@@ -4,11 +4,13 @@ import (
 	"fmt"
 	"math"
 	"reflect"
-	"strconv"
+	"sort"
 	"strings"
 	"unsafe"
 
 	"github.com/evanw/esbuild/internal/ast"
+	"github.com/evanw/esbuild/internal/compat"
+	"github.com/evanw/esbuild/internal/config"
 	"github.com/evanw/esbuild/internal/lexer"
 	"github.com/evanw/esbuild/internal/logging"
 	"github.com/evanw/esbuild/internal/runtime"
@@ -28,18 +30,16 @@ import (
 // to have at least two separate passes to handle variable hoisting. See the
 // comment about scopesInOrder below for more information.
 type parser struct {
+	config.Options
 	log                      logging.Log
 	source                   logging.Source
 	lexer                    lexer.Lexer
-	importPaths              []ast.ImportPath
-	omitWarnings             bool
 	allowIn                  bool
+	allowPrivateIdentifiers  bool
 	hasTopLevelReturn        bool
 	currentFnOpts            fnOpts
-	target                   LanguageTarget
-	ts                       TypeScriptOptions
-	jsx                      JSXOptions
 	latestReturnHadSemicolon bool
+	hasImportMeta            bool
 	allocatedNames           []string
 	latestArrowArgLoc        ast.Loc
 	currentScope             *ast.Scope
@@ -48,21 +48,38 @@ type parser struct {
 	exportsRef               ast.Ref
 	requireRef               ast.Ref
 	moduleRef                ast.Ref
-	usedRuntimeSyms          runtime.Sym
-	findSymbolHelper         FindSymbol
+	importMetaRef            ast.Ref
+	findSymbolHelper         config.FindSymbol
+	symbolUses               map[ast.Ref]ast.SymbolUse
+	declaredSymbols          []ast.DeclaredSymbol
+	runtimeImports           map[string]ast.Ref
+
+	// For lowering private methods
+	weakMapRef     ast.Ref
+	weakSetRef     ast.Ref
+	privateGetters map[ast.Ref]ast.Ref
+	privateSetters map[ast.Ref]ast.Ref
 
 	// These are for TypeScript
-	exportEqualsStmt           *ast.Stmt
 	shouldFoldNumericConstants bool
 	enclosingNamespaceRef      *ast.Ref
 	emittedNamespaceVars       map[ast.Ref]bool
 	isExportedInsideNamespace  map[ast.Ref]ast.Ref
 	knownEnumValues            map[ast.Ref]map[string]float64
 
+	// Imports (both ES6 and CommonJS) are tracked at the top level
+	importRecords               []ast.ImportRecord
+	importRecordsForCurrentPart []uint32
+	exportStarImportRecords     []uint32
+
 	// These are for handling ES6 imports and exports
-	importItemsForNamespace map[ast.Ref]map[string]ast.Ref
+	hasES6ImportSyntax      bool
+	hasES6ExportSyntax      bool
+	importItemsForNamespace map[ast.Ref]map[string]ast.LocRef
 	isImportItem            map[ast.Ref]bool
-	exportAliases           map[string]bool
+	namedImports            map[ast.Ref]ast.NamedImport
+	namedExports            map[string]ast.Ref
+	topLevelSymbolToParts   map[ast.Ref][]uint32
 
 	// The parser does two passes and we need to pass the scope tree information
 	// from the first pass to the second pass. That's done by tracking the calls
@@ -84,16 +101,89 @@ type parser struct {
 	// The visit pass binds identifiers to declared symbols, does constant
 	// folding, substitutes compile-time variable definitions, and lowers certain
 	// syntactic constructs as appropriate.
-	mangleSyntax      bool
-	isBundling        bool
-	tryBodyCount      int
 	isThisCaptured    bool
+	argumentsRef      *ast.Ref
 	callTarget        ast.E
-	typeofTarget      ast.E
 	moduleScope       *ast.Scope
 	isControlFlowDead bool
-	identifierDefines map[string]DefineFunc
-	dotDefines        map[string]dotDefine
+
+	// These are for recognizing "typeof require == 'function' && require". This
+	// is a workaround for code that browserify generates that looks like this:
+	//
+	//   (function e(t, n, r) {
+	//     function s(o2, u) {
+	//       if (!n[o2]) {
+	//         if (!t[o2]) {
+	//           var a = typeof require == "function" && require;
+	//           if (!u && a)
+	//             return a(o2, true);
+	//           if (i)
+	//             return i(o2, true);
+	//           throw new Error("Cannot find module '" + o2 + "'");
+	//         }
+	//         var f = n[o2] = {exports: {}};
+	//         t[o2][0].call(f.exports, function(e2) {
+	//           var n2 = t[o2][1][e2];
+	//           return s(n2 ? n2 : e2);
+	//         }, f, f.exports, e, t, n, r);
+	//       }
+	//       return n[o2].exports;
+	//     }
+	//     var i = typeof require == "function" && require;
+	//     for (var o = 0; o < r.length; o++)
+	//       s(r[o]);
+	//     return s;
+	//   });
+	//
+	// It's checking to see if the environment it's running in has a "require"
+	// function before calling it. However, esbuild's bundling environment has a
+	// bundle-time require function because it's a bundler. So in this case
+	// "typeof require == 'function'" is true and the "&&" expression just
+	// becomes a single "require" identifier, which will then crash at run time.
+	//
+	// The workaround is to explicitly pattern-match for the exact expression
+	// "typeof require == 'function' && require" and replace it with "false" if
+	// we're targeting the browser.
+	//
+	// Note that we can't just leave "typeof require == 'function'" alone because
+	// there is other code in the wild that legitimately does need it to become
+	// "true" when bundling. Specifically, the package "@dagrejs/graphlib" has
+	// code that looks like this:
+	//
+	//   if (typeof require === "function") {
+	//     try {
+	//       lodash = {
+	//         clone: require("lodash/clone"),
+	//         constant: require("lodash/constant"),
+	//         each: require("lodash/each"),
+	//         // ... more calls to require() here ...
+	//       };
+	//     } catch (e) {
+	//       // continue regardless of error
+	//     }
+	//   }
+	//
+	// That library will crash later on during startup if that branch isn't
+	// taken because "typeof require === 'function'" is false at run time.
+	typeofTarget                ast.E
+	typeofRequire               ast.E
+	typeofRequireEqualsFn       ast.E
+	typeofRequireEqualsFnTarget ast.E
+
+	// This is used to silence references to "require" inside a try/catch
+	// statement. The assumption is that the try/catch statement is there to
+	// handle the case where the reference to "require" crashes. Specifically,
+	// the workaround handles the "moment" library which contains code that
+	// looks like this:
+	//
+	//   try {
+	//     oldLocale = globalLocale._abbr;
+	//     var aliasedRequire = require;
+	//     aliasedRequire('./locale/' + name);
+	//     getSetGlobalLocale(oldLocale);
+	//   } catch (e) {}
+	//
+	tryBodyCount int
 
 	// Temporary variables used for lowering
 	tempRefsToDeclare []ast.Ref
@@ -110,27 +200,22 @@ type scopeOrder struct {
 }
 
 type fnOpts struct {
-	isOutsideFn bool
-	allowAwait  bool
-	allowYield  bool
+	asyncRange     ast.Range
+	isOutsideFn    bool
+	allowAwait     bool
+	allowYield     bool
+	allowSuperCall bool
 
 	// In TypeScript, forward declarations of functions have no bodies
 	allowMissingBodyForTypeScript bool
+
+	// Allow TypeScript decorators in function arguments
+	allowTSDecorators bool
 }
 
 func isJumpStatement(data ast.S) bool {
 	switch data.(type) {
 	case *ast.SBreak, *ast.SContinue, *ast.SReturn, *ast.SThrow:
-		return true
-	}
-
-	return false
-}
-
-func hasNoSideEffects(data ast.E) bool {
-	switch data.(type) {
-	case *ast.ENull, *ast.EUndefined, *ast.EBoolean, *ast.ENumber, *ast.EBigInt,
-		*ast.EString, *ast.EThis, *ast.ERegExp, *ast.EFunction, *ast.EArrow:
 		return true
 	}
 
@@ -256,6 +341,16 @@ func checkEqualityIfNoSideEffects(left ast.E, right ast.E) (bool, bool) {
 	return false, false
 }
 
+func hasValueForThisInCall(expr ast.Expr) bool {
+	switch expr.Data.(type) {
+	case *ast.EDot, *ast.EIndex:
+		return true
+
+	default:
+		return false
+	}
+}
+
 func (p *parser) pushScopeForParsePass(kind ast.ScopeKind, loc ast.Loc) int {
 	parent := p.currentScope
 	scope := &ast.Scope{
@@ -357,14 +452,35 @@ func (p *parser) popAndFlattenScope(scopeIndex int) {
 	}
 }
 
+// Undo all scopes pushed and popped after this scope index. This assumes that
+// the scope stack is at the same level now as it was at the given scope index.
+func (p *parser) discardScopesUpTo(scopeIndex int) {
+	// Remove any direct children from their parent
+	children := p.currentScope.Children
+	for _, child := range p.scopesInOrder[scopeIndex:] {
+		if child.scope.Parent == p.currentScope {
+			for i := len(children) - 1; i >= 0; i-- {
+				if children[i] == child.scope {
+					children = append(children[:i], children[i+1:]...)
+					break
+				}
+			}
+		}
+	}
+	p.currentScope.Children = children
+
+	// Truncate the scope order where we started to pretend we never saw this scope
+	p.scopesInOrder = p.scopesInOrder[:scopeIndex]
+}
+
 func (p *parser) newSymbol(kind ast.SymbolKind, name string) ast.Ref {
-	ref := ast.Ref{p.source.Index, uint32(len(p.symbols))}
+	ref := ast.Ref{OuterIndex: p.source.Index, InnerIndex: uint32(len(p.symbols))}
 	p.symbols = append(p.symbols, ast.Symbol{
 		Kind: kind,
 		Name: name,
 		Link: ast.InvalidRef,
 	})
-	if p.ts.Parse {
+	if p.TS.Parse {
 		p.tsUseCounts = append(p.tsUseCounts, 0)
 	}
 	return ref
@@ -376,15 +492,22 @@ const (
 	mergeForbidden = iota
 	mergeReplaceWithNew
 	mergeKeepExisting
+	mergeBecomePrivateGetSetPair
+	mergeBecomePrivateStaticGetSetPair
 )
 
-func canMergeSymbols(existing ast.SymbolKind, new ast.SymbolKind) mergeResult {
+func (p *parser) canMergeSymbols(existing ast.SymbolKind, new ast.SymbolKind) mergeResult {
 	if existing == ast.SymbolUnbound {
 		return mergeReplaceWithNew
 	}
 
-	// "import {Foo} from 'bar'; class Foo {}"
-	if existing == ast.SymbolTSImport {
+	// In TypeScript, imports are allowed to silently collide with symbols within
+	// the module. Presumably this is because the imports may be type-only:
+	//
+	//   import {Foo} from 'bar'
+	//   class Foo {}
+	//
+	if p.TS.Parse && existing == ast.SymbolImport {
 		return mergeReplaceWithNew
 	}
 
@@ -409,6 +532,17 @@ func canMergeSymbols(existing ast.SymbolKind, new ast.SymbolKind) mergeResult {
 		return mergeKeepExisting
 	}
 
+	// "get #foo() {} set #foo() {}"
+	// "set #foo() {} get #foo() {}"
+	if (existing == ast.SymbolPrivateGet && new == ast.SymbolPrivateSet) ||
+		(existing == ast.SymbolPrivateSet && new == ast.SymbolPrivateGet) {
+		return mergeBecomePrivateGetSetPair
+	}
+	if (existing == ast.SymbolPrivateStaticGet && new == ast.SymbolPrivateStaticSet) ||
+		(existing == ast.SymbolPrivateStaticSet && new == ast.SymbolPrivateStaticGet) {
+		return mergeBecomePrivateStaticGetSetPair
+	}
+
 	return mergeForbidden
 }
 
@@ -429,7 +563,7 @@ func (p *parser) declareSymbol(kind ast.SymbolKind, loc ast.Loc, name string) as
 					// symbol exists.
 				default:
 					r := lexer.RangeOfIdentifier(p.source, loc)
-					p.log.AddRangeError(p.source, r, fmt.Sprintf("%q has already been declared", name))
+					p.log.AddRangeError(&p.source, r, fmt.Sprintf("%q has already been declared", name))
 					return existing
 				}
 			}
@@ -442,19 +576,27 @@ func (p *parser) declareSymbol(kind ast.SymbolKind, loc ast.Loc, name string) as
 
 	// Check for a collision in the declaring scope
 	if existing, ok := scope.Members[name]; ok {
-		symbol := p.symbols[existing.InnerIndex]
+		symbol := &p.symbols[existing.InnerIndex]
 
-		switch canMergeSymbols(symbol.Kind, kind) {
+		switch p.canMergeSymbols(symbol.Kind, kind) {
 		case mergeForbidden:
 			r := lexer.RangeOfIdentifier(p.source, loc)
-			p.log.AddRangeError(p.source, r, fmt.Sprintf("%q has already been declared", name))
+			p.log.AddRangeError(&p.source, r, fmt.Sprintf("%q has already been declared", name))
 			return existing
 
 		case mergeKeepExisting:
 			ref = existing
 
 		case mergeReplaceWithNew:
-			p.symbols[existing.InnerIndex].Link = ref
+			symbol.Link = ref
+
+		case mergeBecomePrivateGetSetPair:
+			ref = existing
+			symbol.Kind = ast.SymbolPrivateGetSetPair
+
+		case mergeBecomePrivateStaticGetSetPair:
+			ref = existing
+			symbol.Kind = ast.SymbolPrivateStaticGetSetPair
 		}
 	}
 
@@ -509,42 +651,42 @@ func (p *parser) declareSymbol(kind ast.SymbolKind, loc ast.Loc, name string) as
 }
 
 func (p *parser) declareBinding(kind ast.SymbolKind, binding ast.Binding, opts parseStmtOpts) {
-	switch d := binding.Data.(type) {
+	switch b := binding.Data.(type) {
 	case *ast.BMissing:
 
 	case *ast.BIdentifier:
-		name := p.loadNameFromRef(d.Ref)
-		if !opts.isTypeScriptDeclare {
-			d.Ref = p.declareSymbol(kind, binding.Loc, name)
-			if opts.isExport && p.enclosingNamespaceRef == nil {
-				p.recordExport(binding.Loc, name)
+		name := p.loadNameFromRef(b.Ref)
+		if !opts.isTypeScriptDeclare || (opts.isNamespaceScope && opts.isExport) {
+			b.Ref = p.declareSymbol(kind, binding.Loc, name)
+			if opts.isExport {
+				p.recordExport(binding.Loc, name, b.Ref)
 			}
 		}
 
 	case *ast.BArray:
-		for _, i := range d.Items {
+		for _, i := range b.Items {
 			p.declareBinding(kind, i.Binding, opts)
 		}
 
 	case *ast.BObject:
-		for _, property := range d.Properties {
+		for _, property := range b.Properties {
 			p.declareBinding(kind, property.Value, opts)
 		}
 
 	default:
-		panic(fmt.Sprintf("Unexpected binding of type %T", binding.Data))
+		panic("Internal error")
 	}
 }
 
-func (p *parser) recordExport(loc ast.Loc, alias string) {
+func (p *parser) recordExport(loc ast.Loc, alias string, ref ast.Ref) {
 	// This is only an ES6 export if we're not inside a TypeScript namespace
 	if p.enclosingNamespaceRef == nil {
-		if p.exportAliases[alias] {
+		if _, ok := p.namedExports[alias]; ok {
 			// Warn about duplicate exports
-			p.log.AddRangeError(p.source, lexer.RangeOfIdentifier(p.source, loc),
+			p.log.AddRangeError(&p.source, lexer.RangeOfIdentifier(p.source, loc),
 				fmt.Sprintf("Multiple exports with the same name %q", alias))
 		} else {
-			p.exportAliases[alias] = true
+			p.namedExports[alias] = ref
 		}
 	}
 }
@@ -555,12 +697,15 @@ func (p *parser) recordUsage(ref ast.Ref) {
 	// code regions since those will be culled.
 	if !p.isControlFlowDead {
 		p.symbols[ref.InnerIndex].UseCountEstimate++
+		use := p.symbolUses[ref]
+		use.CountEstimate++
+		p.symbolUses[ref] = use
 	}
 
 	// The correctness of TypeScript-to-JavaScript conversion relies on accurate
 	// symbol use counts for the whole file, including dead code regions. This is
 	// tracked separately in a parser-only data structure.
-	if p.ts.Parse {
+	if p.TS.Parse {
 		p.tsUseCounts[ref.InnerIndex]++
 	}
 }
@@ -569,18 +714,30 @@ func (p *parser) ignoreUsage(ref ast.Ref) {
 	// Roll back the use count increment in recordUsage()
 	if !p.isControlFlowDead {
 		p.symbols[ref.InnerIndex].UseCountEstimate--
+		use := p.symbolUses[ref]
+		use.CountEstimate--
+		if use.CountEstimate == 0 {
+			delete(p.symbolUses, ref)
+		} else {
+			p.symbolUses[ref] = use
+		}
 	}
 
 	// Don't roll back the "tsUseCounts" increment. This must be counted even if
 	// the value is ignored because that's what the TypeScript compiler does.
 }
 
-func (p *parser) addError(loc ast.Loc, text string) {
-	p.log.AddError(p.source, loc, text)
-}
-
-func (p *parser) addRangeError(r ast.Range, text string) {
-	p.log.AddRangeError(p.source, r, text)
+func (p *parser) callRuntime(loc ast.Loc, name string, args []ast.Expr) ast.Expr {
+	ref, ok := p.runtimeImports[name]
+	if !ok {
+		ref = p.newSymbol(ast.SymbolOther, name)
+		p.runtimeImports[name] = ref
+	}
+	p.recordUsage(ref)
+	return ast.Expr{Loc: loc, Data: &ast.ECall{
+		Target: ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: ref}},
+		Args:   args,
+	}}
 }
 
 // The name is temporarily stored in the ref until the scope traversal pass
@@ -604,13 +761,13 @@ func (p *parser) storeNameInRef(name string) ast.Ref {
 		// It's stored as a negative value so we'll crash if we try to use it. That
 		// way we'll catch cases where we've forgetten to call loadNameFromRef().
 		// The length is the negative part because we know it's non-zero.
-		return ast.Ref{-uint32(n.Len), uint32(n.Data - c.Data)}
+		return ast.Ref{OuterIndex: -uint32(n.Len), InnerIndex: uint32(n.Data - c.Data)}
 	} else {
 		// The name is some memory allocated elsewhere. This is either an inline
 		// string constant in the parser or an identifier with escape sequences
 		// in the source code, which is very unusual. Stash it away for later.
 		// This uses allocations but it should hopefully be very uncommon.
-		ref := ast.Ref{0x80000000, uint32(len(p.allocatedNames))}
+		ref := ast.Ref{OuterIndex: 0x80000000, InnerIndex: uint32(len(p.allocatedNames))}
 		p.allocatedNames = append(p.allocatedNames, name)
 		return ref
 	}
@@ -626,647 +783,6 @@ func (p *parser) loadNameFromRef(ref ast.Ref) string {
 		}
 		return p.source.Contents[ref.InnerIndex : int32(ref.InnerIndex)-int32(ref.OuterIndex)]
 	}
-}
-
-func (p *parser) skipTypeScriptBinding() {
-	switch p.lexer.Token {
-	case lexer.TIdentifier, lexer.TThis:
-		p.lexer.Next()
-
-	case lexer.TOpenBracket:
-		p.lexer.Next()
-
-		// "[, , a]"
-		for p.lexer.Token == lexer.TComma {
-			p.lexer.Next()
-		}
-
-		// "[a, b]"
-		for p.lexer.Token != lexer.TCloseBracket {
-			p.skipTypeScriptBinding()
-			if p.lexer.Token != lexer.TComma {
-				break
-			}
-			p.lexer.Next()
-		}
-
-		p.lexer.Expect(lexer.TCloseBracket)
-
-	case lexer.TOpenBrace:
-		p.lexer.Next()
-
-		for p.lexer.Token != lexer.TCloseBrace {
-			foundIdentifier := false
-
-			switch p.lexer.Token {
-			case lexer.TIdentifier:
-				// "{x}"
-				// "{x: y}"
-				foundIdentifier = true
-				p.lexer.Next()
-
-				// "{1: y}"
-				// "{'x': y}"
-			case lexer.TStringLiteral, lexer.TNumericLiteral:
-				p.lexer.Next()
-
-			default:
-				if p.lexer.IsIdentifierOrKeyword() {
-					// "{if: x}"
-					p.lexer.Next()
-				} else {
-					p.lexer.Unexpected()
-				}
-			}
-
-			if p.lexer.Token == lexer.TColon || !foundIdentifier {
-				p.lexer.Expect(lexer.TColon)
-				p.skipTypeScriptBinding()
-			}
-
-			if p.lexer.Token != lexer.TComma {
-				break
-			}
-			p.lexer.Next()
-		}
-
-		p.lexer.Expect(lexer.TCloseBrace)
-
-	default:
-		p.lexer.Unexpected()
-	}
-}
-
-func (p *parser) skipTypeScriptFnArgs() {
-	p.lexer.Expect(lexer.TOpenParen)
-
-	for p.lexer.Token != lexer.TCloseParen {
-		// "(...a)"
-		if p.lexer.Token == lexer.TDotDotDot {
-			p.lexer.Next()
-		}
-
-		p.skipTypeScriptBinding()
-
-		// "(a?)"
-		if p.lexer.Token == lexer.TQuestion {
-			p.lexer.Next()
-		}
-
-		// "(a: any)"
-		if p.lexer.Token == lexer.TColon {
-			p.lexer.Next()
-			p.skipTypeScriptType(ast.LLowest)
-		}
-
-		// "(a, b)"
-		if p.lexer.Token != lexer.TComma {
-			break
-		}
-		p.lexer.Next()
-	}
-
-	p.lexer.Expect(lexer.TCloseParen)
-}
-
-// This is a spot where the TypeScript grammar is highly ambiguous. Here are
-// some cases that are valid:
-//
-//     let x = (y: any): (() => {}) => { };
-//     let x = (y: any): () => {} => { };
-//     let x = (y: any): (y) => {} => { };
-//     let x = (y: any): (y[]) => {};
-//     let x = (y: any): (a | b) => {};
-//
-// Here are some cases that aren't valid:
-//
-//     let x = (y: any): (y) => {};
-//     let x = (y: any): (y) => {return 0};
-//     let x = (y: any): asserts y is (y) => {};
-//
-func (p *parser) skipTypeScriptParenOrFnType() {
-	if p.trySkipTypeScriptArrowArgsWithBacktracking() {
-		p.skipTypeScriptReturnType()
-	} else {
-		p.lexer.Expect(lexer.TOpenParen)
-		p.skipTypeScriptType(ast.LLowest)
-		p.lexer.Expect(lexer.TCloseParen)
-	}
-}
-
-func (p *parser) skipTypeScriptReturnType() {
-	// Skip over "function assert(x: boolean): asserts x"
-	if p.lexer.IsContextualKeyword("asserts") {
-		p.lexer.Next()
-
-		// "function assert(x: boolean): asserts" is also valid
-		if p.lexer.Token != lexer.TIdentifier && p.lexer.Token != lexer.TThis {
-			return
-		}
-		p.lexer.Next()
-
-		// Continue on to the "is" check below to handle something like
-		// "function assert(x: any): asserts x is boolean"
-	} else {
-		p.skipTypeScriptType(ast.LLowest)
-	}
-
-	if p.lexer.IsContextualKeyword("is") && !p.lexer.HasNewlineBefore {
-		p.lexer.Next()
-		p.skipTypeScriptType(ast.LLowest)
-	}
-}
-
-func (p *parser) skipTypeScriptType(level ast.L) {
-	p.skipTypeScriptTypePrefix()
-	p.skipTypeScriptTypeSuffix(level)
-}
-
-func (p *parser) skipTypeScriptTypePrefix() {
-	switch p.lexer.Token {
-	case lexer.TNumericLiteral, lexer.TBigIntegerLiteral, lexer.TStringLiteral,
-		lexer.TNoSubstitutionTemplateLiteral, lexer.TThis, lexer.TTrue, lexer.TFalse,
-		lexer.TNull, lexer.TVoid, lexer.TConst:
-		p.lexer.Next()
-
-	case lexer.TMinus:
-		p.lexer.Next()
-		if p.lexer.Token == lexer.TBigIntegerLiteral {
-			p.lexer.Next()
-		} else {
-			p.lexer.Expect(lexer.TNumericLiteral)
-		}
-
-	case lexer.TAmpersand:
-	case lexer.TBar:
-		// Support things like "type Foo = | A | B" and "type Foo = & A & B"
-		p.lexer.Next()
-		p.skipTypeScriptTypePrefix()
-
-	case lexer.TImport:
-		// "import('fs')"
-		p.lexer.Next()
-		p.lexer.Expect(lexer.TOpenParen)
-		p.lexer.Expect(lexer.TStringLiteral)
-		p.lexer.Expect(lexer.TCloseParen)
-
-	case lexer.TNew:
-		// "new () => Foo"
-		// "new <T>() => Foo<T>"
-		p.lexer.Next()
-		p.skipTypeScriptTypeParameters()
-		p.skipTypeScriptParenOrFnType()
-
-	case lexer.TLessThan:
-		// "<T>() => Foo<T>"
-		p.skipTypeScriptTypeParameters()
-		p.skipTypeScriptParenOrFnType()
-
-	case lexer.TOpenParen:
-		p.skipTypeScriptParenOrFnType()
-
-	case lexer.TIdentifier:
-		switch p.lexer.Identifier {
-		case "keyof", "readonly", "infer":
-			p.lexer.Next()
-			p.skipTypeScriptType(ast.LPrefix)
-
-		case "unique":
-			p.lexer.Next()
-			if p.lexer.IsContextualKeyword("symbol") {
-				p.lexer.Next()
-			}
-
-		default:
-			p.lexer.Next()
-		}
-
-	case lexer.TTypeof:
-		p.lexer.Next()
-		p.skipTypeScriptType(ast.LPrefix)
-
-	case lexer.TOpenBracket:
-		p.lexer.Next()
-		for p.lexer.Token != lexer.TCloseBracket {
-			if p.lexer.Token == lexer.TDotDotDot {
-				p.lexer.Next()
-			}
-			p.skipTypeScriptType(ast.LLowest)
-			if p.lexer.Token != lexer.TComma {
-				break
-			}
-			p.lexer.Next()
-		}
-		p.lexer.Expect(lexer.TCloseBracket)
-
-	case lexer.TOpenBrace:
-		p.skipTypeScriptObjectType()
-
-	default:
-		p.lexer.Unexpected()
-	}
-}
-
-func (p *parser) skipTypeScriptTypeSuffix(level ast.L) {
-	for {
-		switch p.lexer.Token {
-		case lexer.TBar:
-			if level >= ast.LBitwiseOr {
-				return
-			}
-			p.lexer.Next()
-			p.skipTypeScriptType(ast.LBitwiseOr)
-
-		case lexer.TAmpersand:
-			if level >= ast.LBitwiseAnd {
-				return
-			}
-			p.lexer.Next()
-			p.skipTypeScriptType(ast.LBitwiseAnd)
-
-		case lexer.TDot:
-			p.lexer.Next()
-			if !p.lexer.IsIdentifierOrKeyword() {
-				p.lexer.Expect(lexer.TIdentifier)
-			}
-			p.lexer.Next()
-
-		case lexer.TOpenBracket:
-			// "{ ['x']: string \n ['y']: string }" must not become a single type
-			if p.lexer.HasNewlineBefore {
-				return
-			}
-			p.lexer.Next()
-			if p.lexer.Token != lexer.TCloseBracket {
-				p.skipTypeScriptType(ast.LLowest)
-			}
-			p.lexer.Expect(lexer.TCloseBracket)
-
-		case lexer.TLessThan, lexer.TLessThanEquals,
-			lexer.TLessThanLessThan, lexer.TLessThanLessThanEquals:
-			// "let foo: any \n <number>foo" must not become a single type
-			if p.lexer.HasNewlineBefore {
-				return
-			}
-			p.lexer.ExpectLessThan(false /* isInsideJSXElement */)
-			for {
-				p.skipTypeScriptType(ast.LLowest)
-				if p.lexer.Token != lexer.TComma {
-					break
-				}
-				p.lexer.Next()
-			}
-			p.lexer.ExpectGreaterThan(false /* isInsideJSXElement */)
-
-		case lexer.TExtends:
-			// "{ x: number \n extends: boolean }" must not become a single type
-			if p.lexer.HasNewlineBefore {
-				return
-			}
-			p.lexer.Next()
-			p.skipTypeScriptType(ast.LCompare)
-
-		case lexer.TQuestion:
-			if level >= ast.LConditional {
-				return
-			}
-			p.lexer.Next()
-
-			switch p.lexer.Token {
-			// Stop now if we're parsing one of these:
-			// "(a?: b) => void"
-			// "(a?, b?) => void"
-			// "(a?) => void"
-			// "[string?]"
-			case lexer.TColon, lexer.TComma, lexer.TCloseParen, lexer.TCloseBracket:
-				return
-			}
-
-			p.skipTypeScriptType(ast.LLowest)
-			p.lexer.Expect(lexer.TColon)
-			p.skipTypeScriptType(ast.LLowest)
-
-		default:
-			return
-		}
-	}
-}
-
-func (p *parser) skipTypeScriptObjectType() {
-	p.lexer.Expect(lexer.TOpenBrace)
-
-	for p.lexer.Token != lexer.TCloseBrace {
-		// "{ -readonly [K in keyof T]: T[K] }"
-		// "{ +readonly [K in keyof T]: T[K] }"
-		if p.lexer.Token == lexer.TPlus || p.lexer.Token == lexer.TMinus {
-			p.lexer.Next()
-		}
-
-		// Skip over modifiers and the property identifier
-		foundKey := false
-		for p.lexer.IsIdentifierOrKeyword() ||
-			p.lexer.Token == lexer.TStringLiteral ||
-			p.lexer.Token == lexer.TNumericLiteral {
-			p.lexer.Next()
-			foundKey = true
-		}
-
-		if p.lexer.Token == lexer.TOpenBracket {
-			// Index signature or computed property
-			p.lexer.Next()
-			p.skipTypeScriptType(ast.LLowest)
-
-			// "{ [key: string]: number }"
-			// "{ readonly [K in keyof T]: T[K] }"
-			if p.lexer.Token == lexer.TColon || p.lexer.Token == lexer.TIn {
-				p.lexer.Next()
-				p.skipTypeScriptType(ast.LLowest)
-			}
-
-			p.lexer.Expect(lexer.TCloseBracket)
-
-			// "{ [K in keyof T]+?: T[K] }"
-			// "{ [K in keyof T]-?: T[K] }"
-			if p.lexer.Token == lexer.TPlus || p.lexer.Token == lexer.TMinus {
-				p.lexer.Next()
-			}
-
-			foundKey = true
-		}
-
-		// "?" indicates an optional property
-		// "!" indicates an initialization assertion
-		if foundKey && (p.lexer.Token == lexer.TQuestion || p.lexer.Token == lexer.TExclamation) {
-			p.lexer.Next()
-		}
-
-		// Type parameters come right after the optional mark
-		p.skipTypeScriptTypeParameters()
-
-		switch p.lexer.Token {
-		case lexer.TColon:
-			// Regular property
-			if !foundKey {
-				p.lexer.Expect(lexer.TIdentifier)
-			}
-			p.lexer.Next()
-			p.skipTypeScriptType(ast.LLowest)
-
-		case lexer.TOpenParen:
-			// Method signature
-			p.skipTypeScriptFnArgs()
-			if p.lexer.Token == lexer.TColon {
-				p.lexer.Next()
-				p.skipTypeScriptReturnType()
-			}
-
-		default:
-			if !foundKey {
-				p.lexer.Unexpected()
-			}
-		}
-
-		switch p.lexer.Token {
-		case lexer.TCloseBrace:
-
-		case lexer.TComma, lexer.TSemicolon:
-			p.lexer.Next()
-
-		default:
-			if !p.lexer.HasNewlineBefore {
-				p.lexer.Unexpected()
-			}
-		}
-	}
-
-	p.lexer.Expect(lexer.TCloseBrace)
-}
-
-// This is the type parameter declarations that go with other symbol
-// declarations (class, function, type, etc.)
-func (p *parser) skipTypeScriptTypeParameters() {
-	if p.lexer.Token == lexer.TLessThan {
-		p.lexer.Next()
-
-		for {
-			p.lexer.Expect(lexer.TIdentifier)
-
-			// "class Foo<T extends number> {}"
-			if p.lexer.Token == lexer.TExtends {
-				p.lexer.Next()
-				p.skipTypeScriptType(ast.LLowest)
-			}
-
-			// "class Foo<T = void> {}"
-			if p.lexer.Token == lexer.TEquals {
-				p.lexer.Next()
-				p.skipTypeScriptType(ast.LLowest)
-			}
-
-			if p.lexer.Token != lexer.TComma {
-				break
-			}
-			p.lexer.Next()
-			if p.lexer.Token == lexer.TGreaterThan {
-				break
-			}
-		}
-
-		p.lexer.ExpectGreaterThan(false /* isInsideJSXElement */)
-	}
-}
-
-func (p *parser) skipTypeScriptTypeArguments(isInsideJSXElement bool) bool {
-	if p.lexer.Token != lexer.TLessThan {
-		return false
-	}
-
-	p.lexer.Next()
-
-	for {
-		p.skipTypeScriptType(ast.LLowest)
-		if p.lexer.Token != lexer.TComma {
-			break
-		}
-		p.lexer.Next()
-	}
-
-	// This type argument list must end with a ">"
-	p.lexer.ExpectGreaterThan(isInsideJSXElement)
-	return true
-}
-
-func (p *parser) trySkipTypeScriptTypeArgumentsWithBacktracking() bool {
-	oldLexer := p.lexer
-	p.lexer.IsLogDisabled = true
-
-	// Implement backtracking by restoring the lexer's memory to its original state
-	defer func() {
-		r := recover()
-		if _, isLexerPanic := r.(lexer.LexerPanic); isLexerPanic {
-			p.lexer = oldLexer
-		} else if r != nil {
-			panic(r)
-		}
-	}()
-
-	p.skipTypeScriptTypeArguments(false /* isInsideJSXElement */)
-
-	// Check the token after this and backtrack if it's the wrong one
-	if !p.canFollowTypeArgumentsInExpression() {
-		p.lexer.Unexpected()
-	}
-
-	// Restore the log disabled flag. Note that we can't just set it back to false
-	// because it may have been true to start with.
-	p.lexer.IsLogDisabled = oldLexer.IsLogDisabled
-	return true
-}
-
-func (p *parser) trySkipTypeScriptTypeParametersThenOpenParenWithBacktracking() bool {
-	oldLexer := p.lexer
-	p.lexer.IsLogDisabled = true
-
-	// Implement backtracking by restoring the lexer's memory to its original state
-	defer func() {
-		r := recover()
-		if _, isLexerPanic := r.(lexer.LexerPanic); isLexerPanic {
-			p.lexer = oldLexer
-		} else if r != nil {
-			panic(r)
-		}
-	}()
-
-	p.skipTypeScriptTypeParameters()
-	if p.lexer.Token != lexer.TOpenParen {
-		p.lexer.Unexpected()
-	}
-
-	// Restore the log disabled flag. Note that we can't just set it back to false
-	// because it may have been true to start with.
-	p.lexer.IsLogDisabled = oldLexer.IsLogDisabled
-	return true
-}
-
-func (p *parser) trySkipTypeScriptArrowReturnTypeWithBacktracking() bool {
-	oldLexer := p.lexer
-	p.lexer.IsLogDisabled = true
-
-	// Implement backtracking by restoring the lexer's memory to its original state
-	defer func() {
-		r := recover()
-		if _, isLexerPanic := r.(lexer.LexerPanic); isLexerPanic {
-			p.lexer = oldLexer
-		} else if r != nil {
-			panic(r)
-		}
-	}()
-
-	p.lexer.Expect(lexer.TColon)
-	p.skipTypeScriptReturnType()
-
-	// Check the token after this and backtrack if it's the wrong one
-	if p.lexer.Token != lexer.TEqualsGreaterThan {
-		p.lexer.Unexpected()
-	}
-
-	// Restore the log disabled flag. Note that we can't just set it back to false
-	// because it may have been true to start with.
-	p.lexer.IsLogDisabled = oldLexer.IsLogDisabled
-	return true
-}
-
-func (p *parser) trySkipTypeScriptArrowArgsWithBacktracking() bool {
-	oldLexer := p.lexer
-	p.lexer.IsLogDisabled = true
-
-	// Implement backtracking by restoring the lexer's memory to its original state
-	defer func() {
-		r := recover()
-		if _, isLexerPanic := r.(lexer.LexerPanic); isLexerPanic {
-			p.lexer = oldLexer
-		} else if r != nil {
-			panic(r)
-		}
-	}()
-
-	p.skipTypeScriptFnArgs()
-	p.lexer.Expect(lexer.TEqualsGreaterThan)
-
-	// Restore the log disabled flag. Note that we can't just set it back to false
-	// because it may have been true to start with.
-	p.lexer.IsLogDisabled = oldLexer.IsLogDisabled
-	return true
-}
-
-// This function is taken from the official TypeScript compiler source code:
-// https://github.com/microsoft/TypeScript/blob/master/src/compiler/parser.ts
-func (p *parser) canFollowTypeArgumentsInExpression() bool {
-	switch p.lexer.Token {
-	case
-		// These are the only tokens can legally follow a type argument list. So we
-		// definitely want to treat them as type arg lists.
-		lexer.TOpenParen,                     // foo<x>(
-		lexer.TNoSubstitutionTemplateLiteral, // foo<T> `...`
-		lexer.TTemplateHead:                  // foo<T> `...${100}...`
-		return true
-
-	case
-		// These cases can't legally follow a type arg list. However, they're not
-		// legal expressions either. The user is probably in the middle of a
-		// generic type. So treat it as such.
-		lexer.TDot,                     // foo<x>.
-		lexer.TCloseParen,              // foo<x>)
-		lexer.TCloseBracket,            // foo<x>]
-		lexer.TColon,                   // foo<x>:
-		lexer.TSemicolon,               // foo<x>;
-		lexer.TQuestion,                // foo<x>?
-		lexer.TEqualsEquals,            // foo<x> ==
-		lexer.TEqualsEqualsEquals,      // foo<x> ===
-		lexer.TExclamationEquals,       // foo<x> !=
-		lexer.TExclamationEqualsEquals, // foo<x> !==
-		lexer.TAmpersandAmpersand,      // foo<x> &&
-		lexer.TBarBar,                  // foo<x> ||
-		lexer.TQuestionQuestion,        // foo<x> ??
-		lexer.TCaret,                   // foo<x> ^
-		lexer.TAmpersand,               // foo<x> &
-		lexer.TBar,                     // foo<x> |
-		lexer.TCloseBrace,              // foo<x> }
-		lexer.TEndOfFile:               // foo<x>
-		return true
-
-	case
-		// We don't want to treat these as type arguments. Otherwise we'll parse
-		// this as an invocation expression. Instead, we want to parse out the
-		// expression in isolation from the type arguments.
-		lexer.TComma,     // foo<x>,
-		lexer.TOpenBrace: // foo<x> {
-		return false
-
-	default:
-		// Anything else treat as an expression.
-		return false
-	}
-}
-
-func (p *parser) skipTypeScriptTypeStmt(opts parseStmtOpts) {
-	if opts.isExport && p.lexer.Token == lexer.TOpenBrace {
-		// "export type {foo}"
-		// "export type {foo} from 'bar'"
-		p.parseExportClause()
-		if p.lexer.IsContextualKeyword("from") {
-			p.lexer.Next()
-			p.parsePath()
-		}
-		p.lexer.ExpectOrInsertSemicolon()
-		return
-	}
-
-	p.lexer.Expect(lexer.TIdentifier)
-	p.skipTypeScriptTypeParameters()
-	p.lexer.Expect(lexer.TEquals)
-	p.skipTypeScriptType(ast.LLowest)
-	p.lexer.ExpectOrInsertSemicolon()
 }
 
 // Due to ES6 destructuring patterns, there are many cases where it's
@@ -1297,58 +813,66 @@ func (from *deferredErrors) mergeInto(to *deferredErrors) {
 
 func (p *parser) logExprErrors(errors *deferredErrors) {
 	if errors.invalidExprDefaultValue.Len > 0 {
-		p.addRangeError(errors.invalidExprDefaultValue, "Unexpected \"=\"")
+		p.log.AddRangeError(&p.source, errors.invalidExprDefaultValue, "Unexpected \"=\"")
 	}
 
 	if errors.invalidExprAfterQuestion.Len > 0 {
 		r := errors.invalidExprAfterQuestion
-		p.addRangeError(r, fmt.Sprintf("Unexpected %q", p.source.Contents[r.Loc.Start:r.Loc.Start+r.Len]))
+		p.log.AddRangeError(&p.source, r, fmt.Sprintf("Unexpected %q", p.source.Contents[r.Loc.Start:r.Loc.Start+r.Len]))
 	}
 }
 
 func (p *parser) logBindingErrors(errors *deferredErrors) {
 	if errors.invalidBindingCommaAfterSpread.Len > 0 {
-		p.addRangeError(errors.invalidBindingCommaAfterSpread, "Unexpected \",\" after rest pattern")
+		p.log.AddRangeError(&p.source, errors.invalidBindingCommaAfterSpread, "Unexpected \",\" after rest pattern")
 	}
 }
 
-type propertyContext int
-
-const (
-	propertyContextObject = iota
-	propertyContextClass
-)
-
 type propertyOpts struct {
+	asyncRange  ast.Range
 	isAsync     bool
 	isGenerator bool
-	isStatic    bool
+
+	// Class-related options
+	isStatic          bool
+	isClass           bool
+	classHasExtends   bool
+	allowTSDecorators bool
+	tsDecorators      []ast.Expr
 }
 
 func (p *parser) parseProperty(
-	context propertyContext, kind ast.PropertyKind, opts propertyOpts, errors *deferredErrors,
+	kind ast.PropertyKind, opts propertyOpts, errors *deferredErrors,
 ) (ast.Property, bool) {
 	var key ast.Expr
+	keyRange := p.lexer.Range()
 	isComputed := false
 
 	switch p.lexer.Token {
 	case lexer.TNumericLiteral:
-		key = ast.Expr{p.lexer.Loc(), &ast.ENumber{p.lexer.Number}}
+		key = ast.Expr{Loc: p.lexer.Loc(), Data: &ast.ENumber{Value: p.lexer.Number}}
 		p.lexer.Next()
 
 	case lexer.TStringLiteral:
-		key = ast.Expr{p.lexer.Loc(), &ast.EString{p.lexer.StringLiteral}}
+		key = ast.Expr{Loc: p.lexer.Loc(), Data: &ast.EString{Value: p.lexer.StringLiteral}}
+		p.lexer.Next()
+
+	case lexer.TPrivateIdentifier:
+		if !opts.isClass || len(opts.tsDecorators) > 0 {
+			p.lexer.Expected(lexer.TIdentifier)
+		}
+		key = ast.Expr{Loc: p.lexer.Loc(), Data: &ast.EPrivateIdentifier{Ref: p.storeNameInRef(p.lexer.Identifier)}}
 		p.lexer.Next()
 
 	case lexer.TOpenBracket:
 		isComputed = true
+		p.markSyntaxFeature(compat.ObjectExtensions, p.lexer.Range())
 		p.lexer.Next()
 		wasIdentifier := p.lexer.Token == lexer.TIdentifier
 		expr := p.parseExpr(ast.LComma)
 
 		// Handle index signatures
-		if p.ts.Parse && p.lexer.Token == lexer.TColon && wasIdentifier &&
-			context == propertyContextClass {
+		if p.TS.Parse && p.lexer.Token == lexer.TColon && wasIdentifier && opts.isClass {
 			if _, ok := expr.Data.(*ast.EIdentifier); ok {
 				// "[key: string]: any;"
 				p.lexer.Next()
@@ -1372,11 +896,11 @@ func (p *parser) parseProperty(
 		}
 		p.lexer.Next()
 		opts.isGenerator = true
-		return p.parseProperty(context, ast.PropertyNormal, opts, errors)
+		return p.parseProperty(ast.PropertyNormal, opts, errors)
 
 	default:
 		name := p.lexer.Identifier
-		loc := p.lexer.Loc()
+		nameRange := p.lexer.Range()
 		if !p.lexer.IsIdentifierOrKeyword() {
 			p.lexer.Expect(lexer.TIdentifier)
 		}
@@ -1388,7 +912,8 @@ func (p *parser) parseProperty(
 			couldBeModifierKeyword := p.lexer.IsIdentifierOrKeyword()
 			if !couldBeModifierKeyword {
 				switch p.lexer.Token {
-				case lexer.TOpenBracket, lexer.TNumericLiteral, lexer.TStringLiteral, lexer.TAsterisk:
+				case lexer.TOpenBracket, lexer.TNumericLiteral, lexer.TStringLiteral,
+					lexer.TAsterisk, lexer.TPrivateIdentifier:
 					couldBeModifierKeyword = true
 				}
 			}
@@ -1398,42 +923,43 @@ func (p *parser) parseProperty(
 				switch name {
 				case "get":
 					if !opts.isAsync {
-						return p.parseProperty(context, ast.PropertyGet, opts, nil)
+						return p.parseProperty(ast.PropertyGet, opts, nil)
 					}
 
 				case "set":
 					if !opts.isAsync {
-						return p.parseProperty(context, ast.PropertySet, opts, nil)
+						return p.parseProperty(ast.PropertySet, opts, nil)
 					}
 
 				case "async":
 					if !opts.isAsync {
 						opts.isAsync = true
-						return p.parseProperty(context, kind, opts, nil)
+						opts.asyncRange = nameRange
+						return p.parseProperty(kind, opts, nil)
 					}
 
 				case "static":
-					if !opts.isStatic && !opts.isAsync && context == propertyContextClass {
+					if !opts.isStatic && !opts.isAsync && opts.isClass {
 						opts.isStatic = true
-						return p.parseProperty(context, kind, opts, nil)
+						return p.parseProperty(kind, opts, nil)
 					}
 
-				case "private", "protected", "public", "readonly", "abstract":
+				case "private", "protected", "public", "readonly", "abstract", "declare":
 					// Skip over TypeScript keywords
-					if context == propertyContextClass && p.ts.Parse {
-						return p.parseProperty(context, kind, opts, nil)
+					if opts.isClass && p.TS.Parse {
+						return p.parseProperty(kind, opts, nil)
 					}
 				}
 			}
 		}
 
-		key = ast.Expr{loc, &ast.EString{lexer.StringToUTF16(name)}}
+		key = ast.Expr{Loc: nameRange.Loc, Data: &ast.EString{Value: lexer.StringToUTF16(name)}}
 
 		// Parse a shorthand property
-		if context == propertyContextObject && kind == ast.PropertyNormal && p.lexer.Token != lexer.TColon &&
+		if !opts.isClass && kind == ast.PropertyNormal && p.lexer.Token != lexer.TColon &&
 			p.lexer.Token != lexer.TOpenParen && p.lexer.Token != lexer.TLessThan && !opts.isGenerator {
 			ref := p.storeNameInRef(name)
-			value := ast.Expr{key.Loc, &ast.EIdentifier{ref}}
+			value := ast.Expr{Loc: key.Loc, Data: &ast.EIdentifier{Ref: ref}}
 
 			// Destructuring patterns have an optional default value
 			var initializer *ast.Expr = nil
@@ -1453,10 +979,10 @@ func (p *parser) parseProperty(
 		}
 	}
 
-	if p.ts.Parse {
+	if p.TS.Parse {
 		// "class X { foo?: number }"
 		// "class X { foo!: number }"
-		if context == propertyContextClass && (p.lexer.Token == lexer.TQuestion || p.lexer.Token == lexer.TExclamation) {
+		if opts.isClass && (p.lexer.Token == lexer.TQuestion || p.lexer.Token == lexer.TExclamation) {
 			p.lexer.Next()
 		}
 
@@ -1465,13 +991,21 @@ func (p *parser) parseProperty(
 		p.skipTypeScriptTypeParameters()
 	}
 
-	// Parse a field
-	if context == propertyContextClass && kind == ast.PropertyNormal &&
-		!opts.isAsync && !opts.isGenerator && p.lexer.Token != lexer.TOpenParen {
+	// Parse a class field with an optional initial value
+	if opts.isClass && kind == ast.PropertyNormal && !opts.isAsync &&
+		!opts.isGenerator && p.lexer.Token != lexer.TOpenParen {
 		var initializer *ast.Expr
 
+		// Forbid the names "constructor" and "prototype" in some cases
+		if !isComputed {
+			if str, ok := key.Data.(*ast.EString); ok && (lexer.UTF16EqualsString(str.Value, "constructor") ||
+				(opts.isStatic && lexer.UTF16EqualsString(str.Value, "prototype"))) {
+				p.log.AddRangeError(&p.source, keyRange, fmt.Sprintf("Invalid field name %q", lexer.UTF16ToString(str.Value)))
+			}
+		}
+
 		// Skip over types
-		if p.ts.Parse && p.lexer.Token == lexer.TColon {
+		if p.TS.Parse && p.lexer.Token == lexer.TColon {
 			p.lexer.Next()
 			p.skipTypeScriptType(ast.LLowest)
 		}
@@ -1482,28 +1016,73 @@ func (p *parser) parseProperty(
 			initializer = &value
 		}
 
+		// Special-case private identifiers
+		if private, ok := key.Data.(*ast.EPrivateIdentifier); ok {
+			name := p.loadNameFromRef(private.Ref)
+			if name == "#constructor" {
+				p.log.AddRangeError(&p.source, keyRange, fmt.Sprintf("Invalid field name %q", name))
+			}
+			var declare ast.SymbolKind
+			if opts.isStatic {
+				declare = ast.SymbolPrivateStaticField
+			} else {
+				declare = ast.SymbolPrivateField
+			}
+			private.Ref = p.declareSymbol(declare, key.Loc, name)
+		}
+
 		p.lexer.ExpectOrInsertSemicolon()
 		return ast.Property{
-			Kind:        kind,
-			IsComputed:  isComputed,
-			IsStatic:    opts.isStatic,
-			Key:         key,
-			Initializer: initializer,
+			TSDecorators: opts.tsDecorators,
+			Kind:         kind,
+			IsComputed:   isComputed,
+			IsStatic:     opts.isStatic,
+			Key:          key,
+			Initializer:  initializer,
 		}, true
 	}
 
 	// Parse a method expression
 	if p.lexer.Token == lexer.TOpenParen || kind != ast.PropertyNormal ||
-		context == propertyContextClass || opts.isAsync || opts.isGenerator {
+		opts.isClass || opts.isAsync || opts.isGenerator {
+		if p.lexer.Token == lexer.TOpenParen {
+			p.markSyntaxFeature(compat.ObjectExtensions, p.lexer.Range())
+		}
 		loc := p.lexer.Loc()
 		scopeIndex := p.pushScopeForParsePass(ast.ScopeFunctionArgs, loc)
+		isConstructor := false
+
+		// Forbid the names "constructor" and "prototype" in some cases
+		if opts.isClass && !isComputed {
+			if str, ok := key.Data.(*ast.EString); ok {
+				if !opts.isStatic && lexer.UTF16EqualsString(str.Value, "constructor") {
+					switch {
+					case kind == ast.PropertyGet:
+						p.log.AddRangeError(&p.source, keyRange, "Class constructor cannot be a getter")
+					case kind == ast.PropertySet:
+						p.log.AddRangeError(&p.source, keyRange, "Class constructor cannot be a setter")
+					case opts.isAsync:
+						p.log.AddRangeError(&p.source, keyRange, "Class constructor cannot be an async function")
+					case opts.isGenerator:
+						p.log.AddRangeError(&p.source, keyRange, "Class constructor cannot be a generator")
+					default:
+						isConstructor = true
+					}
+				} else if opts.isStatic && lexer.UTF16EqualsString(str.Value, "prototype") {
+					p.log.AddRangeError(&p.source, keyRange, "Invalid static method name \"prototype\"")
+				}
+			}
+		}
 
 		fn, hadBody := p.parseFn(nil, fnOpts{
-			allowAwait: opts.isAsync,
-			allowYield: opts.isGenerator,
+			asyncRange:        opts.asyncRange,
+			allowAwait:        opts.isAsync,
+			allowYield:        opts.isGenerator,
+			allowSuperCall:    opts.classHasExtends && isConstructor,
+			allowTSDecorators: opts.allowTSDecorators,
 
 			// Only allow omitting the body if we're parsing TypeScript class
-			allowMissingBodyForTypeScript: p.ts.Parse && context == propertyContextClass,
+			allowMissingBodyForTypeScript: p.TS.Parse && opts.isClass,
 		})
 
 		// "class Foo { foo(): void; foo(): void {} }"
@@ -1514,17 +1093,62 @@ func (p *parser) parseProperty(
 		}
 
 		p.popScope()
-		value := ast.Expr{loc, &ast.EFunction{fn}}
+		value := ast.Expr{Loc: loc, Data: &ast.EFunction{Fn: fn}}
+
+		// Special-case private identifiers
+		if private, ok := key.Data.(*ast.EPrivateIdentifier); ok {
+			var declare ast.SymbolKind
+			var suffix string
+			switch kind {
+			case ast.PropertyGet:
+				if opts.isStatic {
+					declare = ast.SymbolPrivateStaticGet
+				} else {
+					declare = ast.SymbolPrivateGet
+				}
+				suffix = "_get"
+			case ast.PropertySet:
+				if opts.isStatic {
+					declare = ast.SymbolPrivateStaticSet
+				} else {
+					declare = ast.SymbolPrivateSet
+				}
+				suffix = "_set"
+			default:
+				if opts.isStatic {
+					declare = ast.SymbolPrivateStaticMethod
+				} else {
+					declare = ast.SymbolPrivateMethod
+				}
+				suffix = "_fn"
+			}
+			name := p.loadNameFromRef(private.Ref)
+			if name == "#constructor" {
+				p.log.AddRangeError(&p.source, keyRange, fmt.Sprintf("Invalid method name %q", name))
+			}
+			private.Ref = p.declareSymbol(declare, key.Loc, name)
+			if p.UnsupportedFeatures.Has(declare.Feature()) {
+				methodRef := p.newSymbol(ast.SymbolOther, name[1:]+suffix)
+				if kind == ast.PropertySet {
+					p.privateSetters[private.Ref] = methodRef
+				} else {
+					p.privateGetters[private.Ref] = methodRef
+				}
+			}
+		}
+
 		return ast.Property{
-			Kind:       kind,
-			IsComputed: isComputed,
-			IsMethod:   true,
-			IsStatic:   opts.isStatic,
-			Key:        key,
-			Value:      &value,
+			TSDecorators: opts.tsDecorators,
+			Kind:         kind,
+			IsComputed:   isComputed,
+			IsMethod:     true,
+			IsStatic:     opts.isStatic,
+			Key:          key,
+			Value:        &value,
 		}, true
 	}
 
+	// Parse an object key/value pair
 	p.lexer.Expect(lexer.TColon)
 	value := p.parseExprOrBindings(ast.LComma, errors)
 	return ast.Property{
@@ -1541,9 +1165,8 @@ func (p *parser) parsePropertyBinding() ast.PropertyBinding {
 
 	switch p.lexer.Token {
 	case lexer.TDotDotDot:
-		p.warnAboutFutureSyntax(ES2018, p.lexer.Range())
 		p.lexer.Next()
-		value := ast.Binding{p.lexer.Loc(), &ast.BIdentifier{p.storeNameInRef(p.lexer.Identifier)}}
+		value := ast.Binding{Loc: p.lexer.Loc(), Data: &ast.BIdentifier{Ref: p.storeNameInRef(p.lexer.Identifier)}}
 		p.lexer.Expect(lexer.TIdentifier)
 		return ast.PropertyBinding{
 			IsSpread: true,
@@ -1551,11 +1174,11 @@ func (p *parser) parsePropertyBinding() ast.PropertyBinding {
 		}
 
 	case lexer.TNumericLiteral:
-		key = ast.Expr{p.lexer.Loc(), &ast.ENumber{p.lexer.Number}}
+		key = ast.Expr{Loc: p.lexer.Loc(), Data: &ast.ENumber{Value: p.lexer.Number}}
 		p.lexer.Next()
 
 	case lexer.TStringLiteral:
-		key = ast.Expr{p.lexer.Loc(), &ast.EString{p.lexer.StringLiteral}}
+		key = ast.Expr{Loc: p.lexer.Loc(), Data: &ast.EString{Value: p.lexer.StringLiteral}}
 		p.lexer.Next()
 
 	case lexer.TOpenBracket:
@@ -1571,11 +1194,11 @@ func (p *parser) parsePropertyBinding() ast.PropertyBinding {
 			p.lexer.Expect(lexer.TIdentifier)
 		}
 		p.lexer.Next()
-		key = ast.Expr{loc, &ast.EString{lexer.StringToUTF16(name)}}
+		key = ast.Expr{Loc: loc, Data: &ast.EString{Value: lexer.StringToUTF16(name)}}
 
 		if p.lexer.Token != lexer.TColon && p.lexer.Token != lexer.TOpenParen {
 			ref := p.storeNameInRef(name)
-			value := ast.Binding{loc, &ast.BIdentifier{ref}}
+			value := ast.Binding{Loc: loc, Data: &ast.BIdentifier{Ref: ref}}
 
 			var defaultValue *ast.Expr
 			if p.lexer.Token == lexer.TEquals {
@@ -1610,21 +1233,28 @@ func (p *parser) parsePropertyBinding() ast.PropertyBinding {
 	}
 }
 
-// This assumes that the "=>" token has already been parsed by the caller
 func (p *parser) parseArrowBody(args []ast.Arg, opts fnOpts) *ast.EArrow {
 	arrowLoc := p.lexer.Loc()
 
 	// Newlines are not allowed before "=>"
 	if p.lexer.HasNewlineBefore {
-		p.log.AddRangeError(p.source, p.lexer.Range(), "Unexpected newline before \"=>\"")
+		p.log.AddRangeError(&p.source, p.lexer.Range(), "Unexpected newline before \"=>\"")
 		panic(lexer.LexerPanic{})
 	}
 
-	p.lexer.Expect(lexer.TEqualsGreaterThan)
+	if p.lexer.Token == lexer.TEqualsGreaterThan {
+		p.markSyntaxFeature(compat.Arrow, p.lexer.Range())
+		p.lexer.Next()
+	} else {
+		p.lexer.Expected(lexer.TEqualsGreaterThan)
+	}
 
 	for _, arg := range args {
 		p.declareBinding(ast.SymbolHoisted, arg.Binding, parseStmtOpts{})
 	}
+
+	// The ability to call "super()" is inherited by arrow functions
+	opts.allowSuperCall = p.currentFnOpts.allowSuperCall
 
 	if p.lexer.Token == lexer.TOpenBrace {
 		return &ast.EArrow{
@@ -1643,7 +1273,7 @@ func (p *parser) parseArrowBody(args []ast.Arg, opts fnOpts) *ast.EArrow {
 	return &ast.EArrow{
 		Args:       args,
 		PreferExpr: true,
-		Body:       ast.FnBody{arrowLoc, []ast.Stmt{ast.Stmt{expr.Loc, &ast.SReturn{&expr}}}},
+		Body:       ast.FnBody{Loc: arrowLoc, Stmts: []ast.Stmt{{Loc: expr.Loc, Data: &ast.SReturn{Value: &expr}}}},
 	}
 }
 
@@ -1662,23 +1292,21 @@ func (p *parser) parseAsyncPrefixExpr(asyncRange ast.Range) ast.Expr {
 	switch p.lexer.Token {
 	// "async function() {}"
 	case lexer.TFunction:
-		p.warnAboutFutureSyntax(ES2017, asyncRange)
-		return p.parseFnExpr(asyncRange.Loc, true /* isAsync */)
+		return p.parseFnExpr(asyncRange.Loc, true /* isAsync */, asyncRange)
 
 		// "async => {}"
 	case lexer.TEqualsGreaterThan:
-		arg := ast.Arg{Binding: ast.Binding{asyncRange.Loc, &ast.BIdentifier{p.storeNameInRef("async")}}}
+		arg := ast.Arg{Binding: ast.Binding{Loc: asyncRange.Loc, Data: &ast.BIdentifier{Ref: p.storeNameInRef("async")}}}
 
 		p.pushScopeForParsePass(ast.ScopeFunctionArgs, asyncRange.Loc)
 		defer p.popScope()
 
-		return ast.Expr{asyncRange.Loc, p.parseArrowBody([]ast.Arg{arg}, fnOpts{})}
+		return ast.Expr{Loc: asyncRange.Loc, Data: p.parseArrowBody([]ast.Arg{arg}, fnOpts{})}
 
 		// "async x => {}"
 	case lexer.TIdentifier:
-		p.warnAboutFutureSyntax(ES2017, asyncRange)
 		ref := p.storeNameInRef(p.lexer.Identifier)
-		arg := ast.Arg{Binding: ast.Binding{p.lexer.Loc(), &ast.BIdentifier{ref}}}
+		arg := ast.Arg{Binding: ast.Binding{Loc: p.lexer.Loc(), Data: &ast.BIdentifier{Ref: ref}}}
 		p.lexer.Next()
 
 		p.pushScopeForParsePass(ast.ScopeFunctionArgs, asyncRange.Loc)
@@ -1686,39 +1314,32 @@ func (p *parser) parseAsyncPrefixExpr(asyncRange ast.Range) ast.Expr {
 
 		arrow := p.parseArrowBody([]ast.Arg{arg}, fnOpts{allowAwait: true})
 		arrow.IsAsync = true
-		return ast.Expr{asyncRange.Loc, arrow}
+		return ast.Expr{Loc: asyncRange.Loc, Data: arrow}
 
 		// "async()"
 		// "async () => {}"
 	case lexer.TOpenParen:
 		p.lexer.Next()
-		expr := p.parseParenExpr(asyncRange.Loc, parenExprOpts{isAsync: true})
-		if _, ok := expr.Data.(*ast.EArrow); ok {
-			p.warnAboutFutureSyntax(ES2017, asyncRange)
-		}
-		return expr
+		return p.parseParenExpr(asyncRange.Loc, parenExprOpts{isAsync: true})
 
 		// "async"
 		// "async + 1"
 	default:
 		// Distinguish between a call like "async<T>()" and an arrow like "async <T>() => {}"
-		if p.ts.Parse && p.lexer.Token == lexer.TLessThan && p.trySkipTypeScriptTypeParametersThenOpenParenWithBacktracking() {
+		if p.TS.Parse && p.lexer.Token == lexer.TLessThan && p.trySkipTypeScriptTypeParametersThenOpenParenWithBacktracking() {
 			p.lexer.Next()
-			expr := p.parseParenExpr(asyncRange.Loc, parenExprOpts{isAsync: true})
-			if _, ok := expr.Data.(*ast.EArrow); ok {
-				p.warnAboutFutureSyntax(ES2017, asyncRange)
-			}
-			return expr
+			return p.parseParenExpr(asyncRange.Loc, parenExprOpts{isAsync: true})
 		}
 
-		return ast.Expr{asyncRange.Loc, &ast.EIdentifier{p.storeNameInRef("async")}}
+		return ast.Expr{Loc: asyncRange.Loc, Data: &ast.EIdentifier{Ref: p.storeNameInRef("async")}}
 	}
 }
 
-func (p *parser) parseFnExpr(loc ast.Loc, isAsync bool) ast.Expr {
+func (p *parser) parseFnExpr(loc ast.Loc, isAsync bool, asyncRange ast.Range) ast.Expr {
 	p.lexer.Next()
 	isGenerator := p.lexer.Token == lexer.TAsterisk
 	if isGenerator {
+		p.markSyntaxFeature(compat.Generator, p.lexer.Range())
 		p.lexer.Next()
 	}
 	var name *ast.LocRef
@@ -1729,20 +1350,21 @@ func (p *parser) parseFnExpr(loc ast.Loc, isAsync bool) ast.Expr {
 	// The name is optional
 	if p.lexer.Token == lexer.TIdentifier {
 		nameLoc := p.lexer.Loc()
-		name = &ast.LocRef{nameLoc, p.declareSymbol(ast.SymbolHoistedFunction, nameLoc, p.lexer.Identifier)}
+		name = &ast.LocRef{Loc: nameLoc, Ref: p.declareSymbol(ast.SymbolHoistedFunction, nameLoc, p.lexer.Identifier)}
 		p.lexer.Next()
 	}
 
 	// Even anonymous functions can have TypeScript type parameters
-	if p.ts.Parse {
+	if p.TS.Parse {
 		p.skipTypeScriptTypeParameters()
 	}
 
 	fn, _ := p.parseFn(name, fnOpts{
+		asyncRange: asyncRange,
 		allowAwait: isAsync,
 		allowYield: isGenerator,
 	})
-	return ast.Expr{loc, &ast.EFunction{fn}}
+	return ast.Expr{Loc: loc, Data: &ast.EFunction{Fn: fn}}
 }
 
 type parenExprOpts struct {
@@ -1787,20 +1409,20 @@ func (p *parser) parseParenExpr(loc ast.Loc, opts parenExprOpts) ast.Expr {
 		item := p.parseExprOrBindings(ast.LComma, &errors)
 
 		if isSpread {
-			item = ast.Expr{itemLoc, &ast.ESpread{item}}
+			item = ast.Expr{Loc: itemLoc, Data: &ast.ESpread{Value: item}}
 		}
 
 		// Skip over types
-		if p.ts.Parse && p.lexer.Token == lexer.TColon {
+		if p.TS.Parse && p.lexer.Token == lexer.TColon {
 			typeColonRange = p.lexer.Range()
 			p.lexer.Next()
 			p.skipTypeScriptType(ast.LLowest)
 		}
 
 		// There may be a "=" after the type
-		if p.ts.Parse && p.lexer.Token == lexer.TEquals {
+		if p.TS.Parse && p.lexer.Token == lexer.TEquals {
 			p.lexer.Next()
-			item = ast.Expr{item.Loc, &ast.EBinary{ast.BinOpAssign, item, p.parseExpr(ast.LComma)}}
+			item = ast.Assign(item, p.parseExpr(ast.LComma))
 		}
 
 		items = append(items, item)
@@ -1825,7 +1447,7 @@ func (p *parser) parseParenExpr(loc ast.Loc, opts parenExprOpts) ast.Expr {
 	p.allowIn = oldAllowIn
 
 	// Are these arguments to an arrow function?
-	if p.lexer.Token == lexer.TEqualsGreaterThan || opts.forceArrowFn || (p.ts.Parse && p.lexer.Token == lexer.TColon) {
+	if p.lexer.Token == lexer.TEqualsGreaterThan || opts.forceArrowFn || (p.TS.Parse && p.lexer.Token == lexer.TColon) {
 		invalidLog := []ast.Loc{}
 		args := []ast.Arg{}
 
@@ -1852,7 +1474,7 @@ func (p *parser) parseParenExpr(loc ast.Loc, opts parenExprOpts) ast.Expr {
 			// conversion errors
 			if len(invalidLog) > 0 {
 				for _, loc := range invalidLog {
-					p.addError(loc, "Invalid binding pattern")
+					p.log.AddError(&p.source, loc, "Invalid binding pattern")
 				}
 				panic(lexer.LexerPanic{})
 			}
@@ -1861,7 +1483,7 @@ func (p *parser) parseParenExpr(loc ast.Loc, opts parenExprOpts) ast.Expr {
 			arrow.IsAsync = opts.isAsync
 			arrow.HasRestArg = spreadRange.Len > 0
 			p.popScope()
-			return ast.Expr{loc, arrow}
+			return ast.Expr{Loc: loc, Data: arrow}
 		}
 	}
 
@@ -1872,15 +1494,15 @@ func (p *parser) parseParenExpr(loc ast.Loc, opts parenExprOpts) ast.Expr {
 
 	// If this isn't an arrow function, then types aren't allowed
 	if typeColonRange.Len > 0 {
-		p.addRangeError(typeColonRange, "Unexpected \":\"")
+		p.log.AddRangeError(&p.source, typeColonRange, "Unexpected \":\"")
 		panic(lexer.LexerPanic{})
 	}
 
 	// Are these arguments for a call to a function named "async"?
 	if opts.isAsync {
 		p.logExprErrors(&errors)
-		async := ast.Expr{loc, &ast.EIdentifier{p.storeNameInRef("async")}}
-		return ast.Expr{loc, &ast.ECall{
+		async := ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: p.storeNameInRef("async")}}
+		return ast.Expr{Loc: loc, Data: &ast.ECall{
 			Target: async,
 			Args:   items,
 		}}
@@ -1890,7 +1512,7 @@ func (p *parser) parseParenExpr(loc ast.Loc, opts parenExprOpts) ast.Expr {
 	if len(items) > 0 {
 		p.logExprErrors(&errors)
 		if spreadRange.Len > 0 {
-			p.addRangeError(spreadRange, "Unexpected \"...\"")
+			p.log.AddRangeError(&p.source, spreadRange, "Unexpected \"...\"")
 			panic(lexer.LexerPanic{})
 		}
 		value := ast.JoinAllWithComma(items)
@@ -1904,17 +1526,7 @@ func (p *parser) parseParenExpr(loc ast.Loc, opts parenExprOpts) ast.Expr {
 }
 
 func markExprAsParenthesized(value ast.Expr) {
-	switch e := value.Data.(type) {
-	case *ast.EDot:
-		e.IsParenthesized = true
-
-	case *ast.EIndex:
-		e.IsParenthesized = true
-
-	case *ast.ECall:
-		e.IsParenthesized = true
-
-	case *ast.EArrow:
+	if e, ok := value.Data.(*ast.EArrow); ok {
 		e.IsParenthesized = true
 	}
 }
@@ -1932,10 +1544,10 @@ func (p *parser) convertExprToBindingAndInitializer(expr ast.Expr, invalidLog []
 func (p *parser) convertExprToBinding(expr ast.Expr, invalidLog []ast.Loc) (ast.Binding, []ast.Loc) {
 	switch e := expr.Data.(type) {
 	case *ast.EMissing:
-		return ast.Binding{expr.Loc, &ast.BMissing{}}, invalidLog
+		return ast.Binding{Loc: expr.Loc, Data: &ast.BMissing{}}, invalidLog
 
 	case *ast.EIdentifier:
-		return ast.Binding{expr.Loc, &ast.BIdentifier{e.Ref}}, invalidLog
+		return ast.Binding{Loc: expr.Loc, Data: &ast.BIdentifier{Ref: e.Ref}}, invalidLog
 
 	case *ast.EArray:
 		items := []ast.ArrayBinding{}
@@ -1947,15 +1559,16 @@ func (p *parser) convertExprToBinding(expr ast.Expr, invalidLog []ast.Loc) (ast.
 			}
 			binding, initializer, log := p.convertExprToBindingAndInitializer(item, invalidLog)
 			invalidLog = log
-			items = append(items, ast.ArrayBinding{binding, initializer})
+			items = append(items, ast.ArrayBinding{Binding: binding, DefaultValue: initializer})
 		}
-		return ast.Binding{expr.Loc, &ast.BArray{
-			Items:     items,
-			HasSpread: isSpread,
+		return ast.Binding{Loc: expr.Loc, Data: &ast.BArray{
+			Items:        items,
+			HasSpread:    isSpread,
+			IsSingleLine: e.IsSingleLine,
 		}}, invalidLog
 
 	case *ast.EObject:
-		items := []ast.PropertyBinding{}
+		properties := []ast.PropertyBinding{}
 		for _, item := range e.Properties {
 			if item.IsMethod || item.Kind == ast.PropertyGet || item.Kind == ast.PropertySet {
 				invalidLog = append(invalidLog, item.Key.Loc)
@@ -1966,7 +1579,7 @@ func (p *parser) convertExprToBinding(expr ast.Expr, invalidLog []ast.Loc) (ast.
 			if initializer == nil {
 				initializer = item.Initializer
 			}
-			items = append(items, ast.PropertyBinding{
+			properties = append(properties, ast.PropertyBinding{
 				IsSpread:     item.Kind == ast.PropertySpread,
 				IsComputed:   item.IsComputed,
 				Key:          item.Key,
@@ -1974,7 +1587,10 @@ func (p *parser) convertExprToBinding(expr ast.Expr, invalidLog []ast.Loc) (ast.
 				DefaultValue: initializer,
 			})
 		}
-		return ast.Binding{expr.Loc, &ast.BObject{items}}, invalidLog
+		return ast.Binding{Loc: expr.Loc, Data: &ast.BObject{
+			Properties:   properties,
+			IsSingleLine: e.IsSingleLine,
+		}}, invalidLog
 
 	default:
 		invalidLog = append(invalidLog, expr.Loc)
@@ -1982,7 +1598,68 @@ func (p *parser) convertExprToBinding(expr ast.Expr, invalidLog []ast.Loc) (ast.
 	}
 }
 
-func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
+func (p *parser) convertBindingToExpr(binding ast.Binding, wrapIdentifier func(ast.Loc, ast.Ref) ast.Expr) ast.Expr {
+	loc := binding.Loc
+
+	switch b := binding.Data.(type) {
+	case *ast.BMissing:
+		return ast.Expr{Loc: loc, Data: &ast.EMissing{}}
+
+	case *ast.BIdentifier:
+		if wrapIdentifier != nil {
+			return wrapIdentifier(loc, b.Ref)
+		}
+		return ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: b.Ref}}
+
+	case *ast.BArray:
+		exprs := make([]ast.Expr, len(b.Items))
+		for i, item := range b.Items {
+			expr := p.convertBindingToExpr(item.Binding, wrapIdentifier)
+			if b.HasSpread && i+1 == len(b.Items) {
+				expr = ast.Expr{Loc: expr.Loc, Data: &ast.ESpread{Value: expr}}
+			} else if item.DefaultValue != nil {
+				expr = ast.Assign(expr, *item.DefaultValue)
+			}
+			exprs[i] = expr
+		}
+		return ast.Expr{Loc: loc, Data: &ast.EArray{
+			Items:        exprs,
+			IsSingleLine: b.IsSingleLine,
+		}}
+
+	case *ast.BObject:
+		properties := make([]ast.Property, len(b.Properties))
+		for i, property := range b.Properties {
+			value := p.convertBindingToExpr(property.Value, wrapIdentifier)
+			kind := ast.PropertyNormal
+			if property.IsSpread {
+				kind = ast.PropertySpread
+			}
+			properties[i] = ast.Property{
+				Kind:        kind,
+				IsComputed:  property.IsComputed,
+				Key:         property.Key,
+				Value:       &value,
+				Initializer: property.DefaultValue,
+			}
+		}
+		return ast.Expr{Loc: loc, Data: &ast.EObject{
+			Properties:   properties,
+			IsSingleLine: b.IsSingleLine,
+		}}
+
+	default:
+		panic("Internal error")
+	}
+}
+
+type exprFlag uint8
+
+const (
+	exprFlagTSDecorator exprFlag = 1 << iota
+)
+
+func (p *parser) parsePrefix(level ast.L, errors *deferredErrors, flags exprFlag) ast.Expr {
 	loc := p.lexer.Loc()
 
 	switch p.lexer.Token {
@@ -1991,12 +1668,12 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 
 		switch p.lexer.Token {
 		case lexer.TOpenParen:
-			if level < ast.LCall {
-				return ast.Expr{loc, &ast.ESuper{}}
+			if level < ast.LCall && p.currentFnOpts.allowSuperCall {
+				return ast.Expr{Loc: loc, Data: &ast.ESuper{}}
 			}
 
 		case lexer.TDot, lexer.TOpenBracket:
-			return ast.Expr{loc, &ast.ESuper{}}
+			return ast.Expr{Loc: loc, Data: &ast.ESuper{}}
 		}
 
 		p.lexer.Unexpected()
@@ -2024,28 +1701,28 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 
 	case lexer.TFalse:
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.EBoolean{false}}
+		return ast.Expr{Loc: loc, Data: &ast.EBoolean{Value: false}}
 
 	case lexer.TTrue:
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.EBoolean{true}}
+		return ast.Expr{Loc: loc, Data: &ast.EBoolean{Value: true}}
 
 	case lexer.TNull:
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.ENull{}}
+		return ast.Expr{Loc: loc, Data: &ast.ENull{}}
 
 	case lexer.TThis:
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.EThis{}}
+		return ast.Expr{Loc: loc, Data: &ast.EThis{}}
 
 	case lexer.TYield:
 		if !p.currentFnOpts.allowYield {
-			p.addRangeError(p.lexer.Range(), "Cannot use \"yield\" outside a generator function")
+			p.log.AddRangeError(&p.source, p.lexer.Range(), "Cannot use \"yield\" outside a generator function")
 			panic(lexer.LexerPanic{})
 		}
 
 		if level > ast.LAssign {
-			p.addRangeError(p.lexer.Range(), "Cannot use a \"yield\" expression here without parentheses")
+			p.log.AddRangeError(&p.source, p.lexer.Range(), "Cannot use a \"yield\" expression here without parentheses")
 			panic(lexer.LexerPanic{})
 		}
 
@@ -2074,7 +1751,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			}
 		}
 
-		return ast.Expr{loc, &ast.EYield{value, isStar}}
+		return ast.Expr{Loc: loc, Data: &ast.EYield{Value: value, IsStar: isStar}}
 
 	case lexer.TIdentifier:
 		name := p.lexer.Identifier
@@ -2085,54 +1762,56 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		if name == "async" {
 			return p.parseAsyncPrefixExpr(nameRange)
 		} else if p.currentFnOpts.allowAwait && name == "await" {
-			return ast.Expr{loc, &ast.EAwait{p.parseExpr(ast.LPrefix)}}
+			return ast.Expr{Loc: loc, Data: &ast.EAwait{Value: p.parseExpr(ast.LPrefix)}}
 		}
 
 		// Handle the start of an arrow expression
 		if p.lexer.Token == lexer.TEqualsGreaterThan {
 			ref := p.storeNameInRef(name)
-			arg := ast.Arg{Binding: ast.Binding{loc, &ast.BIdentifier{ref}}}
+			arg := ast.Arg{Binding: ast.Binding{Loc: loc, Data: &ast.BIdentifier{Ref: ref}}}
 
 			p.pushScopeForParsePass(ast.ScopeFunctionArgs, loc)
 			defer p.popScope()
 
-			return ast.Expr{loc, p.parseArrowBody([]ast.Arg{arg}, fnOpts{})}
+			return ast.Expr{Loc: loc, Data: p.parseArrowBody([]ast.Arg{arg}, fnOpts{})}
 		}
 
 		ref := p.storeNameInRef(name)
-		return ast.Expr{loc, &ast.EIdentifier{ref}}
+		return ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: ref}}
 
 	case lexer.TStringLiteral:
 		value := p.lexer.StringLiteral
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.EString{value}}
+		return ast.Expr{Loc: loc, Data: &ast.EString{Value: value}}
 
 	case lexer.TNoSubstitutionTemplateLiteral:
+		p.markSyntaxFeature(compat.TemplateLiteral, p.lexer.Range())
 		head := p.lexer.StringLiteral
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.ETemplate{nil, head, "", []ast.TemplatePart{}}}
+		return ast.Expr{Loc: loc, Data: &ast.ETemplate{Head: head}}
 
 	case lexer.TTemplateHead:
+		p.markSyntaxFeature(compat.TemplateLiteral, p.lexer.Range())
 		head := p.lexer.StringLiteral
 		parts := p.parseTemplateParts(false /* includeRaw */)
-		return ast.Expr{loc, &ast.ETemplate{nil, head, "", parts}}
+		return ast.Expr{Loc: loc, Data: &ast.ETemplate{Head: head, Parts: parts}}
 
 	case lexer.TNumericLiteral:
 		value := p.lexer.Number
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.ENumber{value}}
+		return ast.Expr{Loc: loc, Data: &ast.ENumber{Value: value}}
 
 	case lexer.TBigIntegerLiteral:
 		value := p.lexer.Identifier
-		p.warnAboutFutureSyntax(ES2020, p.lexer.Range())
+		p.markSyntaxFeature(compat.BigInt, p.lexer.Range())
 		p.lexer.Next()
-		return ast.Expr{p.lexer.Loc(), &ast.EBigInt{value}}
+		return ast.Expr{Loc: p.lexer.Loc(), Data: &ast.EBigInt{Value: value}}
 
 	case lexer.TSlash, lexer.TSlashEquals:
 		p.lexer.ScanRegExp()
 		value := p.lexer.Raw()
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.ERegExp{value}}
+		return ast.Expr{Loc: loc, Data: &ast.ERegExp{Value: value}}
 
 	case lexer.TVoid:
 		p.lexer.Next()
@@ -2140,7 +1819,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		if p.lexer.Token == lexer.TAsteriskAsterisk {
 			p.lexer.Unexpected()
 		}
-		return ast.Expr{loc, &ast.EUnary{ast.UnOpVoid, value}}
+		return ast.Expr{Loc: loc, Data: &ast.EUnary{Op: ast.UnOpVoid, Value: value}}
 
 	case lexer.TTypeof:
 		p.lexer.Next()
@@ -2148,7 +1827,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		if p.lexer.Token == lexer.TAsteriskAsterisk {
 			p.lexer.Unexpected()
 		}
-		return ast.Expr{loc, &ast.EUnary{ast.UnOpTypeof, value}}
+		return ast.Expr{Loc: loc, Data: &ast.EUnary{Op: ast.UnOpTypeof, Value: value}}
 
 	case lexer.TDelete:
 		p.lexer.Next()
@@ -2156,7 +1835,14 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		if p.lexer.Token == lexer.TAsteriskAsterisk {
 			p.lexer.Unexpected()
 		}
-		return ast.Expr{loc, &ast.EUnary{ast.UnOpDelete, value}}
+		if index, ok := value.Data.(*ast.EIndex); ok {
+			if private, ok := index.Index.Data.(*ast.EPrivateIdentifier); ok {
+				name := p.loadNameFromRef(private.Ref)
+				r := ast.Range{Loc: index.Index.Loc, Len: int32(len(name))}
+				p.log.AddRangeError(&p.source, r, fmt.Sprintf("Deleting the private name %q is forbidden", name))
+			}
+		}
+		return ast.Expr{Loc: loc, Data: &ast.EUnary{Op: ast.UnOpDelete, Value: value}}
 
 	case lexer.TPlus:
 		p.lexer.Next()
@@ -2164,7 +1850,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		if p.lexer.Token == lexer.TAsteriskAsterisk {
 			p.lexer.Unexpected()
 		}
-		return ast.Expr{loc, &ast.EUnary{ast.UnOpPos, value}}
+		return ast.Expr{Loc: loc, Data: &ast.EUnary{Op: ast.UnOpPos, Value: value}}
 
 	case lexer.TMinus:
 		p.lexer.Next()
@@ -2172,7 +1858,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		if p.lexer.Token == lexer.TAsteriskAsterisk {
 			p.lexer.Unexpected()
 		}
-		return ast.Expr{loc, &ast.EUnary{ast.UnOpNeg, value}}
+		return ast.Expr{Loc: loc, Data: &ast.EUnary{Op: ast.UnOpNeg, Value: value}}
 
 	case lexer.TTilde:
 		p.lexer.Next()
@@ -2180,7 +1866,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		if p.lexer.Token == lexer.TAsteriskAsterisk {
 			p.lexer.Unexpected()
 		}
-		return ast.Expr{loc, &ast.EUnary{ast.UnOpCpl, value}}
+		return ast.Expr{Loc: loc, Data: &ast.EUnary{Op: ast.UnOpCpl, Value: value}}
 
 	case lexer.TExclamation:
 		p.lexer.Next()
@@ -2188,42 +1874,43 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		if p.lexer.Token == lexer.TAsteriskAsterisk {
 			p.lexer.Unexpected()
 		}
-		return ast.Expr{loc, &ast.EUnary{ast.UnOpNot, value}}
+		return ast.Expr{Loc: loc, Data: &ast.EUnary{Op: ast.UnOpNot, Value: value}}
 
 	case lexer.TMinusMinus:
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.EUnary{ast.UnOpPreDec, p.parseExpr(ast.LPrefix)}}
+		return ast.Expr{Loc: loc, Data: &ast.EUnary{Op: ast.UnOpPreDec, Value: p.parseExpr(ast.LPrefix)}}
 
 	case lexer.TPlusPlus:
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.EUnary{ast.UnOpPreInc, p.parseExpr(ast.LPrefix)}}
+		return ast.Expr{Loc: loc, Data: &ast.EUnary{Op: ast.UnOpPreInc, Value: p.parseExpr(ast.LPrefix)}}
 
 	case lexer.TFunction:
-		return p.parseFnExpr(loc, false /* isAsync */)
+		return p.parseFnExpr(loc, false /* isAsync */, ast.Range{})
 
 	case lexer.TClass:
+		p.markSyntaxFeature(compat.Class, p.lexer.Range())
 		p.lexer.Next()
 		var name *ast.LocRef
 
 		if p.lexer.Token == lexer.TIdentifier {
 			p.pushScopeForParsePass(ast.ScopeClassName, loc)
 			nameLoc := p.lexer.Loc()
-			name = &ast.LocRef{loc, p.declareSymbol(ast.SymbolOther, nameLoc, p.lexer.Identifier)}
+			name = &ast.LocRef{Loc: loc, Ref: p.declareSymbol(ast.SymbolOther, nameLoc, p.lexer.Identifier)}
 			p.lexer.Next()
 		}
 
 		// Even anonymous classes can have TypeScript type parameters
-		if p.ts.Parse {
+		if p.TS.Parse {
 			p.skipTypeScriptTypeParameters()
 		}
 
-		class := p.parseClass(name)
+		class := p.parseClass(name, parseClassOpts{})
 
 		if name != nil {
 			p.popScope()
 		}
 
-		return ast.Expr{loc, &ast.EClass{class}}
+		return ast.Expr{Loc: loc, Data: &ast.EClass{Class: class}}
 
 	case lexer.TNew:
 		p.lexer.Next()
@@ -2234,14 +1921,16 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			if p.lexer.Token != lexer.TIdentifier || p.lexer.Identifier != "target" {
 				p.lexer.Unexpected()
 			}
+			r := ast.Range{Loc: loc, Len: p.lexer.Range().End() - loc.Start}
+			p.markSyntaxFeature(compat.NewTarget, r)
 			p.lexer.Next()
-			return ast.Expr{loc, &ast.ENewTarget{}}
+			return ast.Expr{Loc: loc, Data: &ast.ENewTarget{}}
 		}
 
-		target := p.parseExpr(ast.LCall)
+		target := p.parseExprWithFlags(ast.LCall, flags)
 		args := []ast.Expr{}
 
-		if p.ts.Parse {
+		if p.TS.Parse {
 			// Skip over TypeScript non-null assertions
 			if p.lexer.Token == lexer.TExclamation && !p.lexer.HasNewlineBefore {
 				p.lexer.Next()
@@ -2257,10 +1946,11 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			args = p.parseCallArgs()
 		}
 
-		return ast.Expr{loc, &ast.ENew{target, args}}
+		return ast.Expr{Loc: loc, Data: &ast.ENew{Target: target, Args: args}}
 
 	case lexer.TOpenBracket:
 		p.lexer.Next()
+		isSingleLine := !p.lexer.HasNewlineBefore
 		items := []ast.Expr{}
 		selfErrors := deferredErrors{}
 
@@ -2271,13 +1961,14 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		for p.lexer.Token != lexer.TCloseBracket {
 			switch p.lexer.Token {
 			case lexer.TComma:
-				items = append(items, ast.Expr{loc, &ast.EMissing{}})
+				items = append(items, ast.Expr{Loc: loc, Data: &ast.EMissing{}})
 
 			case lexer.TDotDotDot:
+				p.markSyntaxFeature(compat.ArraySpread, p.lexer.Range())
 				dotsLoc := p.lexer.Loc()
 				p.lexer.Next()
 				item := p.parseExprOrBindings(ast.LComma, &selfErrors)
-				items = append(items, ast.Expr{dotsLoc, &ast.ESpread{item}})
+				items = append(items, ast.Expr{Loc: dotsLoc, Data: &ast.ESpread{Value: item}})
 
 				// Commas are not allowed here when destructuring
 				if p.lexer.Token == lexer.TComma {
@@ -2292,9 +1983,18 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			if p.lexer.Token != lexer.TComma {
 				break
 			}
+			if p.lexer.HasNewlineBefore {
+				isSingleLine = false
+			}
 			p.lexer.Next()
+			if p.lexer.HasNewlineBefore {
+				isSingleLine = false
+			}
 		}
 
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 		p.lexer.Expect(lexer.TCloseBracket)
 		p.allowIn = oldAllowIn
 
@@ -2309,10 +2009,14 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			selfErrors.mergeInto(errors)
 		}
 
-		return ast.Expr{loc, &ast.EArray{items}}
+		return ast.Expr{Loc: loc, Data: &ast.EArray{
+			Items:        items,
+			IsSingleLine: isSingleLine,
+		}}
 
 	case lexer.TOpenBrace:
 		p.lexer.Next()
+		isSingleLine := !p.lexer.HasNewlineBefore
 		properties := []ast.Property{}
 		selfErrors := deferredErrors{}
 
@@ -2335,7 +2039,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 				}
 			} else {
 				// This property may turn out to be a type in TypeScript, which should be ignored
-				if property, ok := p.parseProperty(propertyContextObject, ast.PropertyNormal, propertyOpts{}, &selfErrors); ok {
+				if property, ok := p.parseProperty(ast.PropertyNormal, propertyOpts{}, &selfErrors); ok {
 					properties = append(properties, property)
 				}
 			}
@@ -2343,9 +2047,18 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			if p.lexer.Token != lexer.TComma {
 				break
 			}
+			if p.lexer.HasNewlineBefore {
+				isSingleLine = false
+			}
 			p.lexer.Next()
+			if p.lexer.HasNewlineBefore {
+				isSingleLine = false
+			}
 		}
 
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 		p.lexer.Expect(lexer.TCloseBrace)
 		p.allowIn = oldAllowIn
 
@@ -2360,7 +2073,10 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			selfErrors.mergeInto(errors)
 		}
 
-		return ast.Expr{loc, &ast.EObject{properties}}
+		return ast.Expr{Loc: loc, Data: &ast.EObject{
+			Properties:   properties,
+			IsSingleLine: isSingleLine,
+		}}
 
 	case lexer.TLessThan:
 		// This is a very complicated and highly ambiguous area of TypeScript
@@ -2396,7 +2112,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 		//     <A>(x) => {}
 		//     <A = B>(x) => {}
 
-		if p.ts.Parse && p.jsx.Parse {
+		if p.TS.Parse && p.JSX.Parse {
 			oldLexer := p.lexer
 			p.lexer.Next()
 
@@ -2422,7 +2138,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			}
 		}
 
-		if p.jsx.Parse {
+		if p.JSX.Parse {
 			// Use NextInsideJSXElement() instead of Next() so we parse "<<" as "<"
 			p.lexer.NextInsideJSXElement()
 			element := p.parseJSXElement(loc)
@@ -2435,7 +2151,7 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			return element
 		}
 
-		if p.ts.Parse {
+		if p.TS.Parse {
 			// This is either an old-style type cast or a generic lambda function
 
 			// "<T>(x)"
@@ -2449,13 +2165,14 @@ func (p *parser) parsePrefix(level ast.L, errors *deferredErrors) ast.Expr {
 			p.lexer.Next()
 			p.skipTypeScriptType(ast.LLowest)
 			p.lexer.ExpectGreaterThan(false /* isInsideJSXElement */)
-			return p.parsePrefix(level, errors)
+			return p.parsePrefix(level, errors, flags)
 		}
 
 		p.lexer.Unexpected()
 		return ast.Expr{}
 
 	case lexer.TImport:
+		p.hasES6ImportSyntax = true
 		p.lexer.Next()
 		return p.parseImportExpr(loc)
 
@@ -2484,21 +2201,19 @@ func (p *parser) willNeedBindingPattern() bool {
 	}
 }
 
-func (p *parser) warnAboutFutureSyntax(target LanguageTarget, r ast.Range) {
-	if p.target < target {
-		p.log.AddRangeWarning(p.source, r,
-			fmt.Sprintf("This syntax is from %s and is not available in %s",
-				targetTable[target], targetTable[p.target]))
-	}
-}
-
 func (p *parser) parseImportExpr(loc ast.Loc) ast.Expr {
 	// Parse an "import.meta" expression
 	if p.lexer.Token == lexer.TDot {
 		p.lexer.Next()
 		if p.lexer.IsContextualKeyword("meta") {
+			r := p.lexer.Range()
 			p.lexer.Next()
-			return ast.Expr{loc, &ast.EImportMeta{}}
+			p.hasImportMeta = true
+			if p.UnsupportedFeatures.Has(compat.ImportMeta) {
+				r = ast.Range{Loc: loc, Len: r.End() - loc.Start}
+				p.markSyntaxFeature(compat.ImportMeta, r)
+			}
+			return ast.Expr{Loc: loc, Data: &ast.EImportMeta{}}
 		} else {
 			p.lexer.ExpectedString("\"meta\"")
 		}
@@ -2513,18 +2228,43 @@ func (p *parser) parseImportExpr(loc ast.Loc) ast.Expr {
 	p.lexer.Expect(lexer.TCloseParen)
 
 	p.allowIn = oldAllowIn
-	return ast.Expr{loc, &ast.EImport{value}}
+	return ast.Expr{Loc: loc, Data: &ast.EImport{Expr: value}}
 }
 
 func (p *parser) parseExprOrBindings(level ast.L, errors *deferredErrors) ast.Expr {
-	return p.parseSuffix(p.parsePrefix(level, errors), level, errors)
+	return p.parseExprCommon(level, errors, 0)
 }
 
 func (p *parser) parseExpr(level ast.L) ast.Expr {
-	return p.parseSuffix(p.parsePrefix(level, nil), level, nil)
+	return p.parseExprCommon(level, nil, 0)
 }
 
-func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors) ast.Expr {
+func (p *parser) parseExprWithFlags(level ast.L, flags exprFlag) ast.Expr {
+	return p.parseExprCommon(level, nil, flags)
+}
+
+func (p *parser) parseExprCommon(level ast.L, errors *deferredErrors, flags exprFlag) ast.Expr {
+	hadPureCommentBefore := p.lexer.HasPureCommentBefore
+	expr := p.parsePrefix(level, errors, flags)
+
+	// There is no formal spec for "__PURE__" comments but from reverse-
+	// engineering, it looks like they apply to the next CallExpression or
+	// NewExpression. So in "/* @__PURE__ */ a().b() + c()" the comment applies
+	// to the expression "a().b()".
+	if hadPureCommentBefore && level < ast.LCall {
+		expr = p.parseSuffix(expr, ast.LCall-1, errors, flags)
+		switch e := expr.Data.(type) {
+		case *ast.ECall:
+			e.CanBeUnwrappedIfUnused = true
+		case *ast.ENew:
+			e.CanBeUnwrappedIfUnused = true
+		}
+	}
+
+	return p.parseSuffix(expr, level, errors, flags)
+}
+
+func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors, flags exprFlag) ast.Expr {
 	// ArrowFunction is a special case in the grammar. Although it appears to be
 	// a PrimaryExpression, it's actually an AssigmentExpression. This means if
 	// a AssigmentExpression ends up producing an ArrowFunction then nothing can
@@ -2550,7 +2290,7 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 						return left
 					}
 					p.lexer.Next()
-					left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpComma, left, p.parseExpr(ast.LComma)}}
+					left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpComma, Left: left, Right: p.parseExpr(ast.LComma)}}
 
 				default:
 					return left
@@ -2559,27 +2299,58 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 		}
 	}
 
+	optionalChain := ast.OptionalChainNone
+
 	for {
+		// Reset the optional chain flag by default. That way we won't accidentally
+		// treat "c.d" as OptionalChainContinue in "a?.b + c.d".
+		oldOptionalChain := optionalChain
+		optionalChain = ast.OptionalChainNone
+
 		switch p.lexer.Token {
 		case lexer.TDot:
 			p.lexer.Next()
-			if !p.lexer.IsIdentifierOrKeyword() {
-				p.lexer.Expect(lexer.TIdentifier)
+
+			if p.lexer.Token == lexer.TPrivateIdentifier && p.allowPrivateIdentifiers {
+				// "a.#b"
+				// "a?.b.#c"
+				if _, ok := left.Data.(*ast.ESuper); ok {
+					p.lexer.Expected(lexer.TIdentifier)
+				}
+				name := p.lexer.Identifier
+				nameLoc := p.lexer.Loc()
+				p.lexer.Next()
+				ref := p.storeNameInRef(name)
+				left = ast.Expr{Loc: left.Loc, Data: &ast.EIndex{
+					Target:        left,
+					Index:         ast.Expr{Loc: nameLoc, Data: &ast.EPrivateIdentifier{Ref: ref}},
+					OptionalChain: oldOptionalChain,
+				}}
+			} else {
+				// "a.b"
+				// "a?.b.c"
+				if !p.lexer.IsIdentifierOrKeyword() {
+					p.lexer.Expect(lexer.TIdentifier)
+				}
+				name := p.lexer.Identifier
+				nameLoc := p.lexer.Loc()
+				p.lexer.Next()
+				left = ast.Expr{Loc: left.Loc, Data: &ast.EDot{
+					Target:        left,
+					Name:          name,
+					NameLoc:       nameLoc,
+					OptionalChain: oldOptionalChain,
+				}}
 			}
-			name := p.lexer.Identifier
-			nameLoc := p.lexer.Loc()
-			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EDot{
-				Target:  left,
-				Name:    name,
-				NameLoc: nameLoc,
-			}}
+
+			optionalChain = oldOptionalChain
 
 		case lexer.TQuestionDot:
 			p.lexer.Next()
 
 			switch p.lexer.Token {
 			case lexer.TOpenBracket:
+				// "a?.[b]"
 				p.lexer.Next()
 
 				// Allow "in" inside the brackets
@@ -2591,36 +2362,71 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 				p.allowIn = oldAllowIn
 
 				p.lexer.Expect(lexer.TCloseBracket)
-				left = ast.Expr{left.Loc, &ast.EIndex{
-					Target:          left,
-					Index:           index,
-					IsOptionalChain: true,
+				left = ast.Expr{Loc: left.Loc, Data: &ast.EIndex{
+					Target:        left,
+					Index:         index,
+					OptionalChain: ast.OptionalChainStart,
 				}}
 
 			case lexer.TOpenParen:
+				// "a?.()"
 				if level >= ast.LCall {
 					return left
 				}
-				left = ast.Expr{left.Loc, &ast.ECall{
-					Target:          left,
-					Args:            p.parseCallArgs(),
-					IsOptionalChain: true,
+				left = ast.Expr{Loc: left.Loc, Data: &ast.ECall{
+					Target:        left,
+					Args:          p.parseCallArgs(),
+					OptionalChain: ast.OptionalChainStart,
+				}}
+
+			case lexer.TLessThan:
+				// "a?.<T>()"
+				if !p.TS.Parse {
+					p.lexer.Expected(lexer.TIdentifier)
+				}
+				p.skipTypeScriptTypeArguments(false /* isInsideJSXElement */)
+				if p.lexer.Token != lexer.TOpenParen {
+					p.lexer.Expected(lexer.TOpenParen)
+				}
+				if level >= ast.LCall {
+					return left
+				}
+				left = ast.Expr{Loc: left.Loc, Data: &ast.ECall{
+					Target:        left,
+					Args:          p.parseCallArgs(),
+					OptionalChain: ast.OptionalChainStart,
 				}}
 
 			default:
-				if !p.lexer.IsIdentifierOrKeyword() {
-					p.lexer.Expect(lexer.TIdentifier)
+				if p.lexer.Token == lexer.TPrivateIdentifier && p.allowPrivateIdentifiers {
+					// "a?.#b"
+					name := p.lexer.Identifier
+					nameLoc := p.lexer.Loc()
+					p.lexer.Next()
+					ref := p.storeNameInRef(name)
+					left = ast.Expr{Loc: left.Loc, Data: &ast.EIndex{
+						Target:        left,
+						Index:         ast.Expr{Loc: nameLoc, Data: &ast.EPrivateIdentifier{Ref: ref}},
+						OptionalChain: ast.OptionalChainStart,
+					}}
+				} else {
+					// "a?.b"
+					if !p.lexer.IsIdentifierOrKeyword() {
+						p.lexer.Expect(lexer.TIdentifier)
+					}
+					name := p.lexer.Identifier
+					nameLoc := p.lexer.Loc()
+					p.lexer.Next()
+					left = ast.Expr{Loc: left.Loc, Data: &ast.EDot{
+						Target:        left,
+						Name:          name,
+						NameLoc:       nameLoc,
+						OptionalChain: ast.OptionalChainStart,
+					}}
 				}
-				name := p.lexer.Identifier
-				nameLoc := p.lexer.Loc()
-				p.lexer.Next()
-				left = ast.Expr{left.Loc, &ast.EDot{
-					Target:          left,
-					Name:            name,
-					NameLoc:         nameLoc,
-					IsOptionalChain: true,
-				}}
 			}
+
+			optionalChain = ast.OptionalChainContinue
 
 		case lexer.TNoSubstitutionTemplateLiteral:
 			if level >= ast.LPrefix {
@@ -2630,19 +2436,32 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 			headRaw := p.lexer.RawTemplateContents()
 			p.lexer.Next()
 			tag := left
-			left = ast.Expr{left.Loc, &ast.ETemplate{&tag, head, headRaw, []ast.TemplatePart{}}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.ETemplate{Tag: &tag, Head: head, HeadRaw: headRaw}}
 
 		case lexer.TTemplateHead:
 			if level >= ast.LPrefix {
 				return left
 			}
+			p.markSyntaxFeature(compat.TemplateLiteral, p.lexer.Range())
 			head := p.lexer.StringLiteral
 			headRaw := p.lexer.RawTemplateContents()
 			parts := p.parseTemplateParts(true /* includeRaw */)
 			tag := left
-			left = ast.Expr{left.Loc, &ast.ETemplate{&tag, head, headRaw, parts}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.ETemplate{Tag: &tag, Head: head, HeadRaw: headRaw, Parts: parts}}
 
 		case lexer.TOpenBracket:
+			// When parsing a decorator, ignore EIndex expressions since they may be
+			// part of a computed property:
+			//
+			//   class Foo {
+			//     @foo ['computed']() {}
+			//   }
+			//
+			// This matches the behavior of the TypeScript compiler.
+			if (flags & exprFlagTSDecorator) != 0 {
+				return left
+			}
+
 			p.lexer.Next()
 
 			// Allow "in" inside the brackets
@@ -2654,19 +2473,23 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 			p.allowIn = oldAllowIn
 
 			p.lexer.Expect(lexer.TCloseBracket)
-			left = ast.Expr{left.Loc, &ast.EIndex{
-				Target: left,
-				Index:  index,
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EIndex{
+				Target:        left,
+				Index:         index,
+				OptionalChain: oldOptionalChain,
 			}}
+			optionalChain = oldOptionalChain
 
 		case lexer.TOpenParen:
 			if level >= ast.LCall {
 				return left
 			}
-			left = ast.Expr{left.Loc, &ast.ECall{
-				Target: left,
-				Args:   p.parseCallArgs(),
+			left = ast.Expr{Loc: left.Loc, Data: &ast.ECall{
+				Target:        left,
+				Args:          p.parseCallArgs(),
+				OptionalChain: oldOptionalChain,
 			}}
+			optionalChain = oldOptionalChain
 
 		case lexer.TQuestion:
 			if level >= ast.LConditional {
@@ -2678,7 +2501,7 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 			// "(a?) => {}"
 			// "(a?: b) => {}"
 			// "(a?, b?) => {}"
-			if p.ts.Parse && left.Loc == p.latestArrowArgLoc && (p.lexer.Token == lexer.TColon ||
+			if p.TS.Parse && left.Loc == p.latestArrowArgLoc && (p.lexer.Token == lexer.TColon ||
 				p.lexer.Token == lexer.TCloseParen || p.lexer.Token == lexer.TComma) {
 				if errors == nil {
 					p.lexer.Unexpected()
@@ -2697,159 +2520,161 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 
 			p.lexer.Expect(lexer.TColon)
 			no := p.parseExpr(ast.LComma)
-			left = ast.Expr{left.Loc, &ast.EIf{left, yes, no}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EIf{Test: left, Yes: yes, No: no}}
 
 		case lexer.TExclamation:
 			// Skip over TypeScript non-null assertions
 			if p.lexer.HasNewlineBefore {
 				return left
 			}
-			if !p.ts.Parse {
+			if !p.TS.Parse {
 				p.lexer.Unexpected()
 			}
 			if level >= ast.LPostfix {
 				return left
 			}
 			p.lexer.Next()
+			optionalChain = oldOptionalChain
 
 		case lexer.TMinusMinus:
 			if p.lexer.HasNewlineBefore || level >= ast.LPostfix {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EUnary{ast.UnOpPostDec, left}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EUnary{Op: ast.UnOpPostDec, Value: left}}
 
 		case lexer.TPlusPlus:
 			if p.lexer.HasNewlineBefore || level >= ast.LPostfix {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EUnary{ast.UnOpPostInc, left}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EUnary{Op: ast.UnOpPostInc, Value: left}}
 
 		case lexer.TComma:
 			if level >= ast.LComma {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpComma, left, p.parseExpr(ast.LComma)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpComma, Left: left, Right: p.parseExpr(ast.LComma)}}
 
 		case lexer.TPlus:
 			if level >= ast.LAdd {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpAdd, left, p.parseExpr(ast.LAdd)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpAdd, Left: left, Right: p.parseExpr(ast.LAdd)}}
 
 		case lexer.TPlusEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpAddAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpAddAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TMinus:
 			if level >= ast.LAdd {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpSub, left, p.parseExpr(ast.LAdd)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpSub, Left: left, Right: p.parseExpr(ast.LAdd)}}
 
 		case lexer.TMinusEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpSubAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpSubAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TAsterisk:
 			if level >= ast.LMultiply {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpMul, left, p.parseExpr(ast.LMultiply)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpMul, Left: left, Right: p.parseExpr(ast.LMultiply)}}
 
 		case lexer.TAsteriskAsterisk:
 			if level >= ast.LExponentiation {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpPow, left, p.parseExpr(ast.LExponentiation - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpPow, Left: left, Right: p.parseExpr(ast.LExponentiation - 1)}}
 
 		case lexer.TAsteriskAsteriskEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpPowAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpPowAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TAsteriskEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpMulAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpMulAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TPercent:
 			if level >= ast.LMultiply {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpRem, left, p.parseExpr(ast.LMultiply)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpRem, Left: left, Right: p.parseExpr(ast.LMultiply)}}
 
 		case lexer.TPercentEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpRemAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpRemAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TSlash:
 			if level >= ast.LMultiply {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpDiv, left, p.parseExpr(ast.LMultiply)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpDiv, Left: left, Right: p.parseExpr(ast.LMultiply)}}
 
 		case lexer.TSlashEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpDivAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpDivAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TEqualsEquals:
 			if level >= ast.LEquals {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpLooseEq, left, p.parseExpr(ast.LEquals)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpLooseEq, Left: left, Right: p.parseExpr(ast.LEquals)}}
 
 		case lexer.TExclamationEquals:
 			if level >= ast.LEquals {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpLooseNe, left, p.parseExpr(ast.LEquals)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpLooseNe, Left: left, Right: p.parseExpr(ast.LEquals)}}
 
 		case lexer.TEqualsEqualsEquals:
 			if level >= ast.LEquals {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpStrictEq, left, p.parseExpr(ast.LEquals)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpStrictEq, Left: left, Right: p.parseExpr(ast.LEquals)}}
 
 		case lexer.TExclamationEqualsEquals:
 			if level >= ast.LEquals {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpStrictNe, left, p.parseExpr(ast.LEquals)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpStrictNe, Left: left, Right: p.parseExpr(ast.LEquals)}}
 
 		case lexer.TLessThan:
 			// TypeScript allows type arguments to be specified with angle brackets
 			// inside an expression. Unlike in other languages, this unfortunately
 			// appears to require backtracking to parse.
-			if p.ts.Parse && p.trySkipTypeScriptTypeArgumentsWithBacktracking() {
+			if p.TS.Parse && p.trySkipTypeScriptTypeArgumentsWithBacktracking() {
+				optionalChain = oldOptionalChain
 				continue
 			}
 
@@ -2857,140 +2682,161 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpLt, left, p.parseExpr(ast.LCompare)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpLt, Left: left, Right: p.parseExpr(ast.LCompare)}}
 
 		case lexer.TLessThanEquals:
 			if level >= ast.LCompare {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpLe, left, p.parseExpr(ast.LCompare)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpLe, Left: left, Right: p.parseExpr(ast.LCompare)}}
 
 		case lexer.TGreaterThan:
 			if level >= ast.LCompare {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpGt, left, p.parseExpr(ast.LCompare)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpGt, Left: left, Right: p.parseExpr(ast.LCompare)}}
 
 		case lexer.TGreaterThanEquals:
 			if level >= ast.LCompare {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpGe, left, p.parseExpr(ast.LCompare)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpGe, Left: left, Right: p.parseExpr(ast.LCompare)}}
 
 		case lexer.TLessThanLessThan:
 			if level >= ast.LShift {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpShl, left, p.parseExpr(ast.LShift)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpShl, Left: left, Right: p.parseExpr(ast.LShift)}}
 
 		case lexer.TLessThanLessThanEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpShlAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpShlAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TGreaterThanGreaterThan:
 			if level >= ast.LShift {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpShr, left, p.parseExpr(ast.LShift)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpShr, Left: left, Right: p.parseExpr(ast.LShift)}}
 
 		case lexer.TGreaterThanGreaterThanEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpShrAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpShrAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TGreaterThanGreaterThanGreaterThan:
 			if level >= ast.LShift {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpUShr, left, p.parseExpr(ast.LShift)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpUShr, Left: left, Right: p.parseExpr(ast.LShift)}}
 
 		case lexer.TGreaterThanGreaterThanGreaterThanEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpUShrAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpUShrAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TQuestionQuestion:
 			if level >= ast.LNullishCoalescing {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpNullishCoalescing, left, p.parseExpr(ast.LNullishCoalescing)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpNullishCoalescing, Left: left, Right: p.parseExpr(ast.LNullishCoalescing)}}
+
+		case lexer.TQuestionQuestionEquals:
+			if level >= ast.LAssign {
+				return left
+			}
+			p.lexer.Next()
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpNullishCoalescingAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TBarBar:
 			if level >= ast.LLogicalOr {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpLogicalOr, left, p.parseExpr(ast.LLogicalOr)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpLogicalOr, Left: left, Right: p.parseExpr(ast.LLogicalOr)}}
+
+		case lexer.TBarBarEquals:
+			if level >= ast.LAssign {
+				return left
+			}
+			p.lexer.Next()
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpLogicalOrAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TAmpersandAmpersand:
 			if level >= ast.LLogicalAnd {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpLogicalAnd, left, p.parseExpr(ast.LLogicalAnd)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpLogicalAnd, Left: left, Right: p.parseExpr(ast.LLogicalAnd)}}
+
+		case lexer.TAmpersandAmpersandEquals:
+			if level >= ast.LAssign {
+				return left
+			}
+			p.lexer.Next()
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpLogicalAndAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TBar:
 			if level >= ast.LBitwiseOr {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpBitwiseOr, left, p.parseExpr(ast.LBitwiseOr)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpBitwiseOr, Left: left, Right: p.parseExpr(ast.LBitwiseOr)}}
 
 		case lexer.TBarEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpBitwiseOrAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpBitwiseOrAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TAmpersand:
 			if level >= ast.LBitwiseAnd {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpBitwiseAnd, left, p.parseExpr(ast.LBitwiseAnd)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpBitwiseAnd, Left: left, Right: p.parseExpr(ast.LBitwiseAnd)}}
 
 		case lexer.TAmpersandEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpBitwiseAndAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpBitwiseAndAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TCaret:
 			if level >= ast.LBitwiseXor {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpBitwiseXor, left, p.parseExpr(ast.LBitwiseXor)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpBitwiseXor, Left: left, Right: p.parseExpr(ast.LBitwiseXor)}}
 
 		case lexer.TCaretEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpBitwiseXorAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpBitwiseXorAssign, Left: left, Right: p.parseExpr(ast.LAssign - 1)}}
 
 		case lexer.TEquals:
 			if level >= ast.LAssign {
 				return left
 			}
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpAssign, left, p.parseExpr(ast.LAssign - 1)}}
+			left = ast.Assign(left, p.parseExpr(ast.LAssign-1))
 
 		case lexer.TIn:
 			if level >= ast.LCompare || !p.allowIn {
@@ -2998,15 +2844,13 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 			}
 
 			// Warn about "!a in b" instead of "!(a in b)"
-			if !p.omitWarnings {
-				if e, ok := left.Data.(*ast.EUnary); ok && e.Op == ast.UnOpNot {
-					p.log.AddWarning(p.source, left.Loc,
-						"Suspicious use of the \"!\" operator inside the \"in\" operator")
-				}
+			if e, ok := left.Data.(*ast.EUnary); ok && e.Op == ast.UnOpNot {
+				p.log.AddWarning(&p.source, left.Loc,
+					"Suspicious use of the \"!\" operator inside the \"in\" operator")
 			}
 
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpIn, left, p.parseExpr(ast.LCompare)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpIn, Left: left, Right: p.parseExpr(ast.LCompare)}}
 
 		case lexer.TInstanceof:
 			if level >= ast.LCompare {
@@ -3014,19 +2858,17 @@ func (p *parser) parseSuffix(left ast.Expr, level ast.L, errors *deferredErrors)
 			}
 
 			// Warn about "!a instanceof b" instead of "!(a instanceof b)"
-			if !p.omitWarnings {
-				if e, ok := left.Data.(*ast.EUnary); ok && e.Op == ast.UnOpNot {
-					p.log.AddWarning(p.source, left.Loc,
-						"Suspicious use of the \"!\" operator inside the \"instanceof\" operator")
-				}
+			if e, ok := left.Data.(*ast.EUnary); ok && e.Op == ast.UnOpNot {
+				p.log.AddWarning(&p.source, left.Loc,
+					"Suspicious use of the \"!\" operator inside the \"instanceof\" operator")
 			}
 
 			p.lexer.Next()
-			left = ast.Expr{left.Loc, &ast.EBinary{ast.BinOpInstanceof, left, p.parseExpr(ast.LCompare)}}
+			left = ast.Expr{Loc: left.Loc, Data: &ast.EBinary{Op: ast.BinOpInstanceof, Left: left, Right: p.parseExpr(ast.LCompare)}}
 
 		default:
 			// Handle the TypeScript "as" operator
-			if p.ts.Parse && p.lexer.IsContextualKeyword("as") {
+			if p.TS.Parse && p.lexer.IsContextualKeyword("as") {
 				p.lexer.Next()
 				p.skipTypeScriptType(ast.LLowest)
 				continue
@@ -3049,11 +2891,12 @@ func (p *parser) parseCallArgs() []ast.Expr {
 		loc := p.lexer.Loc()
 		isSpread := p.lexer.Token == lexer.TDotDotDot
 		if isSpread {
+			p.markSyntaxFeature(compat.RestArgument, p.lexer.Range())
 			p.lexer.Next()
 		}
 		arg := p.parseExpr(ast.LComma)
 		if isSpread {
-			arg = ast.Expr{loc, &ast.ESpread{arg}}
+			arg = ast.Expr{Loc: loc, Data: &ast.ESpread{Value: arg}}
 		}
 		args = append(args, arg)
 		if p.lexer.Token != lexer.TComma {
@@ -3072,7 +2915,7 @@ func (p *parser) parseJSXTag() (ast.Range, string, *ast.Expr) {
 
 	// A missing tag is a fragment
 	if p.lexer.Token == lexer.TGreaterThan {
-		return ast.Range{loc, 0}, "", nil
+		return ast.Range{Loc: loc, Len: 0}, "", nil
 	}
 
 	// The tag is an identifier
@@ -3082,11 +2925,11 @@ func (p *parser) parseJSXTag() (ast.Range, string, *ast.Expr) {
 
 	// Certain identifiers are strings
 	if strings.ContainsRune(name, '-') || (p.lexer.Token != lexer.TDot && name[0] >= 'a' && name[0] <= 'z') {
-		return tagRange, name, &ast.Expr{loc, &ast.EString{lexer.StringToUTF16(name)}}
+		return tagRange, name, &ast.Expr{Loc: loc, Data: &ast.EString{Value: lexer.StringToUTF16(name)}}
 	}
 
 	// Otherwise, this is an identifier
-	tag := &ast.Expr{loc, &ast.EIdentifier{p.storeNameInRef(name)}}
+	tag := &ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: p.storeNameInRef(name)}}
 
 	// Parse a member expression chain
 	for p.lexer.Token == lexer.TDot {
@@ -3098,12 +2941,12 @@ func (p *parser) parseJSXTag() (ast.Range, string, *ast.Expr) {
 		// Dashes are not allowed in member expression chains
 		index := strings.IndexByte(member, '-')
 		if index >= 0 {
-			p.addError(ast.Loc{memberRange.Loc.Start + int32(index)}, "Unexpected \"-\"")
+			p.log.AddError(&p.source, ast.Loc{Start: memberRange.Loc.Start + int32(index)}, "Unexpected \"-\"")
 			panic(lexer.LexerPanic{})
 		}
 
 		name += "." + member
-		tag = &ast.Expr{loc, &ast.EDot{
+		tag = &ast.Expr{Loc: loc, Data: &ast.EDot{
 			Target:  *tag,
 			Name:    member,
 			NameLoc: memberRange.Loc,
@@ -3119,7 +2962,7 @@ func (p *parser) parseJSXElement(loc ast.Loc) ast.Expr {
 	_, startText, startTag := p.parseJSXTag()
 
 	// The tag may have TypeScript type arguments: "<Foo<T>/>"
-	if p.ts.Parse {
+	if p.TS.Parse {
 		// Pass a flag to the type argument skipper because we need to call
 		// lexer.NextInsideJSXElement() after we hit the closing ">". The next
 		// token after the ">" might be an attribute name with a dash in it
@@ -3136,19 +2979,19 @@ func (p *parser) parseJSXElement(loc ast.Loc) ast.Expr {
 			case lexer.TIdentifier:
 				// Parse the key
 				keyRange := p.lexer.Range()
-				key := ast.Expr{keyRange.Loc, &ast.EString{lexer.StringToUTF16(p.lexer.Identifier)}}
+				key := ast.Expr{Loc: keyRange.Loc, Data: &ast.EString{Value: lexer.StringToUTF16(p.lexer.Identifier)}}
 				p.lexer.NextInsideJSXElement()
 
 				// Parse the value
 				var value ast.Expr
 				if p.lexer.Token != lexer.TEquals {
 					// Implicitly true value
-					value = ast.Expr{ast.Loc{keyRange.Loc.Start + keyRange.Len}, &ast.EBoolean{true}}
+					value = ast.Expr{Loc: ast.Loc{Start: keyRange.Loc.Start + keyRange.Len}, Data: &ast.EBoolean{Value: true}}
 				} else {
 					// Use NextInsideJSXElement() not Next() so we can parse a JSX-style string literal
 					p.lexer.NextInsideJSXElement()
 					if p.lexer.Token == lexer.TStringLiteral {
-						value = ast.Expr{p.lexer.Loc(), &ast.EString{p.lexer.StringLiteral}}
+						value = ast.Expr{Loc: p.lexer.Loc(), Data: &ast.EString{Value: p.lexer.StringLiteral}}
 						p.lexer.NextInsideJSXElement()
 					} else {
 						// Use Expect() not ExpectInsideJSXElement() so we can parse expression tokens
@@ -3190,7 +3033,7 @@ func (p *parser) parseJSXElement(loc ast.Loc) ast.Expr {
 		if p.lexer.Token != lexer.TGreaterThan {
 			p.lexer.Expected(lexer.TGreaterThan)
 		}
-		return ast.Expr{loc, &ast.EJSXElement{startTag, properties, []ast.Expr{}}}
+		return ast.Expr{Loc: loc, Data: &ast.EJSXElement{Tag: startTag, Properties: properties}}
 	}
 
 	// Use ExpectJSXElementChild() so we parse child strings
@@ -3201,7 +3044,7 @@ func (p *parser) parseJSXElement(loc ast.Loc) ast.Expr {
 	for {
 		switch p.lexer.Token {
 		case lexer.TStringLiteral:
-			children = append(children, ast.Expr{p.lexer.Loc(), &ast.EString{p.lexer.StringLiteral}})
+			children = append(children, ast.Expr{Loc: p.lexer.Loc(), Data: &ast.EString{Value: p.lexer.StringLiteral}})
 			p.lexer.NextJSXElementChild()
 
 		case lexer.TOpenBrace:
@@ -3209,7 +3052,7 @@ func (p *parser) parseJSXElement(loc ast.Loc) ast.Expr {
 			p.lexer.Next()
 
 			// The "..." here is ignored (it's used to signal an array type in TypeScript)
-			if p.lexer.Token == lexer.TDotDotDot && p.ts.Parse {
+			if p.lexer.Token == lexer.TDotDotDot && p.TS.Parse {
 				p.lexer.Next()
 			}
 
@@ -3241,13 +3084,13 @@ func (p *parser) parseJSXElement(loc ast.Loc) ast.Expr {
 			p.lexer.NextInsideJSXElement()
 			endRange, endText, _ := p.parseJSXTag()
 			if startText != endText {
-				p.addRangeError(endRange, fmt.Sprintf("Expected closing tag %q to match opening tag %q", endText, startText))
+				p.log.AddRangeError(&p.source, endRange, fmt.Sprintf("Expected closing tag %q to match opening tag %q", endText, startText))
 			}
 			if p.lexer.Token != lexer.TGreaterThan {
 				p.lexer.Expected(lexer.TGreaterThan)
 			}
 
-			return ast.Expr{loc, &ast.EJSXElement{startTag, properties, children}}
+			return ast.Expr{Loc: loc, Data: &ast.EJSXElement{Tag: startTag, Properties: properties, Children: children}}
 
 		default:
 			p.lexer.Unexpected()
@@ -3266,7 +3109,7 @@ func (p *parser) parseTemplateParts(includeRaw bool) []ast.TemplatePart {
 		if includeRaw {
 			tailRaw = p.lexer.RawTemplateContents()
 		}
-		parts = append(parts, ast.TemplatePart{value, tail, tailRaw})
+		parts = append(parts, ast.TemplatePart{Value: value, Tail: tail, TailRaw: tailRaw})
 		if p.lexer.Token == lexer.TTemplateTail {
 			p.lexer.Next()
 			break
@@ -3284,7 +3127,7 @@ func (p *parser) parseAndDeclareDecls(kind ast.SymbolKind, opts parseStmtOpts) [
 		p.declareBinding(kind, local, opts)
 
 		// Skip over types
-		if p.ts.Parse {
+		if p.TS.Parse {
 			// "let foo!"
 			isDefiniteAssignmentAssertion := p.lexer.Token == lexer.TExclamation
 			if isDefiniteAssignmentAssertion {
@@ -3304,7 +3147,7 @@ func (p *parser) parseAndDeclareDecls(kind ast.SymbolKind, opts parseStmtOpts) [
 			value = &expr
 		}
 
-		decls = append(decls, ast.Decl{local, value})
+		decls = append(decls, ast.Decl{Binding: local, Value: value})
 
 		if p.lexer.Token != lexer.TComma {
 			break
@@ -3319,7 +3162,7 @@ func (p *parser) requireInitializers(decls []ast.Decl) {
 	for _, d := range decls {
 		if d.Value == nil {
 			if _, ok := d.Binding.Data.(*ast.BIdentifier); ok {
-				p.addError(d.Binding.Loc, "This constant must be initialized")
+				p.log.AddError(&p.source, d.Binding.Loc, "This constant must be initialized")
 			}
 		}
 	}
@@ -3327,7 +3170,7 @@ func (p *parser) requireInitializers(decls []ast.Decl) {
 
 func (p *parser) forbidInitializers(decls []ast.Decl, loopType string, isVar bool) {
 	if len(decls) > 1 {
-		p.addError(decls[0].Binding.Loc, fmt.Sprintf("for-%s loops must have a single declaration", loopType))
+		p.log.AddError(&p.source, decls[0].Binding.Loc, fmt.Sprintf("for-%s loops must have a single declaration", loopType))
 	} else if len(decls) == 1 && decls[0].Value != nil {
 		if isVar {
 			if _, ok := decls[0].Binding.Data.(*ast.BIdentifier); ok {
@@ -3336,18 +3179,20 @@ func (p *parser) forbidInitializers(decls []ast.Decl, loopType string, isVar boo
 				return
 			}
 		}
-		p.addError(decls[0].Value.Loc, fmt.Sprintf("for-%s loop variables cannot have an initializer", loopType))
+		p.log.AddError(&p.source, decls[0].Value.Loc, fmt.Sprintf("for-%s loop variables cannot have an initializer", loopType))
 	}
 }
 
-func (p *parser) parseImportClause() []ast.ClauseItem {
+func (p *parser) parseImportClause() ([]ast.ClauseItem, bool) {
 	items := []ast.ClauseItem{}
 	p.lexer.Expect(lexer.TOpenBrace)
+	isSingleLine := !p.lexer.HasNewlineBefore
 
 	for p.lexer.Token != lexer.TCloseBrace {
 		alias := p.lexer.Identifier
 		aliasLoc := p.lexer.Loc()
-		name := ast.LocRef{aliasLoc, p.storeNameInRef(alias)}
+		name := ast.LocRef{Loc: aliasLoc, Ref: p.storeNameInRef(alias)}
+		originalName := alias
 
 		// The alias may be a keyword
 		isIdentifier := p.lexer.Token == lexer.TIdentifier
@@ -3358,34 +3203,51 @@ func (p *parser) parseImportClause() []ast.ClauseItem {
 
 		if p.lexer.IsContextualKeyword("as") {
 			p.lexer.Next()
-			name = ast.LocRef{p.lexer.Loc(), p.storeNameInRef(p.lexer.Identifier)}
+			originalName := p.lexer.Identifier
+			name = ast.LocRef{Loc: p.lexer.Loc(), Ref: p.storeNameInRef(originalName)}
 			p.lexer.Expect(lexer.TIdentifier)
 		} else if !isIdentifier {
 			// An import where the name is a keyword must have an alias
 			p.lexer.Unexpected()
 		}
 
-		items = append(items, ast.ClauseItem{alias, aliasLoc, name})
+		items = append(items, ast.ClauseItem{
+			Alias:        alias,
+			AliasLoc:     aliasLoc,
+			Name:         name,
+			OriginalName: originalName,
+		})
 
 		if p.lexer.Token != lexer.TComma {
 			break
 		}
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 		p.lexer.Next()
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 	}
 
+	if p.lexer.HasNewlineBefore {
+		isSingleLine = false
+	}
 	p.lexer.Expect(lexer.TCloseBrace)
-	return items
+	return items, isSingleLine
 }
 
-func (p *parser) parseExportClause() []ast.ClauseItem {
+func (p *parser) parseExportClause() ([]ast.ClauseItem, bool) {
 	items := []ast.ClauseItem{}
 	firstKeywordItemLoc := ast.Loc{}
 	p.lexer.Expect(lexer.TOpenBrace)
+	isSingleLine := !p.lexer.HasNewlineBefore
 
 	for p.lexer.Token != lexer.TCloseBrace {
 		alias := p.lexer.Identifier
 		aliasLoc := p.lexer.Loc()
-		name := ast.LocRef{aliasLoc, p.storeNameInRef(alias)}
+		name := ast.LocRef{Loc: aliasLoc, Ref: p.storeNameInRef(alias)}
+		originalName := alias
 
 		// The name can actually be a keyword if we're really an "export from"
 		// statement. However, we won't know until later. Allow keywords as
@@ -3419,25 +3281,39 @@ func (p *parser) parseExportClause() []ast.ClauseItem {
 			p.lexer.Next()
 		}
 
-		items = append(items, ast.ClauseItem{alias, aliasLoc, name})
+		items = append(items, ast.ClauseItem{
+			Alias:        alias,
+			AliasLoc:     aliasLoc,
+			Name:         name,
+			OriginalName: originalName,
+		})
 
 		if p.lexer.Token != lexer.TComma {
 			break
 		}
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 		p.lexer.Next()
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 	}
 
+	if p.lexer.HasNewlineBefore {
+		isSingleLine = false
+	}
 	p.lexer.Expect(lexer.TCloseBrace)
 
 	// Throw an error here if we found a keyword earlier and this isn't an
 	// "export from" statement after all
 	if firstKeywordItemLoc.Start != 0 && !p.lexer.IsContextualKeyword("from") {
 		r := lexer.RangeOfIdentifier(p.source, firstKeywordItemLoc)
-		p.addRangeError(r, fmt.Sprintf("Expected identifier but found %q", p.source.TextForRange(r)))
+		p.log.AddRangeError(&p.source, r, fmt.Sprintf("Expected identifier but found %q", p.source.TextForRange(r)))
 		panic(lexer.LexerPanic{})
 	}
 
-	return items
+	return items, isSingleLine
 }
 
 func (p *parser) parseBinding() ast.Binding {
@@ -3447,10 +3323,12 @@ func (p *parser) parseBinding() ast.Binding {
 	case lexer.TIdentifier:
 		ref := p.storeNameInRef(p.lexer.Identifier)
 		p.lexer.Next()
-		return ast.Binding{loc, &ast.BIdentifier{ref}}
+		return ast.Binding{Loc: loc, Data: &ast.BIdentifier{Ref: ref}}
 
 	case lexer.TOpenBracket:
+		p.markSyntaxFeature(compat.Destructuring, p.lexer.Range())
 		p.lexer.Next()
+		isSingleLine := !p.lexer.HasNewlineBefore
 		items := []ast.ArrayBinding{}
 		hasSpread := false
 
@@ -3460,8 +3338,8 @@ func (p *parser) parseBinding() ast.Binding {
 
 		for p.lexer.Token != lexer.TCloseBracket {
 			if p.lexer.Token == lexer.TComma {
-				binding := ast.Binding{p.lexer.Loc(), &ast.BMissing{}}
-				items = append(items, ast.ArrayBinding{binding, nil})
+				binding := ast.Binding{Loc: p.lexer.Loc(), Data: &ast.BMissing{}}
+				items = append(items, ast.ArrayBinding{Binding: binding})
 			} else {
 				if p.lexer.Token == lexer.TDotDotDot {
 					p.lexer.Next()
@@ -3469,7 +3347,7 @@ func (p *parser) parseBinding() ast.Binding {
 
 					// This was a bug in the ES2015 spec that was fixed in ES2016
 					if p.lexer.Token != lexer.TIdentifier {
-						p.warnAboutFutureSyntax(ES2016, p.lexer.Range())
+						p.markSyntaxFeature(compat.NestedRestBinding, p.lexer.Range())
 					}
 				}
 
@@ -3482,11 +3360,11 @@ func (p *parser) parseBinding() ast.Binding {
 					defaultValue = &value
 				}
 
-				items = append(items, ast.ArrayBinding{binding, defaultValue})
+				items = append(items, ast.ArrayBinding{Binding: binding, DefaultValue: defaultValue})
 
 				// Commas after spread elements are not allowed
 				if hasSpread && p.lexer.Token == lexer.TComma {
-					p.addRangeError(p.lexer.Range(), "Unexpected \",\" after rest pattern")
+					p.log.AddRangeError(&p.source, p.lexer.Range(), "Unexpected \",\" after rest pattern")
 					panic(lexer.LexerPanic{})
 				}
 			}
@@ -3494,16 +3372,31 @@ func (p *parser) parseBinding() ast.Binding {
 			if p.lexer.Token != lexer.TComma {
 				break
 			}
+			if p.lexer.HasNewlineBefore {
+				isSingleLine = false
+			}
 			p.lexer.Next()
+			if p.lexer.HasNewlineBefore {
+				isSingleLine = false
+			}
 		}
 
 		p.allowIn = oldAllowIn
 
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 		p.lexer.Expect(lexer.TCloseBracket)
-		return ast.Binding{loc, &ast.BArray{items, hasSpread}}
+		return ast.Binding{Loc: loc, Data: &ast.BArray{
+			Items:        items,
+			HasSpread:    hasSpread,
+			IsSingleLine: isSingleLine,
+		}}
 
 	case lexer.TOpenBrace:
+		p.markSyntaxFeature(compat.Destructuring, p.lexer.Range())
 		p.lexer.Next()
+		isSingleLine := !p.lexer.HasNewlineBefore
 		properties := []ast.PropertyBinding{}
 
 		// "in" expressions are allowed
@@ -3516,20 +3409,32 @@ func (p *parser) parseBinding() ast.Binding {
 
 			// Commas after spread elements are not allowed
 			if property.IsSpread && p.lexer.Token == lexer.TComma {
-				p.addRangeError(p.lexer.Range(), "Unexpected \",\" after rest pattern")
+				p.log.AddRangeError(&p.source, p.lexer.Range(), "Unexpected \",\" after rest pattern")
 				panic(lexer.LexerPanic{})
 			}
 
 			if p.lexer.Token != lexer.TComma {
 				break
 			}
+			if p.lexer.HasNewlineBefore {
+				isSingleLine = false
+			}
 			p.lexer.Next()
+			if p.lexer.HasNewlineBefore {
+				isSingleLine = false
+			}
 		}
 
 		p.allowIn = oldAllowIn
 
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 		p.lexer.Expect(lexer.TCloseBrace)
-		return ast.Binding{loc, &ast.BObject{properties}}
+		return ast.Binding{Loc: loc, Data: &ast.BObject{
+			Properties:   properties,
+			IsSingleLine: isSingleLine,
+		}}
 	}
 
 	p.lexer.Expect(lexer.TIdentifier)
@@ -3537,18 +3442,24 @@ func (p *parser) parseBinding() ast.Binding {
 }
 
 func (p *parser) parseFn(name *ast.LocRef, opts fnOpts) (fn ast.Fn, hadBody bool) {
-	args := []ast.Arg{}
-	hasRestArg := false
+	if opts.allowAwait && opts.allowYield {
+		p.markSyntaxFeature(compat.AsyncGenerator, opts.asyncRange)
+	}
+
+	fn.Name = name
+	fn.HasRestArg = false
+	fn.IsAsync = opts.allowAwait
+	fn.IsGenerator = opts.allowYield
 	p.lexer.Expect(lexer.TOpenParen)
 
 	// Reserve the special name "arguments" in this scope. This ensures that it
 	// shadows any variable called "arguments" in any parent scopes.
-	argumentsRef := p.declareSymbol(ast.SymbolHoisted, ast.Loc{}, "arguments")
-	p.symbols[argumentsRef.InnerIndex].MustNotBeRenamed = true
+	fn.ArgumentsRef = p.declareSymbol(ast.SymbolHoisted, ast.Loc{}, "arguments")
+	p.symbols[fn.ArgumentsRef.InnerIndex].MustNotBeRenamed = true
 
 	for p.lexer.Token != lexer.TCloseParen {
 		// Skip over "this" type annotations
-		if p.ts.Parse && p.lexer.Token == lexer.TThis {
+		if p.TS.Parse && p.lexer.Token == lexer.TThis {
 			p.lexer.Next()
 			if p.lexer.Token == lexer.TColon {
 				p.lexer.Next()
@@ -3561,19 +3472,20 @@ func (p *parser) parseFn(name *ast.LocRef, opts fnOpts) (fn ast.Fn, hadBody bool
 			continue
 		}
 
-		// Skip past decorators and recover even though they aren't supported
-		if p.ts.Parse {
-			p.parseAndSkipDecorators()
+		var tsDecorators []ast.Expr
+		if opts.allowTSDecorators {
+			tsDecorators = p.parseTypeScriptDecorators()
 		}
 
-		if !hasRestArg && p.lexer.Token == lexer.TDotDotDot {
+		if !fn.HasRestArg && p.lexer.Token == lexer.TDotDotDot {
+			p.markSyntaxFeature(compat.RestArgument, p.lexer.Range())
 			p.lexer.Next()
-			hasRestArg = true
+			fn.HasRestArg = true
 		}
 
 		// Potentially parse a TypeScript accessibility modifier
 		isTypeScriptField := false
-		if p.ts.Parse {
+		if p.TS.Parse {
 			switch p.lexer.Token {
 			case lexer.TPrivate, lexer.TProtected, lexer.TPublic:
 				isTypeScriptField = true
@@ -3590,7 +3502,7 @@ func (p *parser) parseFn(name *ast.LocRef, opts fnOpts) (fn ast.Fn, hadBody bool
 		identifierText := p.lexer.Identifier
 		arg := p.parseBinding()
 
-		if p.ts.Parse {
+		if p.TS.Parse {
 			// Skip over "readonly"
 			isBeforeBinding := p.lexer.Token == lexer.TIdentifier || p.lexer.Token == lexer.TOpenBrace || p.lexer.Token == lexer.TOpenBracket
 			if isBeforeBinding && isIdentifier && identifierText == "readonly" {
@@ -3620,15 +3532,17 @@ func (p *parser) parseFn(name *ast.LocRef, opts fnOpts) (fn ast.Fn, hadBody bool
 		p.declareBinding(ast.SymbolHoisted, arg, parseStmtOpts{})
 
 		var defaultValue *ast.Expr
-		if !hasRestArg && p.lexer.Token == lexer.TEquals {
+		if !fn.HasRestArg && p.lexer.Token == lexer.TEquals {
+			p.markSyntaxFeature(compat.DefaultArgument, p.lexer.Range())
 			p.lexer.Next()
 			value := p.parseExpr(ast.LComma)
 			defaultValue = &value
 		}
 
-		args = append(args, ast.Arg{
-			Binding: arg,
-			Default: defaultValue,
+		fn.Args = append(fn.Args, ast.Arg{
+			TSDecorators: tsDecorators,
+			Binding:      arg,
+			Default:      defaultValue,
 
 			// We need to track this because it affects code generation
 			IsTypeScriptCtorField: isTypeScriptField,
@@ -3637,7 +3551,7 @@ func (p *parser) parseFn(name *ast.LocRef, opts fnOpts) (fn ast.Fn, hadBody bool
 		if p.lexer.Token != lexer.TComma {
 			break
 		}
-		if hasRestArg {
+		if fn.HasRestArg {
 			p.lexer.Expect(lexer.TCloseParen)
 		}
 		p.lexer.Next()
@@ -3645,22 +3559,15 @@ func (p *parser) parseFn(name *ast.LocRef, opts fnOpts) (fn ast.Fn, hadBody bool
 
 	p.lexer.Expect(lexer.TCloseParen)
 
-	fn = ast.Fn{
-		Name:        name,
-		Args:        args,
-		HasRestArg:  hasRestArg,
-		IsAsync:     opts.allowAwait,
-		IsGenerator: opts.allowYield,
-	}
-
 	// "function foo(): any {}"
-	if p.ts.Parse && p.lexer.Token == lexer.TColon {
+	if p.TS.Parse && p.lexer.Token == lexer.TColon {
 		p.lexer.Next()
 		p.skipTypeScriptReturnType()
 	}
 
 	// "function foo(): any;"
 	if opts.allowMissingBodyForTypeScript && p.lexer.Token != lexer.TOpenBrace {
+		p.lexer.ExpectOrInsertSemicolon()
 		return
 	}
 
@@ -3671,74 +3578,51 @@ func (p *parser) parseFn(name *ast.LocRef, opts fnOpts) (fn ast.Fn, hadBody bool
 
 func (p *parser) parseClassStmt(loc ast.Loc, opts parseStmtOpts) ast.Stmt {
 	var name *ast.LocRef
-	p.lexer.Expect(lexer.TClass)
+	if p.lexer.Token == lexer.TClass {
+		p.markSyntaxFeature(compat.Class, p.lexer.Range())
+		p.lexer.Next()
+	} else {
+		p.lexer.Expected(lexer.TClass)
+	}
 
 	if !opts.isNameOptional || p.lexer.Token == lexer.TIdentifier {
 		nameLoc := p.lexer.Loc()
 		nameText := p.lexer.Identifier
 		p.lexer.Expect(lexer.TIdentifier)
-		name = &ast.LocRef{nameLoc, ast.InvalidRef}
+		name = &ast.LocRef{Loc: nameLoc, Ref: ast.InvalidRef}
 		if !opts.isTypeScriptDeclare {
 			name.Ref = p.declareSymbol(ast.SymbolClass, nameLoc, nameText)
-		}
-		if opts.isExport {
-			p.recordExport(nameLoc, nameText)
+			if opts.isExport {
+				p.recordExport(nameLoc, nameText, name.Ref)
+			}
 		}
 	}
 
 	// Even anonymous classes can have TypeScript type parameters
-	if p.ts.Parse {
+	if p.TS.Parse {
 		p.skipTypeScriptTypeParameters()
 	}
 
-	class := p.parseClass(name)
-	return ast.Stmt{loc, &ast.SClass{class, opts.isExport}}
+	classOpts := parseClassOpts{
+		allowTSDecorators:   true,
+		isTypeScriptDeclare: opts.isTypeScriptDeclare,
+	}
+	if opts.tsDecorators != nil {
+		classOpts.tsDecorators = opts.tsDecorators.values
+	}
+	class := p.parseClass(name, classOpts)
+	return ast.Stmt{Loc: loc, Data: &ast.SClass{Class: class, IsExport: opts.isExport}}
 }
 
-func (p *parser) parseAndSkipDecorators() {
-	for p.lexer.Token == lexer.TAt {
-		r := p.lexer.Range()
-		p.lexer.Next()
-
-		// Eat an identifier
-		r.Len = p.lexer.Range().End() - r.Loc.Start
-		p.lexer.Expect(lexer.TIdentifier)
-
-		// Eat an property access chain
-		for p.lexer.Token == lexer.TDot {
-			p.lexer.Next()
-			r.Len = p.lexer.Range().End() - r.Loc.Start
-			p.lexer.Expect(lexer.TIdentifier)
-		}
-
-		// Eat call expression arguments
-		if p.lexer.Token == lexer.TOpenParen {
-			p.lexer.Next()
-			depth := 0
-
-			// Skip to the matching close parenthesis. This doesn't have to be super
-			// accurate because we're in error recovery mode.
-			for p.lexer.Token != lexer.TEndOfFile && (p.lexer.Token != lexer.TCloseParen || depth > 0) {
-				switch p.lexer.Token {
-				case lexer.TOpenParen:
-					depth++
-				case lexer.TCloseParen:
-					depth--
-				}
-				p.lexer.Next()
-			}
-
-			r.Len = p.lexer.Range().End() - r.Loc.Start
-			p.lexer.Expect(lexer.TCloseParen)
-		}
-
-		p.addRangeError(r, "Decorators are not supported yet")
-	}
+type parseClassOpts struct {
+	tsDecorators        []ast.Expr
+	allowTSDecorators   bool
+	isTypeScriptDeclare bool
 }
 
 // By the time we call this, the identifier and type parameters have already
 // been parsed. We need to start parsing from the "extends" clause.
-func (p *parser) parseClass(name *ast.LocRef) ast.Class {
+func (p *parser) parseClass(name *ast.LocRef, classOpts parseClassOpts) ast.Class {
 	var extends *ast.Expr
 
 	if p.lexer.Token == lexer.TExtends {
@@ -3753,12 +3637,12 @@ func (p *parser) parseClass(name *ast.LocRef) ast.Class {
 		// This seems kind of wasteful to me but it's what the official compiler
 		// does and it probably doesn't have that high of a performance overhead
 		// because "extends" clauses aren't that frequent, so it should be ok.
-		if p.ts.Parse {
+		if p.TS.Parse {
 			p.skipTypeScriptTypeArguments(false /* isInsideJSXElement */)
 		}
 	}
 
-	if p.ts.Parse && p.lexer.Token == lexer.TImplements {
+	if p.TS.Parse && p.lexer.Token == lexer.TImplements {
 		p.lexer.Next()
 		for {
 			p.skipTypeScriptType(ast.LLowest)
@@ -3769,12 +3653,18 @@ func (p *parser) parseClass(name *ast.LocRef) ast.Class {
 		}
 	}
 
+	bodyLoc := p.lexer.Loc()
 	p.lexer.Expect(lexer.TOpenBrace)
 	properties := []ast.Property{}
 
-	// Allow "in" inside class bodies
+	// Allow "in" and private fields inside class bodies
 	oldAllowIn := p.allowIn
+	oldAllowPrivateIdentifiers := p.allowPrivateIdentifiers
 	p.allowIn = true
+	p.allowPrivateIdentifiers = true
+
+	// A scope is needed for private identifiers
+	scopeIndex := p.pushScopeForParsePass(ast.ScopeClassBody, bodyLoc)
 
 	for p.lexer.Token != lexer.TCloseBrace {
 		if p.lexer.Token == lexer.TSemicolon {
@@ -3782,21 +3672,41 @@ func (p *parser) parseClass(name *ast.LocRef) ast.Class {
 			continue
 		}
 
-		// Skip past decorators and recover even though they aren't supported
-		if p.ts.Parse {
-			p.parseAndSkipDecorators()
+		opts := propertyOpts{
+			isClass:           true,
+			allowTSDecorators: classOpts.allowTSDecorators,
+			classHasExtends:   extends != nil,
+		}
+
+		// Parse decorators for this property
+		if opts.allowTSDecorators {
+			opts.tsDecorators = p.parseTypeScriptDecorators()
 		}
 
 		// This property may turn out to be a type in TypeScript, which should be ignored
-		if property, ok := p.parseProperty(propertyContextClass, ast.PropertyNormal, propertyOpts{}, nil); ok {
+		if property, ok := p.parseProperty(ast.PropertyNormal, opts, nil); ok {
 			properties = append(properties, property)
 		}
 	}
 
+	// Discard the private identifier scope inside a TypeScript "declare class"
+	if classOpts.isTypeScriptDeclare {
+		p.popAndDiscardScope(scopeIndex)
+	} else {
+		p.popScope()
+	}
+
 	p.allowIn = oldAllowIn
+	p.allowPrivateIdentifiers = oldAllowPrivateIdentifiers
 
 	p.lexer.Expect(lexer.TCloseBrace)
-	return ast.Class{name, extends, properties}
+	return ast.Class{
+		TSDecorators: classOpts.tsDecorators,
+		Name:         name,
+		Extends:      extends,
+		BodyLoc:      bodyLoc,
+		Properties:   properties,
+	}
 }
 
 func (p *parser) parseLabelName() *ast.LocRef {
@@ -3804,28 +3714,30 @@ func (p *parser) parseLabelName() *ast.LocRef {
 		return nil
 	}
 
-	name := ast.LocRef{p.lexer.Loc(), p.storeNameInRef(p.lexer.Identifier)}
+	name := ast.LocRef{Loc: p.lexer.Loc(), Ref: p.storeNameInRef(p.lexer.Identifier)}
 	p.lexer.Next()
 	return &name
 }
 
-func (p *parser) parsePath() ast.Path {
-	path := ast.Path{p.lexer.Loc(), lexer.UTF16ToString(p.lexer.StringLiteral)}
+func (p *parser) parsePath() (ast.Loc, string) {
+	pathLoc := p.lexer.Loc()
+	pathText := lexer.UTF16ToString(p.lexer.StringLiteral)
 	if p.lexer.Token == lexer.TNoSubstitutionTemplateLiteral {
 		p.lexer.Next()
 	} else {
 		p.lexer.Expect(lexer.TStringLiteral)
 	}
-	return path
+	return pathLoc, pathText
 }
 
 // This assumes the "function" token has already been parsed
-func (p *parser) parseFnStmt(loc ast.Loc, opts parseStmtOpts, isAsync bool) ast.Stmt {
+func (p *parser) parseFnStmt(loc ast.Loc, opts parseStmtOpts, isAsync bool, asyncRange ast.Range) ast.Stmt {
 	isGenerator := p.lexer.Token == lexer.TAsterisk
 	if !opts.allowLexicalDecl && (isGenerator || isAsync) {
 		p.forbidLexicalDecl(loc)
 	}
 	if isGenerator {
+		p.markSyntaxFeature(compat.Generator, p.lexer.Range())
 		p.lexer.Next()
 	}
 
@@ -3837,29 +3749,29 @@ func (p *parser) parseFnStmt(loc ast.Loc, opts parseStmtOpts, isAsync bool) ast.
 		nameLoc := p.lexer.Loc()
 		nameText = p.lexer.Identifier
 		p.lexer.Expect(lexer.TIdentifier)
-		name = &ast.LocRef{nameLoc, ast.InvalidRef}
+		name = &ast.LocRef{Loc: nameLoc, Ref: ast.InvalidRef}
 	}
 
 	// Even anonymous functions can have TypeScript type parameters
-	if p.ts.Parse {
+	if p.TS.Parse {
 		p.skipTypeScriptTypeParameters()
 	}
 
 	scopeIndex := p.pushScopeForParsePass(ast.ScopeFunctionArgs, loc)
 
 	fn, hadBody := p.parseFn(name, fnOpts{
+		asyncRange: asyncRange,
 		allowAwait: isAsync,
 		allowYield: isGenerator,
 
 		// Only allow omitting the body if we're parsing TypeScript
-		allowMissingBodyForTypeScript: p.ts.Parse,
+		allowMissingBodyForTypeScript: p.TS.Parse,
 	})
 
 	// Don't output anything if it's just a forward declaration of a function
-	if !hadBody {
+	if opts.isTypeScriptDeclare || !hadBody {
 		p.popAndDiscardScope(scopeIndex)
-		p.lexer.ExpectOrInsertSemicolon()
-		return ast.Stmt{loc, &ast.STypeScript{}}
+		return ast.Stmt{Loc: loc, Data: &ast.STypeScript{}}
 	}
 
 	p.popScope()
@@ -3870,17 +3782,26 @@ func (p *parser) parseFnStmt(loc ast.Loc, opts parseStmtOpts, isAsync bool) ast.
 	//     function foo(): void;
 	//     function foo(): void {}
 	//
-	if !opts.isTypeScriptDeclare && name != nil {
+	if name != nil {
 		name.Ref = p.declareSymbol(ast.SymbolHoistedFunction, name.Loc, nameText)
 		if opts.isExport {
-			p.recordExport(name.Loc, nameText)
+			p.recordExport(name.Loc, nameText, name.Ref)
 		}
 	}
 
-	return ast.Stmt{loc, &ast.SFunction{fn, opts.isExport}}
+	return ast.Stmt{Loc: loc, Data: &ast.SFunction{Fn: fn, IsExport: opts.isExport}}
+}
+
+type deferredTSDecorators struct {
+	values []ast.Expr
+
+	// If this turns out to be a "declare class" statement, we need to undo the
+	// scopes that were potentially pushed while parsing the decorator arguments.
+	scopeIndex int
 }
 
 type parseStmtOpts struct {
+	tsDecorators        *deferredTSDecorators
 	allowLexicalDecl    bool
 	isModuleScope       bool
 	isNamespaceScope    bool
@@ -3895,13 +3816,27 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 	switch p.lexer.Token {
 	case lexer.TSemicolon:
 		p.lexer.Next()
-		return ast.Stmt{loc, &ast.SEmpty{}}
+		return ast.Stmt{Loc: loc, Data: &ast.SEmpty{}}
 
 	case lexer.TExport:
-		if !opts.isModuleScope && !opts.isNamespaceScope {
+		if opts.isModuleScope {
+			p.hasES6ExportSyntax = true
+		} else if !opts.isNamespaceScope {
 			p.lexer.Unexpected()
 		}
 		p.lexer.Next()
+
+		// TypeScript decorators only work on class declarations
+		// "@decorator export class Foo {}"
+		// "@decorator export abstract class Foo {}"
+		// "@decorator export default class Foo {}"
+		// "@decorator export default abstract class Foo {}"
+		// "@decorator export declare class Foo {}"
+		// "@decorator export declare abstract class Foo {}"
+		if opts.tsDecorators != nil && p.lexer.Token != lexer.TClass && p.lexer.Token != lexer.TDefault &&
+			!p.lexer.IsContextualKeyword("abstract") && !p.lexer.IsContextualKeyword("declare") {
+			p.lexer.Expected(lexer.TClass)
+		}
 
 		switch p.lexer.Token {
 		case lexer.TClass, lexer.TConst, lexer.TFunction, lexer.TLet, lexer.TVar:
@@ -3910,7 +3845,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 
 		case lexer.TImport:
 			// "export import foo = bar"
-			if p.ts.Parse && (opts.isModuleScope || opts.isNamespaceScope) {
+			if p.TS.Parse && (opts.isModuleScope || opts.isNamespaceScope) {
 				opts.isExport = true
 				return p.parseStmt(opts)
 			}
@@ -3919,14 +3854,14 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			return ast.Stmt{}
 
 		case lexer.TEnum:
-			if !p.ts.Parse {
+			if !p.TS.Parse {
 				p.lexer.Unexpected()
 			}
 			opts.isExport = true
 			return p.parseStmt(opts)
 
 		case lexer.TInterface:
-			if p.ts.Parse {
+			if p.TS.Parse {
 				opts.isExport = true
 				return p.parseStmt(opts)
 			}
@@ -3936,20 +3871,20 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		case lexer.TIdentifier:
 			if p.lexer.IsContextualKeyword("async") {
 				// "export async function foo() {}"
-				p.warnAboutFutureSyntax(ES2017, p.lexer.Range())
+				asyncRange := p.lexer.Range()
 				p.lexer.Next()
 				p.lexer.Expect(lexer.TFunction)
 				opts.isExport = true
-				return p.parseFnStmt(loc, opts, true /* isAsync */)
+				return p.parseFnStmt(loc, opts, true /* isAsync */, asyncRange)
 			}
 
-			if p.ts.Parse {
+			if p.TS.Parse {
 				switch p.lexer.Identifier {
 				case "type":
 					// "export type foo = ..."
 					p.lexer.Next()
 					p.skipTypeScriptTypeStmt(parseStmtOpts{isExport: true})
-					return ast.Stmt{loc, &ast.STypeScript{}}
+					return ast.Stmt{Loc: loc, Data: &ast.STypeScript{}}
 
 				case "namespace", "abstract", "module":
 					// "export namespace Foo {}"
@@ -3975,61 +3910,118 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 				p.lexer.Unexpected()
 			}
 
-			defaultName := ast.LocRef{p.lexer.Loc(), p.newSymbol(ast.SymbolOther, "default")}
-			p.currentScope.Generated = append(p.currentScope.Generated, defaultName.Ref)
+			defaultLoc := p.lexer.Loc()
 			p.lexer.Next()
+
+			// The default name is lazily generated only if no other name is present
+			createDefaultName := func() ast.LocRef {
+				defaultName := ast.LocRef{Loc: defaultLoc, Ref: p.newSymbol(ast.SymbolOther, p.source.IdentifierName+"_default")}
+				p.currentScope.Generated = append(p.currentScope.Generated, defaultName.Ref)
+				return defaultName
+			}
+
+			// TypeScript decorators only work on class declarations
+			// "@decorator export default class Foo {}"
+			// "@decorator export default abstract class Foo {}"
+			if opts.tsDecorators != nil && p.lexer.Token != lexer.TClass && !p.lexer.IsContextualKeyword("abstract") {
+				p.lexer.Expected(lexer.TClass)
+			}
 
 			if p.lexer.IsContextualKeyword("async") {
 				asyncRange := p.lexer.Range()
 				p.lexer.Next()
 
 				if p.lexer.Token == lexer.TFunction {
-					p.warnAboutFutureSyntax(ES2017, asyncRange)
 					p.lexer.Expect(lexer.TFunction)
 					stmt := p.parseFnStmt(loc, parseStmtOpts{
 						isNameOptional:   true,
 						allowLexicalDecl: true,
-					}, true /* isAsync */)
+					}, true /* isAsync */, asyncRange)
 					if _, ok := stmt.Data.(*ast.STypeScript); ok {
 						return stmt // This was just a type annotation
 					}
-					p.recordExport(defaultName.Loc, "default")
-					return ast.Stmt{loc, &ast.SExportDefault{defaultName, ast.ExprOrStmt{Stmt: &stmt}}}
+
+					// Use the statement name if present, since it's a better name
+					var defaultName ast.LocRef
+					if s, ok := stmt.Data.(*ast.SFunction); ok && s.Fn.Name != nil {
+						defaultName = ast.LocRef{Loc: defaultLoc, Ref: s.Fn.Name.Ref}
+					} else {
+						defaultName = createDefaultName()
+					}
+
+					p.recordExport(defaultLoc, "default", defaultName.Ref)
+					return ast.Stmt{Loc: loc, Data: &ast.SExportDefault{DefaultName: defaultName, Value: ast.ExprOrStmt{Stmt: &stmt}}}
 				}
 
-				expr := p.parseSuffix(p.parseAsyncPrefixExpr(asyncRange), ast.LComma, nil)
+				defaultName := createDefaultName()
+				p.recordExport(defaultLoc, "default", defaultName.Ref)
+				expr := p.parseSuffix(p.parseAsyncPrefixExpr(asyncRange), ast.LComma, nil, 0)
 				p.lexer.ExpectOrInsertSemicolon()
-				return ast.Stmt{loc, &ast.SExportDefault{defaultName, ast.ExprOrStmt{Expr: &expr}}}
+				return ast.Stmt{Loc: loc, Data: &ast.SExportDefault{DefaultName: defaultName, Value: ast.ExprOrStmt{Expr: &expr}}}
 			}
 
 			if p.lexer.Token == lexer.TFunction || p.lexer.Token == lexer.TClass || p.lexer.Token == lexer.TInterface {
 				stmt := p.parseStmt(parseStmtOpts{
+					tsDecorators:     opts.tsDecorators,
 					isNameOptional:   true,
 					allowLexicalDecl: true,
 				})
 				if _, ok := stmt.Data.(*ast.STypeScript); ok {
 					return stmt // This was just a type annotation
 				}
-				p.recordExport(defaultName.Loc, "default")
-				return ast.Stmt{loc, &ast.SExportDefault{defaultName, ast.ExprOrStmt{Stmt: &stmt}}}
+
+				// Use the statement name if present, since it's a better name
+				var defaultName ast.LocRef
+				switch s := stmt.Data.(type) {
+				case *ast.SFunction:
+					if s.Fn.Name != nil {
+						defaultName = ast.LocRef{Loc: defaultLoc, Ref: s.Fn.Name.Ref}
+					} else {
+						defaultName = createDefaultName()
+					}
+				case *ast.SClass:
+					if s.Class.Name != nil {
+						defaultName = ast.LocRef{Loc: defaultLoc, Ref: s.Class.Name.Ref}
+					} else {
+						defaultName = createDefaultName()
+					}
+				default:
+					defaultName = createDefaultName()
+				}
+
+				p.recordExport(defaultLoc, "default", defaultName.Ref)
+				return ast.Stmt{Loc: loc, Data: &ast.SExportDefault{DefaultName: defaultName, Value: ast.ExprOrStmt{Stmt: &stmt}}}
 			}
 
 			isIdentifier := p.lexer.Token == lexer.TIdentifier
 			name := p.lexer.Identifier
-
-			p.recordExport(defaultName.Loc, "default")
 			expr := p.parseExpr(ast.LComma)
 
 			// Handle the default export of an abstract class in TypeScript
-			if p.ts.Parse && isIdentifier && name == "abstract" && p.lexer.Token == lexer.TClass {
-				if _, ok := expr.Data.(*ast.EIdentifier); ok {
-					stmt := p.parseClassStmt(loc, parseStmtOpts{isNameOptional: true})
-					return ast.Stmt{loc, &ast.SExportDefault{defaultName, ast.ExprOrStmt{Stmt: &stmt}}}
+			if p.TS.Parse && isIdentifier && name == "abstract" {
+				if _, ok := expr.Data.(*ast.EIdentifier); ok && (p.lexer.Token == lexer.TClass || opts.tsDecorators != nil) {
+					stmt := p.parseClassStmt(loc, parseStmtOpts{
+						tsDecorators:   opts.tsDecorators,
+						isNameOptional: true,
+					})
+
+					// Use the statement name if present, since it's a better name
+					var defaultName ast.LocRef
+					if s, ok := stmt.Data.(*ast.SClass); ok && s.Class.Name != nil {
+						defaultName = ast.LocRef{Loc: defaultLoc, Ref: s.Class.Name.Ref}
+					} else {
+						defaultName = createDefaultName()
+					}
+
+					p.recordExport(defaultLoc, "default", defaultName.Ref)
+					return ast.Stmt{Loc: loc, Data: &ast.SExportDefault{DefaultName: defaultName, Value: ast.ExprOrStmt{Stmt: &stmt}}}
 				}
 			}
 
 			p.lexer.ExpectOrInsertSemicolon()
-			return ast.Stmt{loc, &ast.SExportDefault{defaultName, ast.ExprOrStmt{Expr: &expr}}}
+			defaultName := createDefaultName()
+			p.recordExport(defaultLoc, "default", defaultName.Ref)
+			return ast.Stmt{Loc: loc, Data: &ast.SExportDefault{DefaultName: defaultName, Value: ast.ExprOrStmt{Expr: &expr}}}
 
 		case lexer.TAsterisk:
 			if !opts.isModuleScope {
@@ -4037,41 +4029,66 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			}
 
 			p.lexer.Next()
-			var item *ast.ClauseItem
+			var namespaceRef ast.Ref
+			var alias *ast.ExportStarAlias
+			var pathLoc ast.Loc
+			var pathText string
+
 			if p.lexer.IsContextualKeyword("as") {
+				// "export * as ns from 'path'"
 				p.lexer.Next()
 				name := p.lexer.Identifier
-				nameLoc := p.lexer.Loc()
-				item = &ast.ClauseItem{name, nameLoc, ast.LocRef{nameLoc, p.storeNameInRef(name)}}
+				namespaceRef = p.storeNameInRef(name)
+				alias = &ast.ExportStarAlias{Loc: p.lexer.Loc(), Name: name}
 				p.lexer.Expect(lexer.TIdentifier)
+				p.lexer.ExpectContextualKeyword("from")
+				pathLoc, pathText = p.parsePath()
+			} else {
+				// "export * from 'path'"
+				p.lexer.ExpectContextualKeyword("from")
+				pathLoc, pathText = p.parsePath()
+				name := ast.GenerateNonUniqueNameFromPath(pathText) + "_star"
+				namespaceRef = p.storeNameInRef(name)
 			}
-			p.lexer.ExpectContextualKeyword("from")
-			path := p.parsePath()
+			importRecordIndex := p.addImportRecord(ast.ImportStmt, pathLoc, pathText)
+
 			p.lexer.ExpectOrInsertSemicolon()
-			return ast.Stmt{loc, &ast.SExportStar{item, path}}
+			return ast.Stmt{Loc: loc, Data: &ast.SExportStar{
+				NamespaceRef:      namespaceRef,
+				Alias:             alias,
+				ImportRecordIndex: importRecordIndex,
+			}}
 
 		case lexer.TOpenBrace:
 			if !opts.isModuleScope {
 				p.lexer.Unexpected()
 			}
 
-			items := p.parseExportClause()
+			items, isSingleLine := p.parseExportClause()
 			if p.lexer.IsContextualKeyword("from") {
 				p.lexer.Next()
-				path := p.parsePath()
+				pathLoc, pathText := p.parsePath()
+				importRecordIndex := p.addImportRecord(ast.ImportStmt, pathLoc, pathText)
+				name := ast.GenerateNonUniqueNameFromPath(pathText)
+				namespaceRef := p.storeNameInRef(name)
 				p.lexer.ExpectOrInsertSemicolon()
-				return ast.Stmt{loc, &ast.SExportFrom{items, ast.InvalidRef, path}}
+				return ast.Stmt{Loc: loc, Data: &ast.SExportFrom{
+					Items:             items,
+					NamespaceRef:      namespaceRef,
+					ImportRecordIndex: importRecordIndex,
+					IsSingleLine:      isSingleLine,
+				}}
 			}
 			p.lexer.ExpectOrInsertSemicolon()
-			return ast.Stmt{loc, &ast.SExportClause{items}}
+			return ast.Stmt{Loc: loc, Data: &ast.SExportClause{Items: items, IsSingleLine: isSingleLine}}
 
 		case lexer.TEquals:
 			// "export = value;"
-			if p.ts.Parse && p.exportEqualsStmt == nil {
+			if p.TS.Parse {
 				p.lexer.Next()
 				value := p.parseExpr(ast.LLowest)
 				p.lexer.ExpectOrInsertSemicolon()
-				return ast.Stmt{loc, &ast.SExportEquals{value}}
+				return ast.Stmt{Loc: loc, Data: &ast.SExportEquals{Value: value}}
 			}
 			p.lexer.Unexpected()
 			return ast.Stmt{}
@@ -4083,16 +4100,16 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 
 	case lexer.TFunction:
 		p.lexer.Next()
-		return p.parseFnStmt(loc, opts, false /* isAsync */)
+		return p.parseFnStmt(loc, opts, false /* isAsync */, ast.Range{})
 
 	case lexer.TEnum:
-		if !p.ts.Parse {
+		if !p.TS.Parse {
 			p.lexer.Unexpected()
 		}
-		return p.parseEnumStmt(loc, opts)
+		return p.parseTypeScriptEnumStmt(loc, opts)
 
 	case lexer.TInterface:
-		if !p.ts.Parse {
+		if !p.TS.Parse {
 			p.lexer.Unexpected()
 		}
 
@@ -4123,18 +4140,43 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		}
 
 		p.skipTypeScriptObjectType()
-		return ast.Stmt{loc, &ast.STypeScript{}}
+		return ast.Stmt{Loc: loc, Data: &ast.STypeScript{}}
 
 	case lexer.TAt:
-		// Skip past decorators and recover even though they aren't supported
-		if p.ts.Parse {
-			p.parseAndSkipDecorators()
-			if p.lexer.Token == lexer.TExport {
-				p.lexer.Next()
+		// Parse decorators before class statements, which are potentially exported
+		if p.TS.Parse {
+			scopeIndex := len(p.scopesInOrder)
+			tsDecorators := p.parseTypeScriptDecorators()
+
+			// If this turns out to be a "declare class" statement, we need to undo the
+			// scopes that were potentially pushed while parsing the decorator arguments.
+			// That can look like any one of the following:
+			//
+			//   "@decorator declare class Foo {}"
+			//   "@decorator declare abstract class Foo {}"
+			//   "@decorator export declare class Foo {}"
+			//   "@decorator export declare abstract class Foo {}"
+			//
+			opts.tsDecorators = &deferredTSDecorators{
+				values:     tsDecorators,
+				scopeIndex: scopeIndex,
 			}
-			if p.lexer.Token != lexer.TClass {
+
+			// "@decorator class Foo {}"
+			// "@decorator abstract class Foo {}"
+			// "@decorator declare class Foo {}"
+			// "@decorator declare abstract class Foo {}"
+			// "@decorator export class Foo {}"
+			// "@decorator export abstract class Foo {}"
+			// "@decorator export declare class Foo {}"
+			// "@decorator export declare abstract class Foo {}"
+			// "@decorator export default class Foo {}"
+			// "@decorator export default abstract class Foo {}"
+			if p.lexer.Token != lexer.TClass && p.lexer.Token != lexer.TExport &&
+				!p.lexer.IsContextualKeyword("abstract") && !p.lexer.IsContextualKeyword("declare") {
 				p.lexer.Expected(lexer.TClass)
 			}
+
 			return p.parseStmt(opts)
 		}
 
@@ -4151,7 +4193,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		p.lexer.Next()
 		decls := p.parseAndDeclareDecls(ast.SymbolHoisted, opts)
 		p.lexer.ExpectOrInsertSemicolon()
-		return ast.Stmt{loc, &ast.SLocal{
+		return ast.Stmt{Loc: loc, Data: &ast.SLocal{
 			Kind:     ast.LocalVar,
 			Decls:    decls,
 			IsExport: opts.isExport,
@@ -4161,10 +4203,11 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		if !opts.allowLexicalDecl {
 			p.forbidLexicalDecl(loc)
 		}
+		p.markSyntaxFeature(compat.Let, p.lexer.Range())
 		p.lexer.Next()
 		decls := p.parseAndDeclareDecls(ast.SymbolOther, opts)
 		p.lexer.ExpectOrInsertSemicolon()
-		return ast.Stmt{loc, &ast.SLocal{
+		return ast.Stmt{Loc: loc, Data: &ast.SLocal{
 			Kind:     ast.LocalLet,
 			Decls:    decls,
 			IsExport: opts.isExport,
@@ -4174,10 +4217,11 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		if !opts.allowLexicalDecl {
 			p.forbidLexicalDecl(loc)
 		}
+		p.markSyntaxFeature(compat.Const, p.lexer.Range())
 		p.lexer.Next()
 
-		if p.ts.Parse && p.lexer.Token == lexer.TEnum {
-			return p.parseEnumStmt(loc, opts)
+		if p.TS.Parse && p.lexer.Token == lexer.TEnum {
+			return p.parseTypeScriptEnumStmt(loc, opts)
 		}
 
 		decls := p.parseAndDeclareDecls(ast.SymbolOther, opts)
@@ -4185,7 +4229,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		if !opts.isTypeScriptDeclare {
 			p.requireInitializers(decls)
 		}
-		return ast.Stmt{loc, &ast.SLocal{
+		return ast.Stmt{Loc: loc, Data: &ast.SLocal{
 			Kind:     ast.LocalConst,
 			Decls:    decls,
 			IsExport: opts.isExport,
@@ -4203,7 +4247,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			stmt := p.parseStmt(parseStmtOpts{})
 			no = &stmt
 		}
-		return ast.Stmt{loc, &ast.SIf{test, yes, no}}
+		return ast.Stmt{Loc: loc, Data: &ast.SIf{Test: test, Yes: yes, No: no}}
 
 	case lexer.TDo:
 		p.lexer.Next()
@@ -4218,7 +4262,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		if p.lexer.Token == lexer.TSemicolon {
 			p.lexer.Next()
 		}
-		return ast.Stmt{loc, &ast.SDoWhile{body, test}}
+		return ast.Stmt{Loc: loc, Data: &ast.SDoWhile{Body: body, Test: test}}
 
 	case lexer.TWhile:
 		p.lexer.Next()
@@ -4226,7 +4270,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		test := p.parseExpr(ast.LLowest)
 		p.lexer.Expect(lexer.TCloseParen)
 		body := p.parseStmt(parseStmtOpts{})
-		return ast.Stmt{loc, &ast.SWhile{test, body}}
+		return ast.Stmt{Loc: loc, Data: &ast.SWhile{Test: test, Body: body}}
 
 	case lexer.TWith:
 		p.lexer.Next()
@@ -4242,7 +4286,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		body := p.parseStmt(parseStmtOpts{})
 		p.popScope()
 
-		return ast.Stmt{loc, &ast.SWith{test, bodyLoc, body}}
+		return ast.Stmt{Loc: loc, Data: &ast.SWith{Value: test, BodyLoc: bodyLoc, Body: body}}
 
 	case lexer.TSwitch:
 		p.lexer.Next()
@@ -4264,7 +4308,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 
 			if p.lexer.Token == lexer.TDefault {
 				if foundDefault {
-					p.log.AddRangeError(p.source, p.lexer.Range(), "Multiple default clauses are not allowed")
+					p.log.AddRangeError(&p.source, p.lexer.Range(), "Multiple default clauses are not allowed")
 					panic(lexer.LexerPanic{})
 				}
 				foundDefault = true
@@ -4288,11 +4332,11 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 				}
 			}
 
-			cases = append(cases, ast.Case{value, body})
+			cases = append(cases, ast.Case{Value: value, Body: body})
 		}
 
 		p.lexer.Expect(lexer.TCloseBrace)
-		return ast.Stmt{loc, &ast.SSwitch{
+		return ast.Stmt{Loc: loc, Data: &ast.SSwitch{
 			Test:    test,
 			BodyLoc: bodyLoc,
 			Cases:   cases,
@@ -4317,11 +4361,11 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 
 			// The catch binding is optional, and can be omitted
 			if p.lexer.Token == lexer.TOpenBrace {
-				if p.target < ES2019 {
+				if p.UnsupportedFeatures.Has(compat.OptionalCatchBinding) {
 					// Generate a new symbol for the catch binding for older browsers
 					ref := p.newSymbol(ast.SymbolOther, "e")
 					p.currentScope.Generated = append(p.currentScope.Generated, ref)
-					binding = &ast.Binding{p.lexer.Loc(), &ast.BIdentifier{ref}}
+					binding = &ast.Binding{Loc: p.lexer.Loc(), Data: &ast.BIdentifier{Ref: ref}}
 				}
 			} else {
 				p.lexer.Expect(lexer.TOpenParen)
@@ -4340,7 +4384,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			p.lexer.Expect(lexer.TOpenBrace)
 			stmts := p.parseStmtsUpTo(lexer.TCloseBrace, parseStmtOpts{})
 			p.lexer.Next()
-			catch = &ast.Catch{catchLoc, binding, stmts}
+			catch = &ast.Catch{Loc: catchLoc, Binding: binding, Body: stmts}
 			p.popScope()
 		}
 
@@ -4351,11 +4395,11 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			p.lexer.Expect(lexer.TOpenBrace)
 			stmts := p.parseStmtsUpTo(lexer.TCloseBrace, parseStmtOpts{})
 			p.lexer.Next()
-			finally = &ast.Finally{finallyLoc, stmts}
+			finally = &ast.Finally{Loc: finallyLoc, Stmts: stmts}
 			p.popScope()
 		}
 
-		return ast.Stmt{loc, &ast.STry{body, catch, finally}}
+		return ast.Stmt{Loc: loc, Data: &ast.STry{Body: body, Catch: catch, Finally: finally}}
 
 	case lexer.TFor:
 		p.pushScopeForParsePass(ast.ScopeBlock, loc)
@@ -4364,13 +4408,13 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		p.lexer.Next()
 
 		// "for await (let x of y) {}"
-		isAwait := p.lexer.IsContextualKeyword("await")
-		if isAwait {
+		isForAwait := p.lexer.IsContextualKeyword("await")
+		if isForAwait {
 			if !p.currentFnOpts.allowAwait {
-				p.addRangeError(p.lexer.Range(), "Cannot use \"await\" outside an async function")
-				isAwait = false
+				p.log.AddRangeError(&p.source, p.lexer.Range(), "Cannot use \"await\" outside an async function")
+				isForAwait = false
 			} else {
-				p.warnAboutFutureSyntax(ES2018, p.lexer.Range())
+				p.markSyntaxFeature(compat.ForAwait, p.lexer.Range())
 			}
 			p.lexer.Next()
 		}
@@ -4392,30 +4436,32 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			isVar = true
 			p.lexer.Next()
 			decls = p.parseAndDeclareDecls(ast.SymbolHoisted, parseStmtOpts{})
-			init = &ast.Stmt{initLoc, &ast.SLocal{Kind: ast.LocalVar, Decls: decls}}
+			init = &ast.Stmt{Loc: initLoc, Data: &ast.SLocal{Kind: ast.LocalVar, Decls: decls}}
 
 		case lexer.TLet:
+			p.markSyntaxFeature(compat.Let, p.lexer.Range())
 			p.lexer.Next()
 			decls = p.parseAndDeclareDecls(ast.SymbolOther, parseStmtOpts{})
-			init = &ast.Stmt{initLoc, &ast.SLocal{Kind: ast.LocalLet, Decls: decls}}
+			init = &ast.Stmt{Loc: initLoc, Data: &ast.SLocal{Kind: ast.LocalLet, Decls: decls}}
 
 		case lexer.TConst:
+			p.markSyntaxFeature(compat.Const, p.lexer.Range())
 			p.lexer.Next()
 			decls = p.parseAndDeclareDecls(ast.SymbolOther, parseStmtOpts{})
-			init = &ast.Stmt{initLoc, &ast.SLocal{Kind: ast.LocalConst, Decls: decls}}
+			init = &ast.Stmt{Loc: initLoc, Data: &ast.SLocal{Kind: ast.LocalConst, Decls: decls}}
 
 		case lexer.TSemicolon:
 
 		default:
-			init = &ast.Stmt{initLoc, &ast.SExpr{p.parseExpr(ast.LLowest)}}
+			init = &ast.Stmt{Loc: initLoc, Data: &ast.SExpr{Value: p.parseExpr(ast.LLowest)}}
 		}
 
 		// "in" expressions are allowed again
 		p.allowIn = true
 
 		// Detect for-of loops
-		if p.lexer.IsContextualKeyword("of") || isAwait {
-			if isAwait && !p.lexer.IsContextualKeyword("of") {
+		if p.lexer.IsContextualKeyword("of") || isForAwait {
+			if isForAwait && !p.lexer.IsContextualKeyword("of") {
 				if init != nil {
 					p.lexer.ExpectedString("\"of\"")
 				} else {
@@ -4423,11 +4469,12 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 				}
 			}
 			p.forbidInitializers(decls, "of", false)
+			p.markSyntaxFeature(compat.ForOf, p.lexer.Range())
 			p.lexer.Next()
 			value := p.parseExpr(ast.LLowest)
 			p.lexer.Expect(lexer.TCloseParen)
 			body := p.parseStmt(parseStmtOpts{})
-			return ast.Stmt{loc, &ast.SForOf{isAwait, *init, value, body}}
+			return ast.Stmt{Loc: loc, Data: &ast.SForOf{IsAwait: isForAwait, Init: *init, Value: value, Body: body}}
 		}
 
 		// Detect for-in loops
@@ -4437,7 +4484,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			value := p.parseExpr(ast.LLowest)
 			p.lexer.Expect(lexer.TCloseParen)
 			body := p.parseStmt(parseStmtOpts{})
-			return ast.Stmt{loc, &ast.SForIn{*init, value, body}}
+			return ast.Stmt{Loc: loc, Data: &ast.SForIn{Init: *init, Value: value, Body: body}}
 		}
 
 		// Only require "const" statement initializers when we know we're a normal for loop
@@ -4463,9 +4510,10 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 
 		p.lexer.Expect(lexer.TCloseParen)
 		body := p.parseStmt(parseStmtOpts{})
-		return ast.Stmt{loc, &ast.SFor{init, test, update, body}}
+		return ast.Stmt{Loc: loc, Data: &ast.SFor{Init: init, Test: test, Update: update, Body: body}}
 
 	case lexer.TImport:
+		p.hasES6ImportSyntax = true
 		p.lexer.Next()
 		stmt := ast.SImport{}
 
@@ -4479,9 +4527,9 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		case lexer.TOpenParen, lexer.TDot:
 			// "import('path')"
 			// "import.meta"
-			expr := p.parseSuffix(p.parseImportExpr(loc), ast.LLowest, nil)
+			expr := p.parseSuffix(p.parseImportExpr(loc), ast.LLowest, nil, 0)
 			p.lexer.ExpectOrInsertSemicolon()
-			return ast.Stmt{loc, &ast.SExpr{expr}}
+			return ast.Stmt{Loc: loc, Data: &ast.SExpr{Value: expr}}
 
 		case lexer.TStringLiteral, lexer.TNoSubstitutionTemplateLiteral:
 			// "import 'path'"
@@ -4501,7 +4549,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			p.lexer.ExpectContextualKeyword("as")
 			stmt.NamespaceRef = p.storeNameInRef(p.lexer.Identifier)
 			starLoc := p.lexer.Loc()
-			stmt.StarLoc = &starLoc
+			stmt.StarNameLoc = &starLoc
 			p.lexer.Expect(lexer.TIdentifier)
 			p.lexer.ExpectContextualKeyword("from")
 
@@ -4512,8 +4560,9 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 				return ast.Stmt{}
 			}
 
-			items := p.parseImportClause()
+			items, isSingleLine := p.parseImportClause()
 			stmt.Items = &items
+			stmt.IsSingleLine = isSingleLine
 			p.lexer.ExpectContextualKeyword("from")
 
 		case lexer.TIdentifier:
@@ -4525,10 +4574,10 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			}
 
 			defaultName := p.lexer.Identifier
-			stmt.DefaultName = &ast.LocRef{p.lexer.Loc(), p.storeNameInRef(defaultName)}
+			stmt.DefaultName = &ast.LocRef{Loc: p.lexer.Loc(), Ref: p.storeNameInRef(defaultName)}
 			p.lexer.Next()
 
-			if p.ts.Parse {
+			if p.TS.Parse {
 				// Skip over type-only imports
 				if defaultName == "type" {
 					switch p.lexer.Token {
@@ -4539,7 +4588,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 							p.lexer.ExpectContextualKeyword("from")
 							p.parsePath()
 							p.lexer.ExpectOrInsertSemicolon()
-							return ast.Stmt{loc, &ast.STypeScript{}}
+							return ast.Stmt{Loc: loc, Data: &ast.STypeScript{}}
 						}
 
 					case lexer.TAsterisk:
@@ -4550,7 +4599,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 						p.lexer.ExpectContextualKeyword("from")
 						p.parsePath()
 						p.lexer.ExpectOrInsertSemicolon()
-						return ast.Stmt{loc, &ast.STypeScript{}}
+						return ast.Stmt{Loc: loc, Data: &ast.STypeScript{}}
 
 					case lexer.TOpenBrace:
 						// "import type {foo} from 'bar';"
@@ -4558,7 +4607,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 						p.lexer.ExpectContextualKeyword("from")
 						p.parsePath()
 						p.lexer.ExpectOrInsertSemicolon()
-						return ast.Stmt{loc, &ast.STypeScript{}}
+						return ast.Stmt{Loc: loc, Data: &ast.STypeScript{}}
 					}
 				}
 
@@ -4567,19 +4616,19 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 					p.lexer.Expect(lexer.TEquals)
 					value := p.parseExpr(ast.LComma)
 					p.lexer.ExpectOrInsertSemicolon()
-					decls := []ast.Decl{ast.Decl{
-						ast.Binding{stmt.DefaultName.Loc,
-							&ast.BIdentifier{p.declareSymbol(ast.SymbolOther, stmt.DefaultName.Loc, defaultName)}},
-						&value,
+					ref := p.declareSymbol(ast.SymbolOther, stmt.DefaultName.Loc, defaultName)
+					decls := []ast.Decl{{
+						Binding: ast.Binding{Loc: stmt.DefaultName.Loc, Data: &ast.BIdentifier{Ref: ref}},
+						Value:   &value,
 					}}
 					if opts.isExport {
-						p.recordExport(stmt.DefaultName.Loc, defaultName)
+						p.recordExport(stmt.DefaultName.Loc, defaultName, ref)
 					}
 
 					// The kind of statement depends on the expression
 					if _, ok := value.Data.(*ast.ECall); ok {
 						// "import ns = require('x')"
-						return ast.Stmt{loc, &ast.SLocal{
+						return ast.Stmt{Loc: loc, Data: &ast.SLocal{
 							Kind:                         ast.LocalConst,
 							Decls:                        decls,
 							IsExport:                     opts.isExport,
@@ -4587,7 +4636,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 						}}
 					} else {
 						// "import Foo = Bar"
-						return ast.Stmt{loc, &ast.SLocal{
+						return ast.Stmt{Loc: loc, Data: &ast.SLocal{
 							Kind:                         ast.LocalVar,
 							Decls:                        decls,
 							IsExport:                     opts.isExport,
@@ -4606,13 +4655,14 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 					p.lexer.ExpectContextualKeyword("as")
 					stmt.NamespaceRef = p.storeNameInRef(p.lexer.Identifier)
 					starLoc := p.lexer.Loc()
-					stmt.StarLoc = &starLoc
+					stmt.StarNameLoc = &starLoc
 					p.lexer.Expect(lexer.TIdentifier)
 
 				case lexer.TOpenBrace:
 					// "import defaultItem, {item1, item2} from 'path'"
-					items := p.parseImportClause()
+					items, isSingleLine := p.parseImportClause()
 					stmt.Items = &items
+					stmt.IsSingleLine = isSingleLine
 
 				default:
 					p.lexer.Unexpected()
@@ -4626,63 +4676,57 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			return ast.Stmt{}
 		}
 
-		stmt.Path = p.parsePath()
+		pathLoc, pathText := p.parsePath()
+		stmt.ImportRecordIndex = p.addImportRecord(ast.ImportStmt, pathLoc, pathText)
 		p.lexer.ExpectOrInsertSemicolon()
-		kind := ast.SymbolOther
 
-		// In TypeScript, imports are allowed to silently collide with symbols within
-		// the module. Presumably this is because the imports may be type-only.
-		if p.ts.Parse {
-			kind = ast.SymbolTSImport
-		}
-
-		if stmt.StarLoc != nil {
+		if stmt.StarNameLoc != nil {
 			name := p.loadNameFromRef(stmt.NamespaceRef)
-			stmt.NamespaceRef = p.declareSymbol(kind, *stmt.StarLoc, name)
+			stmt.NamespaceRef = p.declareSymbol(ast.SymbolImport, *stmt.StarNameLoc, name)
 		} else {
 			// Generate a symbol for the namespace
-			name := ast.GenerateNonUniqueNameFromPath(stmt.Path.Text)
+			name := ast.GenerateNonUniqueNameFromPath(pathText)
 			stmt.NamespaceRef = p.newSymbol(ast.SymbolOther, name)
 			p.currentScope.Generated = append(p.currentScope.Generated, stmt.NamespaceRef)
 		}
-		itemRefs := make(map[string]ast.Ref)
+		itemRefs := make(map[string]ast.LocRef)
 
 		// Link the default item to the namespace
 		if stmt.DefaultName != nil {
 			name := p.loadNameFromRef(stmt.DefaultName.Ref)
-			ref := p.declareSymbol(kind, stmt.DefaultName.Loc, name)
+			ref := p.declareSymbol(ast.SymbolImport, stmt.DefaultName.Loc, name)
 			p.isImportItem[ref] = true
 			stmt.DefaultName.Ref = ref
-			itemRefs["default"] = ref
+			itemRefs["default"] = *stmt.DefaultName
 		}
 
 		// Link each import item to the namespace
 		if stmt.Items != nil {
 			for i, item := range *stmt.Items {
 				name := p.loadNameFromRef(item.Name.Ref)
-				ref := p.declareSymbol(kind, item.Name.Loc, name)
+				ref := p.declareSymbol(ast.SymbolImport, item.Name.Loc, name)
 				p.isImportItem[ref] = true
 				(*stmt.Items)[i].Name.Ref = ref
-				itemRefs[item.Alias] = ref
+				itemRefs[item.Alias] = ast.LocRef{Loc: item.Name.Loc, Ref: ref}
 			}
 		}
 
 		// Track the items for this namespace
 		p.importItemsForNamespace[stmt.NamespaceRef] = itemRefs
 
-		return ast.Stmt{loc, &stmt}
+		return ast.Stmt{Loc: loc, Data: &stmt}
 
 	case lexer.TBreak:
 		p.lexer.Next()
 		name := p.parseLabelName()
 		p.lexer.ExpectOrInsertSemicolon()
-		return ast.Stmt{loc, &ast.SBreak{name}}
+		return ast.Stmt{Loc: loc, Data: &ast.SBreak{Name: name}}
 
 	case lexer.TContinue:
 		p.lexer.Next()
 		name := p.parseLabelName()
 		p.lexer.ExpectOrInsertSemicolon()
-		return ast.Stmt{loc, &ast.SContinue{name}}
+		return ast.Stmt{Loc: loc, Data: &ast.SContinue{Name: name}}
 
 	case lexer.TReturn:
 		p.lexer.Next()
@@ -4699,22 +4743,22 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		if p.currentFnOpts.isOutsideFn {
 			p.hasTopLevelReturn = true
 		}
-		return ast.Stmt{loc, &ast.SReturn{value}}
+		return ast.Stmt{Loc: loc, Data: &ast.SReturn{Value: value}}
 
 	case lexer.TThrow:
 		p.lexer.Next()
 		if p.lexer.HasNewlineBefore {
-			p.addError(ast.Loc{loc.Start + 5}, "Unexpected newline after \"throw\"")
+			p.log.AddError(&p.source, ast.Loc{Start: loc.Start + 5}, "Unexpected newline after \"throw\"")
 			panic(lexer.LexerPanic{})
 		}
 		expr := p.parseExpr(ast.LLowest)
 		p.lexer.ExpectOrInsertSemicolon()
-		return ast.Stmt{loc, &ast.SThrow{expr}}
+		return ast.Stmt{Loc: loc, Data: &ast.SThrow{Value: expr}}
 
 	case lexer.TDebugger:
 		p.lexer.Next()
 		p.lexer.ExpectOrInsertSemicolon()
-		return ast.Stmt{loc, &ast.SDebugger{}}
+		return ast.Stmt{Loc: loc, Data: &ast.SDebugger{}}
 
 	case lexer.TOpenBrace:
 		p.pushScopeForParsePass(ast.ScopeBlock, loc)
@@ -4723,7 +4767,7 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		p.lexer.Next()
 		stmts := p.parseStmtsUpTo(lexer.TCloseBrace, parseStmtOpts{})
 		p.lexer.Next()
-		return ast.Stmt{loc, &ast.SBlock{stmts}}
+		return ast.Stmt{Loc: loc, Data: &ast.SBlock{Stmts: stmts}}
 
 	default:
 		isIdentifier := p.lexer.Token == lexer.TIdentifier
@@ -4735,35 +4779,34 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 			asyncRange := p.lexer.Range()
 			p.lexer.Next()
 			if p.lexer.Token == lexer.TFunction {
-				p.warnAboutFutureSyntax(ES2017, asyncRange)
 				p.lexer.Next()
-				return p.parseFnStmt(asyncRange.Loc, opts, true /* isAsync */)
+				return p.parseFnStmt(asyncRange.Loc, opts, true /* isAsync */, asyncRange)
 			}
-			expr = p.parseSuffix(p.parseAsyncPrefixExpr(asyncRange), ast.LLowest, nil)
+			expr = p.parseSuffix(p.parseAsyncPrefixExpr(asyncRange), ast.LLowest, nil, 0)
 		} else {
 			expr = p.parseExpr(ast.LLowest)
 		}
 
 		if isIdentifier {
 			if ident, ok := expr.Data.(*ast.EIdentifier); ok {
-				if p.lexer.Token == lexer.TColon {
+				if p.lexer.Token == lexer.TColon && opts.tsDecorators == nil {
 					p.pushScopeForParsePass(ast.ScopeLabel, loc)
 					defer p.popScope()
 
 					// Parse a labeled statement
 					p.lexer.Next()
-					name := ast.LocRef{expr.Loc, ident.Ref}
+					name := ast.LocRef{Loc: expr.Loc, Ref: ident.Ref}
 					stmt := p.parseStmt(parseStmtOpts{})
-					return ast.Stmt{loc, &ast.SLabel{name, stmt}}
+					return ast.Stmt{Loc: loc, Data: &ast.SLabel{Name: name, Stmt: stmt}}
 				}
 
-				if p.ts.Parse {
+				if p.TS.Parse {
 					switch name {
 					case "type":
 						if p.lexer.Token == lexer.TIdentifier {
 							// "type Foo = any"
 							p.skipTypeScriptTypeStmt(parseStmtOpts{})
-							return ast.Stmt{loc, &ast.STypeScript{}}
+							return ast.Stmt{Loc: loc, Data: &ast.STypeScript{}}
 						}
 
 					case "namespace", "module":
@@ -4773,11 +4816,11 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 						// "declare module 'fs';"
 						if (opts.isModuleScope || opts.isNamespaceScope) && (p.lexer.Token == lexer.TIdentifier ||
 							(p.lexer.Token == lexer.TStringLiteral && opts.isTypeScriptDeclare)) {
-							return p.parseNamespaceStmt(loc, opts)
+							return p.parseTypeScriptNamespaceStmt(loc, opts)
 						}
 
 					case "abstract":
-						if p.lexer.Token == lexer.TClass {
+						if p.lexer.Token == lexer.TClass || opts.tsDecorators != nil {
 							return p.parseClassStmt(loc, opts)
 						}
 
@@ -4785,18 +4828,64 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 						opts.allowLexicalDecl = true
 						opts.isTypeScriptDeclare = true
 
+						// "@decorator declare class Foo {}"
+						// "@decorator declare abstract class Foo {}"
+						if opts.tsDecorators != nil && p.lexer.Token != lexer.TClass && !p.lexer.IsContextualKeyword("abstract") {
+							p.lexer.Expected(lexer.TClass)
+						}
+
 						// "declare global { ... }"
 						if p.lexer.IsContextualKeyword("global") {
 							p.lexer.Next()
 							p.lexer.Expect(lexer.TOpenBrace)
 							p.parseStmtsUpTo(lexer.TCloseBrace, opts)
 							p.lexer.Next()
-							return ast.Stmt{loc, &ast.STypeScript{}}
+							return ast.Stmt{Loc: loc, Data: &ast.STypeScript{}}
 						}
 
 						// "declare const x: any"
-						p.parseStmt(opts)
-						return ast.Stmt{loc, &ast.STypeScript{}}
+						stmt := p.parseStmt(opts)
+						if opts.tsDecorators != nil {
+							p.discardScopesUpTo(opts.tsDecorators.scopeIndex)
+						}
+
+						// Unlike almost all uses of "declare", statements that use
+						// "export declare" with "var/let/const" inside a namespace affect
+						// code generation. They cause any declared bindings to be
+						// considered exports of the namespace. Identifier references to
+						// those names must be converted into property accesses off the
+						// namespace object:
+						//
+						//   namespace ns {
+						//     export declare const x
+						//     export function y() { return x }
+						//   }
+						//
+						//   (ns as any).x = 1
+						//   console.log(ns.y())
+						//
+						// In this example, "return x" must be replaced with "return ns.x".
+						// This is handled by replacing each "export declare" statement
+						// inside a namespace with an "export var" statement containing all
+						// of the declared bindings. That "export var" statement will later
+						// cause identifiers to be transformed into property accesses.
+						if opts.isNamespaceScope && opts.isExport {
+							var decls []ast.Decl
+							if s, ok := stmt.Data.(*ast.SLocal); ok {
+								for _, decl := range s.Decls {
+									decls = extractDeclsForBinding(decl.Binding, decls)
+								}
+							}
+							if len(decls) > 0 {
+								return ast.Stmt{Loc: loc, Data: &ast.SLocal{
+									Kind:     ast.LocalVar,
+									IsExport: true,
+									Decls:    decls,
+								}}
+							}
+						}
+
+						return ast.Stmt{Loc: loc, Data: &ast.STypeScript{}}
 					}
 				}
 			}
@@ -4805,157 +4894,47 @@ func (p *parser) parseStmt(opts parseStmtOpts) ast.Stmt {
 		p.lexer.ExpectOrInsertSemicolon()
 
 		// Parse a "use strict" directive
-		if str, ok := expr.Data.(*ast.EString); ok && len(str.Value) == len("use strict") {
-			isEqual := true
-			for i, c := range str.Value {
-				if c != uint16("use strict"[i]) {
-					isEqual = false
-					break
-				}
-			}
-			if isEqual {
-				return ast.Stmt{loc, &ast.SDirective{Value: str.Value}}
-			}
+		if str, ok := expr.Data.(*ast.EString); ok && lexer.UTF16EqualsString(str.Value, "use strict") {
+			return ast.Stmt{Loc: loc, Data: &ast.SDirective{Value: str.Value}}
 		}
 
-		return ast.Stmt{loc, &ast.SExpr{expr}}
+		return ast.Stmt{Loc: loc, Data: &ast.SExpr{Value: expr}}
 	}
 }
 
-func (p *parser) parseNamespaceStmt(loc ast.Loc, opts parseStmtOpts) ast.Stmt {
-	// "namespace Foo {}"
-	nameLoc := p.lexer.Loc()
-	nameText := p.lexer.Identifier
-	p.lexer.Next()
+func extractDeclsForBinding(binding ast.Binding, decls []ast.Decl) []ast.Decl {
+	switch b := binding.Data.(type) {
+	case *ast.BMissing:
 
-	name := ast.LocRef{nameLoc, ast.InvalidRef}
-	argRef := ast.InvalidRef
+	case *ast.BIdentifier:
+		decls = append(decls, ast.Decl{Binding: binding})
 
-	scopeIndex := p.pushScopeForParsePass(ast.ScopeEntry, loc)
-	oldEnclosingNamespaceRef := p.enclosingNamespaceRef
-	p.enclosingNamespaceRef = &name.Ref
-
-	if !opts.isTypeScriptDeclare {
-		argRef = p.declareSymbol(ast.SymbolHoistedFunction, nameLoc, nameText)
-	}
-
-	var stmts []ast.Stmt
-	if p.lexer.Token == lexer.TDot {
-		dotLoc := p.lexer.Loc()
-		p.lexer.Next()
-		stmts = []ast.Stmt{p.parseNamespaceStmt(dotLoc, parseStmtOpts{
-			isExport:            true,
-			isNamespaceScope:    true,
-			isTypeScriptDeclare: opts.isTypeScriptDeclare,
-		})}
-	} else if opts.isTypeScriptDeclare && p.lexer.Token != lexer.TOpenBrace {
-		p.lexer.ExpectOrInsertSemicolon()
-	} else {
-		p.lexer.Expect(lexer.TOpenBrace)
-		stmts = p.parseStmtsUpTo(lexer.TCloseBrace, parseStmtOpts{
-			isNamespaceScope:    true,
-			isTypeScriptDeclare: opts.isTypeScriptDeclare,
-		})
-		p.lexer.Next()
-	}
-
-	p.enclosingNamespaceRef = oldEnclosingNamespaceRef
-
-	// Import assignments may be only used in type expressions, not value
-	// expressions. If this is the case, the TypeScript compiler removes
-	// them entirely from the output. That can cause the namespace itself
-	// to be considered empty and thus be removed.
-	importEqualsCount := 0
-	for _, stmt := range stmts {
-		if local, ok := stmt.Data.(*ast.SLocal); ok && local.WasTSImportEqualsInNamespace && !local.IsExport {
-			importEqualsCount++
+	case *ast.BArray:
+		for _, item := range b.Items {
+			decls = extractDeclsForBinding(item.Binding, decls)
 		}
-	}
 
-	// TypeScript omits namespaces without values. These namespaces
-	// are only allowed to be used in type expressions. They are
-	// allowed to be exported, but can also only be used in type
-	// expressions when imported. So we shouldn't count them as a
-	// real export either.
-	if len(stmts) == importEqualsCount || opts.isTypeScriptDeclare {
-		p.popAndDiscardScope(scopeIndex)
-		return ast.Stmt{loc, &ast.STypeScript{}}
-	}
-
-	p.popScope()
-	if !opts.isTypeScriptDeclare {
-		_, alreadyExists := p.currentScope.Members[nameText]
-		name.Ref = p.declareSymbol(ast.SymbolTSNamespace, nameLoc, nameText)
-
-		// It's valid to have multiple exported namespace statements as long as
-		// each one has the "export" keyword. Make sure we don't record the same
-		// export more than once, because then we will incorrectly detect duplicate
-		// exports.
-		if opts.isExport && !alreadyExists {
-			p.recordExport(nameLoc, nameText)
+	case *ast.BObject:
+		for _, property := range b.Properties {
+			decls = extractDeclsForBinding(property.Value, decls)
 		}
+
+	default:
+		panic("Internal error")
 	}
-	return ast.Stmt{loc, &ast.SNamespace{name, argRef, stmts, opts.isExport}}
+
+	return decls
 }
 
-func (p *parser) parseEnumStmt(loc ast.Loc, opts parseStmtOpts) ast.Stmt {
-	p.lexer.Expect(lexer.TEnum)
-	nameLoc := p.lexer.Loc()
-	nameText := p.lexer.Identifier
-	p.lexer.Expect(lexer.TIdentifier)
-	name := ast.LocRef{nameLoc, ast.InvalidRef}
-	argRef := ast.InvalidRef
-	if !opts.isTypeScriptDeclare {
-		name.Ref = p.declareSymbol(ast.SymbolTSEnum, nameLoc, nameText)
-		p.pushScopeForParsePass(ast.ScopeEntry, loc)
-		argRef = p.declareSymbol(ast.SymbolHoisted, nameLoc, nameText)
-	}
-	p.lexer.Expect(lexer.TOpenBrace)
-
-	values := []ast.EnumValue{}
-
-	for p.lexer.Token != lexer.TCloseBrace {
-		value := ast.EnumValue{
-			Loc: p.lexer.Loc(),
-			Ref: ast.InvalidRef,
-		}
-
-		// Parse the name
-		if p.lexer.Token == lexer.TStringLiteral {
-			value.Name = p.lexer.StringLiteral
-		} else if p.lexer.IsIdentifierOrKeyword() {
-			value.Name = lexer.StringToUTF16(p.lexer.Identifier)
-		} else {
-			p.lexer.Expect(lexer.TIdentifier)
-		}
-		p.lexer.Next()
-
-		// Identifiers can be referenced by other values
-		if !opts.isTypeScriptDeclare && lexer.IsIdentifierUTF16(value.Name) {
-			value.Ref = p.declareSymbol(ast.SymbolOther, value.Loc, lexer.UTF16ToString(value.Name))
-		}
-
-		// Parse the initializer
-		if p.lexer.Token == lexer.TEquals {
-			p.lexer.Next()
-			initializer := p.parseExpr(ast.LComma)
-			value.Value = &initializer
-		}
-
-		values = append(values, value)
-
-		if p.lexer.Token != lexer.TComma && p.lexer.Token != lexer.TSemicolon {
-			break
-		}
-		p.lexer.Next()
-	}
-
-	if !opts.isTypeScriptDeclare {
-		p.popScope()
-	}
-
-	p.lexer.Expect(lexer.TCloseBrace)
-	return ast.Stmt{loc, &ast.SEnum{name, argRef, values, opts.isExport}}
+func (p *parser) addImportRecord(kind ast.ImportKind, loc ast.Loc, text string) uint32 {
+	index := uint32(len(p.importRecords))
+	p.importRecords = append(p.importRecords, ast.ImportRecord{
+		Kind:       kind,
+		Loc:        loc,
+		Path:       ast.Path{Text: text},
+		WrapperRef: ast.InvalidRef,
+	})
+	return index
 }
 
 func (p *parser) parseFnBody(opts fnOpts) ast.FnBody {
@@ -4974,11 +4953,11 @@ func (p *parser) parseFnBody(opts fnOpts) ast.FnBody {
 
 	p.allowIn = oldAllowIn
 	p.currentFnOpts = oldFnOpts
-	return ast.FnBody{loc, stmts}
+	return ast.FnBody{Loc: loc, Stmts: stmts}
 }
 
 func (p *parser) forbidLexicalDecl(loc ast.Loc) {
-	p.addError(loc, "Cannot use a declaration in a single-statement context")
+	p.log.AddError(&p.source, loc, "Cannot use a declaration in a single-statement context")
 }
 
 func (p *parser) parseStmtsUpTo(end lexer.T, opts parseStmtOpts) []ast.Stmt {
@@ -4986,11 +4965,26 @@ func (p *parser) parseStmtsUpTo(end lexer.T, opts parseStmtOpts) []ast.Stmt {
 	returnWithoutSemicolonStart := int32(-1)
 	opts.allowLexicalDecl = true
 
-	for p.lexer.Token != end {
+	for {
+		// Preserve some statement-level comments
+		comments := p.lexer.CommentsToPreserveBefore
+		if len(comments) > 0 {
+			for _, comment := range comments {
+				stmts = append(stmts, ast.Stmt{
+					Loc:  comment.Loc,
+					Data: &ast.SComment{Text: comment.Text},
+				})
+			}
+		}
+
+		if p.lexer.Token == end {
+			break
+		}
+
 		stmt := p.parseStmt(opts)
 
 		// Skip TypeScript types entirely
-		if p.ts.Parse {
+		if p.TS.Parse {
 			if _, ok := stmt.Data.(*ast.STypeScript); ok {
 				continue
 			}
@@ -4999,27 +4993,20 @@ func (p *parser) parseStmtsUpTo(end lexer.T, opts parseStmtOpts) []ast.Stmt {
 		stmts = append(stmts, stmt)
 
 		// Warn about ASI and return statements
-		if !p.omitWarnings {
-			if s, ok := stmt.Data.(*ast.SReturn); ok && s.Value == nil && !p.latestReturnHadSemicolon {
-				returnWithoutSemicolonStart = stmt.Loc.Start
-			} else {
-				if returnWithoutSemicolonStart != -1 {
-					if _, ok := stmt.Data.(*ast.SExpr); ok {
-						p.log.AddWarning(p.source, ast.Loc{returnWithoutSemicolonStart + 6},
-							"The following expression is not returned because of an automatically-inserted semicolon")
-					}
+		if s, ok := stmt.Data.(*ast.SReturn); ok && s.Value == nil && !p.latestReturnHadSemicolon {
+			returnWithoutSemicolonStart = stmt.Loc.Start
+		} else {
+			if returnWithoutSemicolonStart != -1 {
+				if _, ok := stmt.Data.(*ast.SExpr); ok {
+					p.log.AddWarning(&p.source, ast.Loc{Start: returnWithoutSemicolonStart + 6},
+						"The following expression is not returned because of an automatically-inserted semicolon")
 				}
-				returnWithoutSemicolonStart = -1
 			}
+			returnWithoutSemicolonStart = -1
 		}
 	}
 
 	return stmts
-}
-
-type dotDefine struct {
-	parts      []string
-	defineFunc DefineFunc
 }
 
 type generateTempRefArg uint8
@@ -5029,13 +5016,16 @@ const (
 	tempRefNoDeclare
 )
 
-func (p *parser) generateTempRef(declare generateTempRefArg) ast.Ref {
+func (p *parser) generateTempRef(declare generateTempRefArg, optionalName string) ast.Ref {
 	scope := p.currentScope
 	for !scope.Kind.StopsHoisting() {
 		scope = scope.Parent
 	}
-	ref := p.newSymbol(ast.SymbolOther, "_"+lexer.NumberToMinifiedName(p.tempRefCount))
-	p.tempRefCount++
+	if optionalName == "" {
+		optionalName = "_" + lexer.NumberToMinifiedName(p.tempRefCount)
+		p.tempRefCount++
+	}
+	ref := p.newSymbol(ast.SymbolOther, optionalName)
 	if declare == tempRefNeedsDeclare {
 		p.tempRefsToDeclare = append(p.tempRefsToDeclare, ref)
 	}
@@ -5112,7 +5102,7 @@ func (p *parser) findLabelSymbol(loc ast.Loc, name string) ast.Ref {
 	}
 
 	r := lexer.RangeOfIdentifier(p.source, loc)
-	p.log.AddRangeError(p.source, r, fmt.Sprintf("There is no containing label named %q", name))
+	p.log.AddRangeError(&p.source, r, fmt.Sprintf("There is no containing label named %q", name))
 
 	// Allocate an "unbound" symbol
 	ref := p.newSymbol(ast.SymbolUnbound, name)
@@ -5128,13 +5118,13 @@ func findIdentifiers(binding ast.Binding, identifiers []ast.Decl) []ast.Decl {
 		identifiers = append(identifiers, ast.Decl{Binding: binding})
 
 	case *ast.BArray:
-		for _, i := range b.Items {
-			identifiers = findIdentifiers(i.Binding, identifiers)
+		for _, item := range b.Items {
+			identifiers = findIdentifiers(item.Binding, identifiers)
 		}
 
 	case *ast.BObject:
-		for _, i := range b.Properties {
-			identifiers = findIdentifiers(i.Value, identifiers)
+		for _, property := range b.Properties {
+			identifiers = findIdentifiers(property.Value, identifiers)
 		}
 	}
 
@@ -5191,9 +5181,16 @@ func (p *parser) visitStmtsAndPrependTempRefs(stmts []ast.Stmt) []ast.Stmt {
 	if len(p.tempRefsToDeclare) > 0 {
 		decls := []ast.Decl{}
 		for _, ref := range p.tempRefsToDeclare {
-			decls = append(decls, ast.Decl{ast.Binding{ast.Loc{}, &ast.BIdentifier{ref}}, nil})
+			decls = append(decls, ast.Decl{Binding: ast.Binding{Data: &ast.BIdentifier{Ref: ref}}})
 		}
-		stmts = append([]ast.Stmt{ast.Stmt{ast.Loc{}, &ast.SLocal{Kind: ast.LocalVar, Decls: decls}}}, stmts...)
+
+		// If the first statement is a super() call, make sure it stays that way
+		stmt := ast.Stmt{Data: &ast.SLocal{Kind: ast.LocalVar, Decls: decls}}
+		if len(stmts) > 0 && ast.IsSuperCall(stmts[0]) {
+			stmts = append([]ast.Stmt{stmts[0], stmt}, stmts[1:]...)
+		} else {
+			stmts = append([]ast.Stmt{stmt}, stmts...)
+		}
 	}
 
 	p.tempRefsToDeclare = oldTempRefs
@@ -5204,12 +5201,21 @@ func (p *parser) visitStmtsAndPrependTempRefs(stmts []ast.Stmt) []ast.Stmt {
 func (p *parser) visitStmts(stmts []ast.Stmt) []ast.Stmt {
 	// Visit all statements first
 	visited := make([]ast.Stmt, 0, len(stmts))
+	var after []ast.Stmt
 	for _, stmt := range stmts {
-		visited = p.visitAndAppendStmt(visited, stmt)
+		if _, ok := stmt.Data.(*ast.SExportEquals); ok {
+			// TypeScript "export = value;" becomes "module.exports = value;". This
+			// must happen at the end after everything is parsed because TypeScript
+			// moves this statement to the end when it generates code.
+			after = p.visitAndAppendStmt(after, stmt)
+		} else {
+			visited = p.visitAndAppendStmt(visited, stmt)
+		}
 	}
+	visited = append(visited, after...)
 
 	// Stop now if we're not mangling
-	if !p.mangleSyntax {
+	if !p.MangleSyntax {
 		return visited
 	}
 
@@ -5287,7 +5293,7 @@ func (p *parser) visitStmts(stmts []ast.Stmt) []ast.Stmt {
 				prevStmt := result[len(result)-1]
 				if prevS, ok := prevStmt.Data.(*ast.SExpr); ok {
 					value := ast.JoinWithComma(prevS.Value, *s.Value)
-					result[len(result)-1] = ast.Stmt{prevStmt.Loc, &ast.SReturn{&value}}
+					result[len(result)-1] = ast.Stmt{Loc: prevStmt.Loc, Data: &ast.SReturn{Value: &value}}
 					continue
 				}
 			}
@@ -5297,7 +5303,7 @@ func (p *parser) visitStmts(stmts []ast.Stmt) []ast.Stmt {
 			if len(result) > 0 {
 				prevStmt := result[len(result)-1]
 				if prevS, ok := prevStmt.Data.(*ast.SExpr); ok {
-					result[len(result)-1] = ast.Stmt{prevStmt.Loc, &ast.SThrow{ast.JoinWithComma(prevS.Value, s.Value)}}
+					result[len(result)-1] = ast.Stmt{Loc: prevStmt.Loc, Data: &ast.SThrow{Value: ast.JoinWithComma(prevS.Value, s.Value)}}
 					continue
 				}
 			}
@@ -5309,11 +5315,11 @@ func (p *parser) visitStmts(stmts []ast.Stmt) []ast.Stmt {
 					// Insert the previous expression into the for loop initializer
 					if s.Init == nil {
 						result[len(result)-1] = stmt
-						s.Init = &ast.Stmt{prevStmt.Loc, &ast.SExpr{prevS.Value}}
+						s.Init = &ast.Stmt{Loc: prevStmt.Loc, Data: &ast.SExpr{Value: prevS.Value}}
 						continue
 					} else if s2, ok := s.Init.Data.(*ast.SExpr); ok {
 						result[len(result)-1] = stmt
-						s.Init = &ast.Stmt{prevStmt.Loc, &ast.SExpr{ast.JoinWithComma(prevS.Value, s2.Value)}}
+						s.Init = &ast.Stmt{Loc: prevStmt.Loc, Data: &ast.SExpr{Value: ast.JoinWithComma(prevS.Value, s2.Value)}}
 						continue
 					}
 				} else {
@@ -5362,10 +5368,10 @@ func (p *parser) visitStmts(stmts []ast.Stmt) []ast.Stmt {
 
 					// "a(); return b;" => "return a(), b;"
 					lastValue := ast.JoinWithComma(prevS.Value, *lastReturn.Value)
-					lastReturn = &ast.SReturn{&lastValue}
+					lastReturn = &ast.SReturn{Value: &lastValue}
 
 					// Merge the last two statements
-					lastStmt = ast.Stmt{prevStmt.Loc, lastReturn}
+					lastStmt = ast.Stmt{Loc: prevStmt.Loc, Data: lastReturn}
 					result[prevIndex] = lastStmt
 					result = result[:len(result)-1]
 
@@ -5386,11 +5392,11 @@ func (p *parser) visitStmts(stmts []ast.Stmt) []ast.Stmt {
 					right := lastReturn.Value
 					if left == nil {
 						// "if (a) return; return b;" => "return a ? void 0 : b;"
-						left = &ast.Expr{prevS.Yes.Loc, &ast.EUndefined{}}
+						left = &ast.Expr{Loc: prevS.Yes.Loc, Data: &ast.EUndefined{}}
 					}
 					if right == nil {
 						// "if (a) return a; return;" => "return a ? b : void 0;"
-						right = &ast.Expr{lastStmt.Loc, &ast.EUndefined{}}
+						right = &ast.Expr{Loc: lastStmt.Loc, Data: &ast.EUndefined{}}
 					}
 
 					// "if (!a) return b; return c;" => "return a ? c : b;"
@@ -5403,14 +5409,14 @@ func (p *parser) visitStmts(stmts []ast.Stmt) []ast.Stmt {
 					if boolean, ok := checkEqualityIfNoSideEffects(left.Data, right.Data); ok && boolean {
 						// "if (a) return b; return b;" => "return a, b;"
 						lastValue := ast.JoinWithComma(prevS.Test, *left)
-						lastReturn = &ast.SReturn{&lastValue}
+						lastReturn = &ast.SReturn{Value: &lastValue}
 					} else {
 						// "if (a) return b; return c;" => "return a ? b : c;"
-						lastReturn = &ast.SReturn{&ast.Expr{prevS.Test.Loc, &ast.EIf{prevS.Test, *left, *right}}}
+						lastReturn = &ast.SReturn{Value: &ast.Expr{Loc: prevS.Test.Loc, Data: &ast.EIf{Test: prevS.Test, Yes: *left, No: *right}}}
 					}
 
 					// Merge the last two statements
-					lastStmt = ast.Stmt{prevStmt.Loc, lastReturn}
+					lastStmt = ast.Stmt{Loc: prevStmt.Loc, Data: lastReturn}
 					result[prevIndex] = lastStmt
 					result = result[:len(result)-1]
 
@@ -5428,10 +5434,10 @@ func (p *parser) visitStmts(stmts []ast.Stmt) []ast.Stmt {
 				switch prevS := prevStmt.Data.(type) {
 				case *ast.SExpr:
 					// "a(); throw b;" => "throw a(), b;"
-					lastThrow = &ast.SThrow{ast.JoinWithComma(prevS.Value, lastThrow.Value)}
+					lastThrow = &ast.SThrow{Value: ast.JoinWithComma(prevS.Value, lastThrow.Value)}
 
 					// Merge the last two statements
-					lastStmt = ast.Stmt{prevStmt.Loc, lastThrow}
+					lastStmt = ast.Stmt{Loc: prevStmt.Loc, Data: lastThrow}
 					result[prevIndex] = lastStmt
 					result = result[:len(result)-1]
 
@@ -5457,8 +5463,8 @@ func (p *parser) visitStmts(stmts []ast.Stmt) []ast.Stmt {
 					}
 
 					// Merge the last two statements
-					lastThrow = &ast.SThrow{ast.Expr{prevS.Test.Loc, &ast.EIf{prevS.Test, left, right}}}
-					lastStmt = ast.Stmt{prevStmt.Loc, lastThrow}
+					lastThrow = &ast.SThrow{Value: ast.Expr{Loc: prevS.Test.Loc, Data: &ast.EIf{Test: prevS.Test, Yes: left, No: right}}}
+					lastStmt = ast.Stmt{Loc: prevStmt.Loc, Data: lastThrow}
 					result[prevIndex] = lastStmt
 					result = result[:len(result)-1]
 
@@ -5478,382 +5484,63 @@ func (p *parser) visitSingleStmt(stmt ast.Stmt) ast.Stmt {
 	// This statement could potentially expand to several statements
 	switch len(stmts) {
 	case 0:
-		return ast.Stmt{stmt.Loc, &ast.SEmpty{}}
+		return ast.Stmt{Loc: stmt.Loc, Data: &ast.SEmpty{}}
 	case 1:
 		return stmts[0]
 	default:
-		return ast.Stmt{stmt.Loc, &ast.SBlock{stmts}}
+		return ast.Stmt{Loc: stmt.Loc, Data: &ast.SBlock{Stmts: stmts}}
 	}
 }
 
-func (p *parser) lowerExponentiationAssignmentOperator(loc ast.Loc, e *ast.EBinary) ast.Expr {
-	switch left := e.Left.Data.(type) {
-	case *ast.EDot:
-		if !left.IsOptionalChain {
-			referenceFunc, wrapFunc := p.captureValueWithPossibleSideEffects(loc, 2, left.Target)
-			p.usedRuntimeSyms |= runtime.PowSym
-			return wrapFunc(ast.Expr{loc, &ast.EBinary{
-				Op: ast.BinOpAssign,
-				Left: ast.Expr{e.Left.Loc, &ast.EDot{
-					Target:  referenceFunc(),
-					Name:    left.Name,
-					NameLoc: left.NameLoc,
-				}},
-				Right: ast.Expr{loc, &ast.ERuntimeCall{
-					Sym: runtime.PowSym,
-					Args: []ast.Expr{
-						ast.Expr{e.Left.Loc, &ast.EDot{
-							Target:  referenceFunc(),
-							Name:    left.Name,
-							NameLoc: left.NameLoc,
-						}},
-						e.Right,
-					},
-				}},
-			}})
+func (p *parser) visitForLoopInit(stmt ast.Stmt, isInOrOf bool) ast.Stmt {
+	switch s := stmt.Data.(type) {
+	case *ast.SExpr:
+		assignTarget := ast.AssignTargetNone
+		if isInOrOf {
+			assignTarget = ast.AssignTargetReplace
 		}
+		s.Value, _ = p.visitExprInOut(s.Value, exprIn{assignTarget: assignTarget})
 
-	case *ast.EIndex:
-		if !left.IsOptionalChain {
-			targetFunc, targetWrapFunc := p.captureValueWithPossibleSideEffects(loc, 2, left.Target)
-			indexFunc, indexWrapFunc := p.captureValueWithPossibleSideEffects(loc, 2, left.Index)
-			p.usedRuntimeSyms |= runtime.PowSym
-			return targetWrapFunc(indexWrapFunc(ast.Expr{loc, &ast.EBinary{
-				Op: ast.BinOpAssign,
-				Left: ast.Expr{e.Left.Loc, &ast.EIndex{
-					Target: targetFunc(),
-					Index:  indexFunc(),
-				}},
-				Right: ast.Expr{loc, &ast.ERuntimeCall{
-					Sym: runtime.PowSym,
-					Args: []ast.Expr{
-						ast.Expr{e.Left.Loc, &ast.EIndex{
-							Target: targetFunc(),
-							Index:  indexFunc(),
-						}},
-						e.Right,
-					},
-				}},
-			}}))
+	case *ast.SLocal:
+		for _, d := range s.Decls {
+			p.visitBinding(d.Binding)
+			if d.Value != nil {
+				*d.Value = p.visitExpr(*d.Value)
+			}
 		}
+		s.Decls = p.lowerObjectRestInDecls(s.Decls)
 
-	case *ast.EIdentifier:
-		p.usedRuntimeSyms |= runtime.PowSym
-		return ast.Expr{loc, &ast.EBinary{
-			Op:   ast.BinOpAssign,
-			Left: ast.Expr{e.Left.Loc, &ast.EIdentifier{left.Ref}},
-			Right: ast.Expr{loc, &ast.ERuntimeCall{
-				Sym:  runtime.PowSym,
-				Args: []ast.Expr{e.Left, e.Right},
-			}},
-		}}
+	default:
+		panic("Internal error")
 	}
 
-	// We shouldn't get here with valid syntax? Just let this through for now
-	// since there's currently no assignment target validation. Garbage in,
-	// garbage out.
-	return ast.Expr{loc, e}
+	return stmt
 }
 
-// Lower object spread for environments that don't support them. Non-spread
-// properties are grouped into object literals and then passed to __assign()
-// like this (__assign() is an alias for Object.assign()):
-//
-//   "{a, b, ...c, d, e}" => "__assign(__assign(__assign({a, b}, c), {d, e})"
-//
-// If the object literal starts with a spread, then we pass an empty object
-// literal to __assign() to make sure we clone the object:
-//
-//   "{...a, b}" => "__assign(__assign({}, a), {b})"
-//
-// It's not immediately obvious why we don't compile everything to a single
-// call to __assign(). After all, Object.assign() can take any number of
-// arguments. The reason is to preserve the order of side effects. Consider
-// this code:
-//
-//   let a = {get x() { b = {y: 2}; return 1 }}
-//   let b = {}
-//   let c = {...a, ...b}
-//
-// Converting the above code to "let c = __assign({}, a, b)" means "c" becomes
-// "{x: 1}" which is incorrect. Converting the above code instead to
-// "let c = __assign(__assign({}, a), b)" means "c" becomes "{x: 1, y: 2}"
-// which is correct.
-func (p *parser) lowerObjectSpread(loc ast.Loc, e *ast.EObject) ast.Expr {
-	needsLowering := false
-
-	if p.target < ES2018 {
-		for _, property := range e.Properties {
-			if property.Kind == ast.PropertySpread {
-				needsLowering = true
-				break
-			}
-		}
-	}
-
-	if !needsLowering {
-		return ast.Expr{loc, e}
-	}
-
-	var result ast.Expr
-	properties := []ast.Property{}
-
-	for _, property := range e.Properties {
-		if property.Kind != ast.PropertySpread {
-			properties = append(properties, property)
-			continue
-		}
-
-		if len(properties) > 0 || result.Data == nil {
-			if result.Data == nil {
-				// "{a, ...b}" => "__assign({a}, b)"
-				result = ast.Expr{loc, &ast.EObject{properties}}
-			} else {
-				// "{...a, b, ...c}" => "__assign(__assign(__assign({}, a), {b}), c)"
-				result = ast.Expr{loc, &ast.ERuntimeCall{
-					Sym:  runtime.AssignSym,
-					Args: []ast.Expr{result, ast.Expr{loc, &ast.EObject{properties}}},
-				}}
-			}
-			properties = []ast.Property{}
-		}
-
-		// "{a, ...b}" => "__assign({a}, b)"
-		result = ast.Expr{loc, &ast.ERuntimeCall{
-			Sym:  runtime.AssignSym,
-			Args: []ast.Expr{result, *property.Value},
-		}}
-	}
-
-	if len(properties) > 0 {
-		// "{...a, b}" => "__assign(__assign({}, a), {b})"
-		result = ast.Expr{loc, &ast.ERuntimeCall{
-			Sym:  runtime.AssignSym,
-			Args: []ast.Expr{result, ast.Expr{loc, &ast.EObject{properties}}},
-		}}
-	}
-
-	p.usedRuntimeSyms |= runtime.AssignSym
-	return result
-}
-
-// Lower class fields for environments that don't support them
-func (p *parser) lowerClass(classLoc ast.Loc, class *ast.Class, isStmt bool) (
-	staticFields []ast.Expr, // Generated static field initializers
-	newExpr ast.Expr, // Only for !isStmt, should replace the expression if not nil
-) {
-	if !p.ts.Parse && p.target >= ESNext {
-		return
-	}
-
-	var ctor *ast.EFunction
-	props := class.Properties
-	parameterFields := []ast.Stmt{}
-	instanceFields := []ast.Stmt{}
-	end := 0
-
-	// These are only for class expressions that need to be captured
-	var nameFunc func() ast.Expr
-	var wrapFunc func(ast.Expr) ast.Expr
-	var classExpr *ast.EClass
-
-	for _, prop := range props {
-		// Instance and static fields are a JavaScript feature
-		if (p.ts.Parse || p.target < ESNext) && !prop.IsMethod && (prop.IsStatic || prop.Value == nil) {
-			// The TypeScript compiler doesn't follow the JavaScript spec for
-			// uninitialized fields. They are supposed to be set to undefined but the
-			// TypeScript compiler just omits them entirely.
-			if p.ts.Parse && prop.Initializer == nil && prop.Value == nil {
-				continue
-			}
-
-			// Determine where to store the field
-			var target ast.Expr
-			if prop.IsStatic {
-				if nameFunc == nil {
-					if !isStmt {
-						// If this is a class expression, capture and store it. We have to
-						// do this even if it has a name since the name isn't exposed
-						// outside the class body.
-						classExpr = &ast.EClass{}
-						nameFunc, wrapFunc = p.captureValueWithPossibleSideEffects(classLoc, 2, ast.Expr{classLoc, classExpr})
-						newExpr = nameFunc()
-					} else {
-						// Otherwise, this is a class statement. Just use the class name.
-						nameFunc = func() ast.Expr {
-							p.recordUsage(class.Name.Ref)
-							return ast.Expr{classLoc, &ast.EIdentifier{class.Name.Ref}}
-						}
-
-						// Class statements can be missing a name if they are in an
-						// "export default" statement:
-						//
-						//   export default class {
-						//     static foo = 123
-						//   }
-						//
-						if class.Name == nil {
-							class.Name = &ast.LocRef{classLoc, p.generateTempRef(tempRefNoDeclare)}
-						}
-					}
-				}
-				target = nameFunc()
-			} else {
-				target = ast.Expr{prop.Key.Loc, &ast.EThis{}}
-			}
-
-			// Generate the assignment target
-			if key, ok := prop.Key.Data.(*ast.EString); ok && !prop.IsComputed {
-				target = ast.Expr{prop.Key.Loc, &ast.EDot{
-					Target:  target,
-					Name:    lexer.UTF16ToString(key.Value),
-					NameLoc: prop.Key.Loc,
-				}}
-			} else {
-				target = ast.Expr{prop.Key.Loc, &ast.EIndex{
-					Target: target,
-					Index:  prop.Key,
-				}}
-			}
-
-			// Generate the assignment initializer
-			var init ast.Expr
-			if prop.Initializer != nil {
-				init = *prop.Initializer
-			} else if prop.Value != nil {
-				init = *prop.Value
-			} else {
-				init = ast.Expr{prop.Key.Loc, &ast.EUndefined{}}
-			}
-
-			expr := ast.Expr{prop.Key.Loc, &ast.EBinary{ast.BinOpAssign, target, init}}
-			if prop.IsStatic {
-				// Move this property to an assignment after the class ends
-				staticFields = append(staticFields, expr)
-			} else {
-				// Move this property to an assignment inside the class constructor
-				instanceFields = append(instanceFields, ast.Stmt{prop.Key.Loc, &ast.SExpr{expr}})
-			}
-			continue
-		}
-
-		// Remember where the constructor is for later
-		if prop.IsMethod && prop.Value != nil {
-			if str, ok := prop.Key.Data.(*ast.EString); ok && lexer.UTF16ToString(str.Value) == "constructor" {
-				if fn, ok := prop.Value.Data.(*ast.EFunction); ok {
-					ctor = fn
-
-					// Initialize TypeScript constructor parameter fields
-					if p.ts.Parse {
-						for _, arg := range ctor.Fn.Args {
-							if arg.IsTypeScriptCtorField {
-								if id, ok := arg.Binding.Data.(*ast.BIdentifier); ok {
-									parameterFields = append(parameterFields, ast.Stmt{arg.Binding.Loc, &ast.SExpr{ast.Expr{arg.Binding.Loc, &ast.EBinary{
-										ast.BinOpAssign,
-										ast.Expr{arg.Binding.Loc, &ast.EDot{
-											Target:  ast.Expr{arg.Binding.Loc, &ast.EThis{}},
-											Name:    p.symbols[id.Ref.InnerIndex].Name,
-											NameLoc: arg.Binding.Loc,
-										}},
-										ast.Expr{arg.Binding.Loc, &ast.EIdentifier{id.Ref}},
-									}}}})
-								}
-							}
-						}
-					}
-				}
-			}
-		}
-
-		// Keep this property
-		props[end] = prop
-		end++
-	}
-
-	// Finish the filtering operation
-	props = props[:end]
-
-	// Insert instance field initializers into the constructor
-	if len(instanceFields) > 0 || len(parameterFields) > 0 {
-		// Create a constructor if one doesn't already exist
-		if ctor == nil {
-			ctor = &ast.EFunction{}
-
-			// Append it to the list to reuse existing allocation space
-			props = append(props, ast.Property{
-				IsMethod: true,
-				Key:      ast.Expr{classLoc, &ast.EString{lexer.StringToUTF16("constructor")}},
-				Value:    &ast.Expr{classLoc, ctor},
-			})
-
-			// Make sure the constructor has a super() call if needed
-			if class.Extends != nil {
-				argumentsRef := p.newSymbol(ast.SymbolUnbound, "arguments")
-				p.currentScope.Generated = append(p.currentScope.Generated, argumentsRef)
-				ctor.Fn.Body.Stmts = append(ctor.Fn.Body.Stmts, ast.Stmt{classLoc, &ast.SExpr{ast.Expr{classLoc, &ast.ECall{
-					Target: ast.Expr{classLoc, &ast.ESuper{}},
-					Args: []ast.Expr{
-						ast.Expr{classLoc, &ast.ESpread{ast.Expr{classLoc, &ast.EIdentifier{argumentsRef}}}},
-					},
-				}}}})
-			}
-		}
-
-		// Insert the instance field initializers after the super call if there is one
-		stmtsFrom := ctor.Fn.Body.Stmts
-		stmtsTo := []ast.Stmt{}
-		if len(stmtsFrom) > 0 && ast.IsSuperCall(stmtsFrom[0]) {
-			stmtsTo = append(stmtsTo, stmtsFrom[0])
-			stmtsFrom = stmtsFrom[1:]
-		}
-		stmtsTo = append(stmtsTo, parameterFields...)
-		stmtsTo = append(stmtsTo, instanceFields...)
-		ctor.Fn.Body.Stmts = append(stmtsTo, stmtsFrom...)
-
-		// Sort the constructor first to match the TypeScript compiler's output
-		for i := 0; i < len(props); i++ {
-			if props[i].Value != nil && props[i].Value.Data == ctor {
-				ctorProp := props[i]
-				for j := i; j > 0; j-- {
-					props[j] = props[j-1]
-				}
-				props[0] = ctorProp
-				break
-			}
-		}
-	}
-
-	class.Properties = props
-
-	// Join the static field initializers if this is a class expression
-	if !isStmt && len(staticFields) > 0 {
-		classExpr.Class = *class
-		for _, initializer := range staticFields {
-			newExpr = ast.JoinWithComma(newExpr, initializer)
-		}
-		newExpr = ast.JoinWithComma(newExpr, nameFunc())
-		if wrapFunc != nil {
-			newExpr = wrapFunc(newExpr)
-		}
-	}
-
-	return
+func (p *parser) recordDeclaredSymbol(ref ast.Ref) {
+	p.declaredSymbols = append(p.declaredSymbols, ast.DeclaredSymbol{
+		Ref:        ref,
+		IsTopLevel: p.currentScope == p.moduleScope,
+	})
 }
 
 func (p *parser) visitBinding(binding ast.Binding) {
-	switch d := binding.Data.(type) {
-	case *ast.BMissing, *ast.BIdentifier:
+	switch b := binding.Data.(type) {
+	case *ast.BMissing:
+
+	case *ast.BIdentifier:
+		p.recordDeclaredSymbol(b.Ref)
 
 	case *ast.BArray:
-		for _, i := range d.Items {
-			p.visitBinding(i.Binding)
-			if i.DefaultValue != nil {
-				*i.DefaultValue = p.visitExpr(*i.DefaultValue)
+		for _, item := range b.Items {
+			p.visitBinding(item.Binding)
+			if item.DefaultValue != nil {
+				*item.DefaultValue = p.visitExpr(*item.DefaultValue)
 			}
 		}
 
 	case *ast.BObject:
-		for i, property := range d.Properties {
+		for i, property := range b.Properties {
 			if !property.IsSpread {
 				property.Key = p.visitExpr(property.Key)
 			}
@@ -5861,11 +5548,11 @@ func (p *parser) visitBinding(binding ast.Binding) {
 			if property.DefaultValue != nil {
 				*property.DefaultValue = p.visitExpr(*property.DefaultValue)
 			}
-			d.Properties[i] = property
+			b.Properties[i] = property
 		}
 
 	default:
-		panic(fmt.Sprintf("Unexpected binding of type %T", binding.Data))
+		panic("Internal error")
 	}
 }
 
@@ -5885,7 +5572,7 @@ func statementCaresAboutScope(stmt ast.Stmt) bool {
 	}
 }
 
-func mangleIf(loc ast.Loc, s *ast.SIf, isTestBooleanConstant bool, testBooleanValue bool) ast.Stmt {
+func (p *parser) mangleIf(loc ast.Loc, s *ast.SIf, isTestBooleanConstant bool, testBooleanValue bool) ast.Stmt {
 	// Constant folding using the test expression
 	if isTestBooleanConstant {
 		if testBooleanValue {
@@ -5893,7 +5580,7 @@ func mangleIf(loc ast.Loc, s *ast.SIf, isTestBooleanConstant bool, testBooleanVa
 			if s.No == nil || !shouldKeepStmtInDeadControlFlow(*s.No) {
 				// We can drop the "no" branch
 				if statementCaresAboutScope(s.Yes) {
-					return ast.Stmt{s.Yes.Loc, &ast.SBlock{[]ast.Stmt{s.Yes}}}
+					return ast.Stmt{Loc: s.Yes.Loc, Data: &ast.SBlock{Stmts: []ast.Stmt{s.Yes}}}
 				} else {
 					return s.Yes
 				}
@@ -5905,9 +5592,9 @@ func mangleIf(loc ast.Loc, s *ast.SIf, isTestBooleanConstant bool, testBooleanVa
 			if !shouldKeepStmtInDeadControlFlow(s.Yes) {
 				// We can drop the "yes" branch
 				if s.No == nil {
-					return ast.Stmt{loc, &ast.SEmpty{}}
+					return ast.Stmt{Loc: loc, Data: &ast.SEmpty{}}
 				} else if statementCaresAboutScope(*s.No) {
-					return ast.Stmt{s.No.Loc, &ast.SBlock{[]ast.Stmt{*s.No}}}
+					return ast.Stmt{Loc: s.No.Loc, Data: &ast.SBlock{Stmts: []ast.Stmt{*s.No}}}
 				} else {
 					return *s.No
 				}
@@ -5922,33 +5609,33 @@ func mangleIf(loc ast.Loc, s *ast.SIf, isTestBooleanConstant bool, testBooleanVa
 		if s.No == nil {
 			if not, ok := s.Test.Data.(*ast.EUnary); ok && not.Op == ast.UnOpNot {
 				// "if (!a) b();" => "a || b();"
-				return ast.Stmt{loc, &ast.SExpr{ast.Expr{loc, &ast.EBinary{
-					ast.BinOpLogicalOr,
-					not.Value,
-					yes.Value,
+				return ast.Stmt{Loc: loc, Data: &ast.SExpr{Value: ast.Expr{Loc: loc, Data: &ast.EBinary{
+					Op:    ast.BinOpLogicalOr,
+					Left:  not.Value,
+					Right: yes.Value,
 				}}}}
 			} else {
 				// "if (a) b();" => "a && b();"
-				return ast.Stmt{loc, &ast.SExpr{ast.Expr{loc, &ast.EBinary{
-					ast.BinOpLogicalAnd,
-					s.Test,
-					yes.Value,
+				return ast.Stmt{Loc: loc, Data: &ast.SExpr{Value: ast.Expr{Loc: loc, Data: &ast.EBinary{
+					Op:    ast.BinOpLogicalAnd,
+					Left:  s.Test,
+					Right: yes.Value,
 				}}}}
 			}
 		} else if no, ok := s.No.Data.(*ast.SExpr); ok {
 			if not, ok := s.Test.Data.(*ast.EUnary); ok && not.Op == ast.UnOpNot {
 				// "if (!a) b(); else c();" => "a ? c() : b();"
-				return ast.Stmt{loc, &ast.SExpr{ast.Expr{loc, &ast.EIf{
-					not.Value,
-					no.Value,
-					yes.Value,
+				return ast.Stmt{Loc: loc, Data: &ast.SExpr{Value: ast.Expr{Loc: loc, Data: &ast.EIf{
+					Test: not.Value,
+					Yes:  no.Value,
+					No:   yes.Value,
 				}}}}
 			} else {
 				// "if (a) b(); else c();" => "a ? b() : c();"
-				return ast.Stmt{loc, &ast.SExpr{ast.Expr{loc, &ast.EIf{
-					s.Test,
-					yes.Value,
-					no.Value,
+				return ast.Stmt{Loc: loc, Data: &ast.SExpr{Value: ast.Expr{Loc: loc, Data: &ast.EIf{
+					Test: s.Test,
+					Yes:  yes.Value,
+					No:   no.Value,
 				}}}}
 			}
 		}
@@ -5956,27 +5643,27 @@ func mangleIf(loc ast.Loc, s *ast.SIf, isTestBooleanConstant bool, testBooleanVa
 		// "yes" is missing
 		if s.No == nil {
 			// "yes" and "no" are both missing
-			if hasNoSideEffects(s.Test.Data) {
+			if p.exprCanBeRemovedIfUnused(s.Test) {
 				// "if (1) {}" => ";"
-				return ast.Stmt{loc, &ast.SEmpty{}}
+				return ast.Stmt{Loc: loc, Data: &ast.SEmpty{}}
 			} else {
 				// "if (a) {}" => "a;"
-				return ast.Stmt{loc, &ast.SExpr{s.Test}}
+				return ast.Stmt{Loc: loc, Data: &ast.SExpr{Value: s.Test}}
 			}
 		} else if no, ok := s.No.Data.(*ast.SExpr); ok {
 			if not, ok := s.Test.Data.(*ast.EUnary); ok && not.Op == ast.UnOpNot {
 				// "if (!a) {} else b();" => "a && b();"
-				return ast.Stmt{loc, &ast.SExpr{ast.Expr{loc, &ast.EBinary{
-					ast.BinOpLogicalAnd,
-					not.Value,
-					no.Value,
+				return ast.Stmt{Loc: loc, Data: &ast.SExpr{Value: ast.Expr{Loc: loc, Data: &ast.EBinary{
+					Op:    ast.BinOpLogicalAnd,
+					Left:  not.Value,
+					Right: no.Value,
 				}}}}
 			} else {
 				// "if (a) {} else b();" => "a || b();"
-				return ast.Stmt{loc, &ast.SExpr{ast.Expr{loc, &ast.EBinary{
-					ast.BinOpLogicalOr,
-					s.Test,
-					no.Value,
+				return ast.Stmt{Loc: loc, Data: &ast.SExpr{Value: ast.Expr{Loc: loc, Data: &ast.EBinary{
+					Op:    ast.BinOpLogicalOr,
+					Left:  s.Test,
+					Right: no.Value,
 				}}}}
 			}
 		} else {
@@ -5988,7 +5675,7 @@ func mangleIf(loc ast.Loc, s *ast.SIf, isTestBooleanConstant bool, testBooleanVa
 				s.No = nil
 			} else {
 				// "if (a) {} else throw b;" => "if (!a) throw b;"
-				s.Test = ast.Expr{s.Test.Loc, &ast.EUnary{ast.UnOpNot, s.Test}}
+				s.Test = ast.Expr{Loc: s.Test.Loc, Data: &ast.EUnary{Op: ast.UnOpNot, Value: s.Test}}
 				s.Yes = *s.No
 				s.No = nil
 			}
@@ -6005,98 +5692,12 @@ func mangleIf(loc ast.Loc, s *ast.SIf, isTestBooleanConstant bool, testBooleanVa
 		}
 	}
 
-	return ast.Stmt{loc, s}
-}
-
-func (p *parser) generateClosureForNamespaceOrEnum(
-	stmts []ast.Stmt, stmtLoc ast.Loc, isExport bool, nameLoc ast.Loc,
-	nameRef ast.Ref, argRef ast.Ref, stmtsInsideClosure []ast.Stmt,
-) []ast.Stmt {
-	// Follow the link chain in case symbols were merged
-	symbol := p.symbols[nameRef.InnerIndex]
-	for symbol.Link != ast.InvalidRef {
-		nameRef = symbol.Link
-		symbol = p.symbols[nameRef.InnerIndex]
-	}
-
-	// Make sure to only emit a variable once for a given namespace, since there
-	// can be multiple namespace blocks for the same namespace
-	if (symbol.Kind == ast.SymbolTSNamespace || symbol.Kind == ast.SymbolTSEnum) && !p.emittedNamespaceVars[nameRef] {
-		p.emittedNamespaceVars[nameRef] = true
-		if p.enclosingNamespaceRef == nil {
-			// Top-level namespace
-			stmts = append(stmts, ast.Stmt{stmtLoc, &ast.SLocal{
-				Kind:     ast.LocalVar,
-				Decls:    []ast.Decl{ast.Decl{ast.Binding{nameLoc, &ast.BIdentifier{nameRef}}, nil}},
-				IsExport: isExport,
-			}})
-		} else {
-			// Nested namespace
-			stmts = append(stmts, ast.Stmt{stmtLoc, &ast.SLocal{
-				Kind:  ast.LocalLet,
-				Decls: []ast.Decl{ast.Decl{ast.Binding{nameLoc, &ast.BIdentifier{nameRef}}, nil}},
-			}})
-		}
-	}
-
-	var argExpr ast.Expr
-	if isExport && p.enclosingNamespaceRef != nil {
-		// "name = enclosing.name || (enclosing.name = {})"
-		name := p.symbols[nameRef.InnerIndex].Name
-		argExpr = ast.Expr{nameLoc, &ast.EBinary{
-			ast.BinOpAssign,
-			ast.Expr{nameLoc, &ast.EIdentifier{nameRef}},
-			ast.Expr{nameLoc, &ast.EBinary{
-				ast.BinOpLogicalOr,
-				ast.Expr{nameLoc, &ast.EDot{
-					Target:  ast.Expr{nameLoc, &ast.EIdentifier{*p.enclosingNamespaceRef}},
-					Name:    name,
-					NameLoc: nameLoc,
-				}},
-				ast.Expr{nameLoc, &ast.EBinary{
-					ast.BinOpAssign,
-					ast.Expr{nameLoc, &ast.EDot{
-						Target:  ast.Expr{nameLoc, &ast.EIdentifier{*p.enclosingNamespaceRef}},
-						Name:    name,
-						NameLoc: nameLoc,
-					}},
-					ast.Expr{nameLoc, &ast.EObject{}},
-				}},
-			}},
-		}}
-		p.recordUsage(*p.enclosingNamespaceRef)
-		p.recordUsage(*p.enclosingNamespaceRef)
-		p.recordUsage(nameRef)
-	} else {
-		// "name || (name = {})"
-		argExpr = ast.Expr{nameLoc, &ast.EBinary{
-			ast.BinOpLogicalOr,
-			ast.Expr{nameLoc, &ast.EIdentifier{nameRef}},
-			ast.Expr{nameLoc, &ast.EBinary{
-				ast.BinOpAssign,
-				ast.Expr{nameLoc, &ast.EIdentifier{nameRef}},
-				ast.Expr{nameLoc, &ast.EObject{}},
-			}},
-		}}
-		p.recordUsage(nameRef)
-		p.recordUsage(nameRef)
-	}
-
-	// Call the closure with the name object
-	stmts = append(stmts, ast.Stmt{stmtLoc, &ast.SExpr{ast.Expr{stmtLoc, &ast.ECall{
-		Target: ast.Expr{stmtLoc, &ast.EFunction{Fn: ast.Fn{
-			Args: []ast.Arg{ast.Arg{Binding: ast.Binding{nameLoc, &ast.BIdentifier{argRef}}}},
-			Body: ast.FnBody{stmtLoc, stmtsInsideClosure},
-		}}},
-		Args: []ast.Expr{argExpr},
-	}}}})
-
-	return stmts
+	return ast.Stmt{Loc: loc, Data: s}
 }
 
 func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt {
 	switch s := stmt.Data.(type) {
-	case *ast.SDebugger, *ast.SEmpty, *ast.SDirective:
+	case *ast.SDebugger, *ast.SEmpty, *ast.SDirective, *ast.SComment:
 		// These don't contain anything to traverse
 
 	case *ast.STypeScript:
@@ -6104,44 +5705,61 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 		return stmts
 
 	case *ast.SImport:
-		// This was already handled in "parseStmt"
+		p.recordDeclaredSymbol(s.NamespaceRef)
+
+		if s.DefaultName != nil {
+			p.recordDeclaredSymbol(s.DefaultName.Ref)
+		}
+
+		if s.Items != nil {
+			for _, item := range *s.Items {
+				p.recordDeclaredSymbol(item.Name.Ref)
+			}
+		}
 
 	case *ast.SExportClause:
+		// "export {foo}"
 		for i, item := range s.Items {
 			name := p.loadNameFromRef(item.Name.Ref)
-			s.Items[i].Name.Ref = p.findSymbol(name).ref
-			p.recordExport(item.AliasLoc, item.Alias)
+			ref := p.findSymbol(name).ref
+			s.Items[i].Name.Ref = ref
+			p.recordExport(item.AliasLoc, item.Alias, ref)
 		}
 
 	case *ast.SExportFrom:
-		// Generate a symbol for the namespace
-		name := ast.GenerateNonUniqueNameFromPath(s.Path.Text)
-		namespaceRef := p.newSymbol(ast.SymbolOther, name)
-		p.currentScope.Generated = append(p.currentScope.Generated, namespaceRef)
-		s.NamespaceRef = namespaceRef
+		// "export {foo} from 'path'"
+		name := p.loadNameFromRef(s.NamespaceRef)
+		s.NamespaceRef = p.newSymbol(ast.SymbolOther, name)
+		p.currentScope.Generated = append(p.currentScope.Generated, s.NamespaceRef)
+		p.recordDeclaredSymbol(s.NamespaceRef)
 
-		// Path: this is a re-export and the names are symbols in another file
+		// This is a re-export and the symbols created here are used to reference
+		// names in another file. This means the symbols are really aliases.
 		for i, item := range s.Items {
 			name := p.loadNameFromRef(item.Name.Ref)
-			s.Items[i].Name.Ref = p.newSymbol(ast.SymbolUnbound, name)
-			p.recordExport(item.AliasLoc, item.Alias)
+			ref := p.newSymbol(ast.SymbolOther, name)
+			p.currentScope.Generated = append(p.currentScope.Generated, ref)
+			p.recordDeclaredSymbol(ref)
+			s.Items[i].Name.Ref = ref
+			p.recordExport(item.AliasLoc, item.Alias, ref)
 		}
 
 	case *ast.SExportStar:
-		if s.Item != nil {
-			// "export * as ns from 'path'"
-			name := p.loadNameFromRef(s.Item.Name.Ref)
-			ref := p.newSymbol(ast.SymbolOther, name)
+		// "export * from 'path'"
+		// "export * as ns from 'path'"
+		name := p.loadNameFromRef(s.NamespaceRef)
+		s.NamespaceRef = p.newSymbol(ast.SymbolOther, name)
+		p.currentScope.Generated = append(p.currentScope.Generated, s.NamespaceRef)
+		p.recordDeclaredSymbol(s.NamespaceRef)
 
-			// This name isn't ever declared in this scope, so code in this module
-			// must not be able to get to it. Still, we need to associate it with
-			// the scope somehow so it will be minified.
-			p.currentScope.Generated = append(p.currentScope.Generated, ref)
-			s.Item.Name.Ref = ref
-			p.recordExport(s.Item.AliasLoc, s.Item.Alias)
+		// "export * as ns from 'path'"
+		if s.Alias != nil {
+			p.recordExport(s.Alias.Loc, s.Alias.Name, s.NamespaceRef)
 		}
 
 	case *ast.SExportDefault:
+		p.recordDeclaredSymbol(s.DefaultName.Ref)
+
 		switch {
 		case s.Value.Expr != nil:
 			*s.Value.Expr = p.visitExpr(*s.Value.Expr)
@@ -6153,14 +5771,10 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 
 			case *ast.SClass:
 				p.visitClass(&s2.Class)
-				stmts = append(stmts, stmt)
 
 				// Lower class field syntax for browsers that don't support it
-				extraExprs, _ := p.lowerClass(s.Value.Stmt.Loc, &s2.Class, true /* isStmt */)
-				for _, expr := range extraExprs {
-					stmts = append(stmts, ast.Stmt{expr.Loc, &ast.SExpr{expr}})
-				}
-				return stmts
+				classStmts, _ := p.lowerClass(stmt, ast.Expr{})
+				return append(stmts, classStmts...)
 
 			default:
 				panic("Internal error")
@@ -6168,16 +5782,15 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 		}
 
 	case *ast.SExportEquals:
-		// Defer the assignment to the end of the file like the TypeScript compiler
-		p.exportEqualsStmt = &ast.Stmt{stmt.Loc, &ast.SExpr{ast.Expr{stmt.Loc, &ast.EBinary{
-			ast.BinOpAssign,
-			ast.Expr{stmt.Loc, &ast.EDot{
-				Target:  ast.Expr{stmt.Loc, &ast.EIdentifier{p.moduleRef}},
+		// "module.exports = value"
+		stmts = append(stmts, ast.AssignStmt(
+			ast.Expr{Loc: stmt.Loc, Data: &ast.EDot{
+				Target:  ast.Expr{Loc: stmt.Loc, Data: &ast.EIdentifier{Ref: p.moduleRef}},
 				Name:    "exports",
 				NameLoc: stmt.Loc,
 			}},
 			p.visitExpr(s.Value),
-		}}}}
+		))
 		p.recordUsage(p.moduleRef)
 		return stmts
 
@@ -6221,7 +5834,7 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 				// Bad (a behavior change):
 				//   "a = 123; var a = undefined;" => "a = 123; var a;"
 				//
-				if p.mangleSyntax && s.Kind == ast.LocalLet {
+				if p.MangleSyntax && s.Kind == ast.LocalLet {
 					if _, ok := d.Binding.Data.(*ast.BIdentifier); ok {
 						if _, ok := d.Value.Data.(*ast.EUndefined); ok {
 							s.Decls[i].Value = nil
@@ -6233,18 +5846,38 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 
 		// Handle being exported inside a namespace
 		if s.IsExport && p.enclosingNamespaceRef != nil {
-			if exprOrNil := p.exprForExportedDeclsInNamespace(s.Decls); exprOrNil.Data != nil {
-				stmts = append(stmts, ast.Stmt{stmt.Loc, &ast.SExpr{exprOrNil}})
+			wrapIdentifier := func(loc ast.Loc, ref ast.Ref) ast.Expr {
+				return ast.Expr{Loc: loc, Data: &ast.EDot{
+					Target:  ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: *p.enclosingNamespaceRef}},
+					Name:    p.symbols[ref.InnerIndex].Name,
+					NameLoc: loc,
+				}}
+			}
+			for _, decl := range s.Decls {
+				if decl.Value != nil {
+					target := p.convertBindingToExpr(decl.Binding, wrapIdentifier)
+					if result, ok := p.lowerObjectRestInAssign(target, *decl.Value); ok {
+						target = result
+					} else {
+						target = ast.Assign(target, *decl.Value)
+					}
+					stmts = append(stmts, ast.Stmt{Loc: stmt.Loc, Data: &ast.SExpr{Value: target}})
+				}
 			}
 			return stmts
 		}
+
+		s.Decls = p.lowerObjectRestInDecls(s.Decls)
 
 	case *ast.SExpr:
 		s.Value = p.visitExpr(s.Value)
 
 		// Trim expressions without side effects
-		if p.mangleSyntax && hasNoSideEffects(s.Value.Data) {
-			stmt = ast.Stmt{stmt.Loc, &ast.SEmpty{}}
+		if p.MangleSyntax {
+			s.Value = p.simplifyUnusedExpr(s.Value)
+			if s.Value.Data == nil {
+				stmt = ast.Stmt{Loc: stmt.Loc, Data: &ast.SEmpty{}}
+			}
 		}
 
 	case *ast.SThrow:
@@ -6255,7 +5888,7 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 			*s.Value = p.visitExpr(*s.Value)
 
 			// Returning undefined is implicit
-			if p.mangleSyntax {
+			if p.MangleSyntax {
 				if _, ok := s.Value.Data.(*ast.EUndefined); ok {
 					s.Value = nil
 				}
@@ -6267,13 +5900,13 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 		s.Stmts = p.visitStmts(s.Stmts)
 		p.popScope()
 
-		if p.mangleSyntax {
+		if p.MangleSyntax {
 			if len(s.Stmts) == 1 && !statementCaresAboutScope(s.Stmts[0]) {
 				// Unwrap blocks containing a single statement
 				stmt = s.Stmts[0]
 			} else if len(s.Stmts) == 0 {
 				// Trim empty blocks
-				stmt = ast.Stmt{stmt.Loc, &ast.SEmpty{}}
+				stmt = ast.Stmt{Loc: stmt.Loc, Data: &ast.SEmpty{}}
 			}
 		}
 
@@ -6287,13 +5920,13 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 		s.Test = p.visitBooleanExpr(s.Test)
 		s.Body = p.visitSingleStmt(s.Body)
 
-		if p.mangleSyntax {
+		if p.MangleSyntax {
 			// "while (a) {}" => "for (;a;) {}"
 			test := &s.Test
 			if boolean, ok := toBooleanWithoutSideEffects(s.Test.Data); ok && boolean {
 				test = nil
 			}
-			stmt = ast.Stmt{stmt.Loc, &ast.SFor{Test: test, Body: s.Body}}
+			stmt = ast.Stmt{Loc: stmt.Loc, Data: &ast.SFor{Test: test, Body: s.Body}}
 		}
 
 	case *ast.SDoWhile:
@@ -6329,28 +5962,28 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 			}
 
 			// Trim unnecessary "else" clauses
-			if p.mangleSyntax {
+			if p.MangleSyntax {
 				if _, ok := s.No.Data.(*ast.SEmpty); ok {
 					s.No = nil
 				}
 			}
 		}
 
-		if p.mangleSyntax {
-			stmt = mangleIf(stmt.Loc, s, ok, boolean)
+		if p.MangleSyntax {
+			stmt = p.mangleIf(stmt.Loc, s, ok, boolean)
 		}
 
 	case *ast.SFor:
 		p.pushScopeForVisitPass(ast.ScopeBlock, stmt.Loc)
 		if s.Init != nil {
-			p.visitSingleStmt(*s.Init)
+			p.visitForLoopInit(*s.Init, false)
 		}
 
 		if s.Test != nil {
 			*s.Test = p.visitBooleanExpr(*s.Test)
 
 			// A true value is implied
-			if p.mangleSyntax {
+			if p.MangleSyntax {
 				if boolean, ok := toBooleanWithoutSideEffects(s.Test.Data); ok && boolean {
 					s.Test = nil
 				}
@@ -6365,17 +5998,19 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 
 	case *ast.SForIn:
 		p.pushScopeForVisitPass(ast.ScopeBlock, stmt.Loc)
-		p.visitSingleStmt(s.Init)
+		p.visitForLoopInit(s.Init, true)
 		s.Value = p.visitExpr(s.Value)
 		s.Body = p.visitSingleStmt(s.Body)
 		p.popScope()
+		p.lowerObjectRestInForLoopInit(s.Init, &s.Body)
 
 	case *ast.SForOf:
 		p.pushScopeForVisitPass(ast.ScopeBlock, stmt.Loc)
-		p.visitSingleStmt(s.Init)
+		p.visitForLoopInit(s.Init, true)
 		s.Value = p.visitExpr(s.Value)
 		s.Body = p.visitSingleStmt(s.Body)
 		p.popScope()
+		p.lowerObjectRestInForLoopInit(s.Init, &s.Body)
 
 	case *ast.STry:
 		p.pushScopeForVisitPass(ast.ScopeBlock, stmt.Loc)
@@ -6390,6 +6025,7 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 				p.visitBinding(*s.Catch.Binding)
 			}
 			s.Catch.Body = p.visitStmts(s.Catch.Body)
+			p.lowerObjectRestInCatchBinding(s.Catch)
 			p.popScope()
 		}
 
@@ -6414,56 +6050,54 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 		p.popScope()
 
 	case *ast.SFunction:
+		p.recordDeclaredSymbol(s.Fn.Name.Ref)
 		p.visitFn(&s.Fn, stmt.Loc)
 
 		// Handle exporting this function from a namespace
 		if s.IsExport && p.enclosingNamespaceRef != nil {
 			s.IsExport = false
-			stmts = append(stmts,
-				stmt,
-				ast.Stmt{stmt.Loc, &ast.SExpr{ast.Expr{stmt.Loc, &ast.EBinary{
-					ast.BinOpAssign,
-					ast.Expr{stmt.Loc, &ast.EDot{
-						Target:  ast.Expr{stmt.Loc, &ast.EIdentifier{*p.enclosingNamespaceRef}},
-						Name:    p.symbols[s.Fn.Name.Ref.InnerIndex].Name,
-						NameLoc: s.Fn.Name.Loc,
-					}},
-					ast.Expr{s.Fn.Name.Loc, &ast.EIdentifier{s.Fn.Name.Ref}},
-				}}}},
-			)
+			stmts = append(stmts, stmt, ast.AssignStmt(
+				ast.Expr{Loc: stmt.Loc, Data: &ast.EDot{
+					Target:  ast.Expr{Loc: stmt.Loc, Data: &ast.EIdentifier{Ref: *p.enclosingNamespaceRef}},
+					Name:    p.symbols[s.Fn.Name.Ref.InnerIndex].Name,
+					NameLoc: s.Fn.Name.Loc,
+				}},
+				ast.Expr{Loc: s.Fn.Name.Loc, Data: &ast.EIdentifier{Ref: s.Fn.Name.Ref}},
+			))
 			return stmts
 		}
 
 	case *ast.SClass:
+		p.recordDeclaredSymbol(s.Class.Name.Ref)
 		p.visitClass(&s.Class)
-		stmts = append(stmts, stmt)
 
-		// Lower class field syntax for browsers that don't support it
-		extraExprs, _ := p.lowerClass(stmt.Loc, &s.Class, true /* isStmt */)
-		for _, expr := range extraExprs {
-			stmts = append(stmts, ast.Stmt{expr.Loc, &ast.SExpr{expr}})
+		// Remove the export flag inside a namespace
+		wasExportInsideNamespace := s.IsExport && p.enclosingNamespaceRef != nil
+		if wasExportInsideNamespace {
+			s.IsExport = false
 		}
 
+		// Lower class field syntax for browsers that don't support it
+		classStmts, _ := p.lowerClass(stmt, ast.Expr{})
+		stmts = append(stmts, classStmts...)
+
 		// Handle exporting this class from a namespace
-		if s.IsExport && p.enclosingNamespaceRef != nil {
-			s.IsExport = false
-			stmts = append(stmts,
-				ast.Stmt{stmt.Loc, &ast.SExpr{ast.Expr{stmt.Loc, &ast.EBinary{
-					ast.BinOpAssign,
-					ast.Expr{stmt.Loc, &ast.EDot{
-						Target:  ast.Expr{stmt.Loc, &ast.EIdentifier{*p.enclosingNamespaceRef}},
-						Name:    p.symbols[s.Class.Name.Ref.InnerIndex].Name,
-						NameLoc: s.Class.Name.Loc,
-					}},
-					ast.Expr{s.Class.Name.Loc, &ast.EIdentifier{s.Class.Name.Ref}},
-				}}}},
-			)
+		if wasExportInsideNamespace {
+			stmts = append(stmts, ast.AssignStmt(
+				ast.Expr{Loc: stmt.Loc, Data: &ast.EDot{
+					Target:  ast.Expr{Loc: stmt.Loc, Data: &ast.EIdentifier{Ref: *p.enclosingNamespaceRef}},
+					Name:    p.symbols[s.Class.Name.Ref.InnerIndex].Name,
+					NameLoc: s.Class.Name.Loc,
+				}},
+				ast.Expr{Loc: s.Class.Name.Loc, Data: &ast.EIdentifier{Ref: s.Class.Name.Ref}},
+			))
 			return stmts
 		}
 
 		return stmts
 
 	case *ast.SEnum:
+		p.recordDeclaredSymbol(s.Name.Ref)
 		p.pushScopeForVisitPass(ast.ScopeEntry, stmt.Loc)
 		defer p.popScope()
 
@@ -6517,33 +6151,31 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 				}
 			} else if hasNumericValue {
 				valuesSoFar[name] = nextNumericValue
-				value.Value = &ast.Expr{value.Loc, &ast.ENumber{nextNumericValue}}
+				value.Value = &ast.Expr{Loc: value.Loc, Data: &ast.ENumber{Value: nextNumericValue}}
 				nextNumericValue++
 			} else {
-				value.Value = &ast.Expr{value.Loc, &ast.EUndefined{}}
+				value.Value = &ast.Expr{Loc: value.Loc, Data: &ast.EUndefined{}}
 			}
 
-			if p.mangleSyntax && lexer.IsIdentifier(name) {
+			if p.MangleSyntax && lexer.IsIdentifier(name) {
 				// "Enum.Name = value"
-				assignTarget = ast.Expr{value.Loc, &ast.EBinary{
-					ast.BinOpAssign,
-					ast.Expr{value.Loc, &ast.EDot{
-						Target:  ast.Expr{value.Loc, &ast.EIdentifier{s.Arg}},
+				assignTarget = ast.Assign(
+					ast.Expr{Loc: value.Loc, Data: &ast.EDot{
+						Target:  ast.Expr{Loc: value.Loc, Data: &ast.EIdentifier{Ref: s.Arg}},
 						Name:    name,
 						NameLoc: value.Loc,
 					}},
 					*value.Value,
-				}}
+				)
 			} else {
 				// "Enum['Name'] = value"
-				assignTarget = ast.Expr{value.Loc, &ast.EBinary{
-					ast.BinOpAssign,
-					ast.Expr{value.Loc, &ast.EIndex{
-						Target: ast.Expr{value.Loc, &ast.EIdentifier{s.Arg}},
-						Index:  ast.Expr{value.Loc, &ast.EString{value.Name}},
+				assignTarget = ast.Assign(
+					ast.Expr{Loc: value.Loc, Data: &ast.EIndex{
+						Target: ast.Expr{Loc: value.Loc, Data: &ast.EIdentifier{Ref: s.Arg}},
+						Index:  ast.Expr{Loc: value.Loc, Data: &ast.EString{Value: value.Name}},
 					}},
 					*value.Value,
-				}}
+				)
 			}
 			p.recordUsage(s.Arg)
 
@@ -6552,14 +6184,13 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 				valueExprs = append(valueExprs, assignTarget)
 			} else {
 				// "Enum[assignTarget] = 'Name'"
-				valueExprs = append(valueExprs, ast.Expr{value.Loc, &ast.EBinary{
-					ast.BinOpAssign,
-					ast.Expr{value.Loc, &ast.EIndex{
-						Target: ast.Expr{value.Loc, &ast.EIdentifier{s.Arg}},
+				valueExprs = append(valueExprs, ast.Assign(
+					ast.Expr{Loc: value.Loc, Data: &ast.EIndex{
+						Target: ast.Expr{Loc: value.Loc, Data: &ast.EIdentifier{Ref: s.Arg}},
 						Index:  assignTarget,
 					}},
-					ast.Expr{value.Loc, &ast.EString{value.Name}},
-				}})
+					ast.Expr{Loc: value.Loc, Data: &ast.EString{Value: value.Name}},
+				))
 			}
 			p.recordUsage(s.Arg)
 		}
@@ -6569,23 +6200,25 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 		// Generate statements from expressions
 		valueStmts := []ast.Stmt{}
 		if len(valueExprs) > 0 {
-			if p.mangleSyntax {
+			if p.MangleSyntax {
 				// "a; b; c;" => "a, b, c;"
 				joined := ast.JoinAllWithComma(valueExprs)
-				valueStmts = append(valueStmts, ast.Stmt{joined.Loc, &ast.SExpr{joined}})
+				valueStmts = append(valueStmts, ast.Stmt{Loc: joined.Loc, Data: &ast.SExpr{Value: joined}})
 			} else {
 				for _, expr := range valueExprs {
-					valueStmts = append(valueStmts, ast.Stmt{expr.Loc, &ast.SExpr{expr}})
+					valueStmts = append(valueStmts, ast.Stmt{Loc: expr.Loc, Data: &ast.SExpr{Value: expr}})
 				}
 			}
 		}
 
 		// Wrap this enum definition in a closure
-		stmts = p.generateClosureForNamespaceOrEnum(
+		stmts = p.generateClosureForTypeScriptNamespaceOrEnum(
 			stmts, stmt.Loc, s.IsExport, s.Name.Loc, s.Name.Ref, s.Arg, valueStmts)
 		return stmts
 
 	case *ast.SNamespace:
+		p.recordDeclaredSymbol(s.Name.Ref)
+
 		// Scan ahead for any variables inside this namespace. This must be done
 		// ahead of time before visiting any statements inside the namespace
 		// because we may end up visiting the uses before the declarations.
@@ -6606,7 +6239,7 @@ func (p *parser) visitAndAppendStmt(stmts []ast.Stmt, stmt ast.Stmt) []ast.Stmt 
 		p.enclosingNamespaceRef = oldEnclosingNamespaceRef
 
 		// Generate a closure for this namespace
-		stmts = p.generateClosureForNamespaceOrEnum(
+		stmts = p.generateClosureForTypeScriptNamespaceOrEnum(
 			stmts, stmt.Loc, s.IsExport, s.Name.Loc, s.Name.Ref, s.Arg, stmtsInsideNamespace)
 		return stmts
 
@@ -6642,7 +6275,7 @@ func (p *parser) markExportedBindingInsideNamespace(nsRef ast.Ref, binding ast.B
 		}
 
 	default:
-		panic(fmt.Sprintf("Unexpected binding of type %T", binding.Data))
+		panic("Internal error")
 	}
 }
 
@@ -6656,16 +6289,6 @@ func maybeJoinWithComma(a ast.Expr, b ast.Expr) ast.Expr {
 	return ast.JoinWithComma(a, b)
 }
 
-func (p *parser) exprForExportedDeclsInNamespace(decls []ast.Decl) ast.Expr {
-	var expr ast.Expr
-	for _, decl := range decls {
-		if decl.Value != nil {
-			expr = maybeJoinWithComma(expr, p.exprForExportedBindingInNamespace(decl.Binding, *decl.Value))
-		}
-	}
-	return expr
-}
-
 // This is a helper function to use when you need to capture a value that may
 // have side effects so you can use it multiple times. It guarantees that the
 // side effects take place exactly once.
@@ -6675,7 +6298,7 @@ func (p *parser) exprForExportedDeclsInNamespace(decls []ast.Decl) ast.Expr {
 //   // "value" => "value + value"
 //   // "value()" => "(_a = value(), _a + _a)"
 //   valueFunc, wrapFunc := p.captureValueWithPossibleSideEffects(loc, 2, value)
-//   return wrapFunc(ast.Expr{loc, &ast.EBinary{
+//   return wrapFunc(ast.Expr{Loc: loc, Data: &ast.EBinary{
 //     Op: ast.BinOpAdd,
 //     Left: valueFunc(),
 //     Right: valueFunc(),
@@ -6706,21 +6329,21 @@ func (p *parser) captureValueWithPossibleSideEffects(
 	var valueFunc func() ast.Expr
 	switch e := value.Data.(type) {
 	case *ast.ENull:
-		valueFunc = func() ast.Expr { return ast.Expr{loc, &ast.ENull{}} }
+		valueFunc = func() ast.Expr { return ast.Expr{Loc: loc, Data: &ast.ENull{}} }
 	case *ast.EUndefined:
-		valueFunc = func() ast.Expr { return ast.Expr{loc, &ast.EUndefined{}} }
+		valueFunc = func() ast.Expr { return ast.Expr{Loc: loc, Data: &ast.EUndefined{}} }
 	case *ast.EThis:
-		valueFunc = func() ast.Expr { return ast.Expr{loc, &ast.EThis{}} }
+		valueFunc = func() ast.Expr { return ast.Expr{Loc: loc, Data: &ast.EThis{}} }
 	case *ast.EBoolean:
-		valueFunc = func() ast.Expr { return ast.Expr{loc, &ast.EBoolean{e.Value}} }
+		valueFunc = func() ast.Expr { return ast.Expr{Loc: loc, Data: &ast.EBoolean{Value: e.Value}} }
 	case *ast.ENumber:
-		valueFunc = func() ast.Expr { return ast.Expr{loc, &ast.ENumber{e.Value}} }
+		valueFunc = func() ast.Expr { return ast.Expr{Loc: loc, Data: &ast.ENumber{Value: e.Value}} }
 	case *ast.EBigInt:
-		valueFunc = func() ast.Expr { return ast.Expr{loc, &ast.EBigInt{e.Value}} }
+		valueFunc = func() ast.Expr { return ast.Expr{Loc: loc, Data: &ast.EBigInt{Value: e.Value}} }
 	case *ast.EString:
-		valueFunc = func() ast.Expr { return ast.Expr{loc, &ast.EString{e.Value}} }
+		valueFunc = func() ast.Expr { return ast.Expr{Loc: loc, Data: &ast.EString{Value: e.Value}} }
 	case *ast.EIdentifier:
-		valueFunc = func() ast.Expr { return ast.Expr{loc, &ast.EIdentifier{e.Ref}} }
+		valueFunc = func() ast.Expr { return ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: e.Ref}} }
 	}
 	if valueFunc != nil {
 		return valueFunc, wrapFunc
@@ -6752,18 +6375,14 @@ func (p *parser) captureValueWithPossibleSideEffects(
 	if p.currentScope.Kind == ast.ScopeFunctionArgs {
 		return func() ast.Expr {
 				if tempRef == ast.InvalidRef {
-					tempRef = p.generateTempRef(tempRefNoDeclare)
+					tempRef = p.generateTempRef(tempRefNoDeclare, "")
 
 					// Assign inline so the order of side effects remains the same
 					p.recordUsage(tempRef)
-					return ast.Expr{loc, &ast.EBinary{
-						ast.BinOpAssign,
-						ast.Expr{loc, &ast.EIdentifier{tempRef}},
-						value,
-					}}
+					return ast.Assign(ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: tempRef}}, value)
 				}
 				p.recordUsage(tempRef)
-				return ast.Expr{loc, &ast.EIdentifier{tempRef}}
+				return ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: tempRef}}
 			}, func(expr ast.Expr) ast.Expr {
 				// Make sure side effects still happen if no expression was generated
 				if expr.Data == nil {
@@ -6771,11 +6390,11 @@ func (p *parser) captureValueWithPossibleSideEffects(
 				}
 
 				// Generate a new variable using an arrow function to avoid messing with "this"
-				return ast.Expr{loc, &ast.ECall{
-					Target: ast.Expr{loc, &ast.EArrow{
-						Args:       []ast.Arg{ast.Arg{Binding: ast.Binding{loc, &ast.BIdentifier{tempRef}}}},
+				return ast.Expr{Loc: loc, Data: &ast.ECall{
+					Target: ast.Expr{Loc: loc, Data: &ast.EArrow{
+						Args:       []ast.Arg{{Binding: ast.Binding{Loc: loc, Data: &ast.BIdentifier{Ref: tempRef}}}},
 						PreferExpr: true,
-						Body:       ast.FnBody{loc, []ast.Stmt{ast.Stmt{loc, &ast.SReturn{&expr}}}},
+						Body:       ast.FnBody{Loc: loc, Stmts: []ast.Stmt{{Loc: loc, Data: &ast.SReturn{Value: &expr}}}},
 					}},
 					Args: []ast.Expr{},
 				}}
@@ -6784,222 +6403,25 @@ func (p *parser) captureValueWithPossibleSideEffects(
 
 	return func() ast.Expr {
 		if tempRef == ast.InvalidRef {
-			tempRef = p.generateTempRef(tempRefNeedsDeclare)
+			tempRef = p.generateTempRef(tempRefNeedsDeclare, "")
 			p.recordUsage(tempRef)
-			return ast.Expr{loc, &ast.EBinary{
-				ast.BinOpAssign,
-				ast.Expr{loc, &ast.EIdentifier{tempRef}},
-				value,
-			}}
+			return ast.Assign(ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: tempRef}}, value)
 		}
 		p.recordUsage(tempRef)
-		return ast.Expr{loc, &ast.EIdentifier{tempRef}}
+		return ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: tempRef}}
 	}, wrapFunc
 }
 
-// Returns "typeof ref === 'symbol' ? ref : ref + ''"
-func symbolOrString(loc ast.Loc, ref ast.Ref) ast.Expr {
-	return ast.Expr{loc, &ast.EIf{
-		Test: ast.Expr{loc, &ast.EBinary{
-			Op: ast.BinOpStrictEq,
-			Left: ast.Expr{loc, &ast.EUnary{
-				Op:    ast.UnOpTypeof,
-				Value: ast.Expr{loc, &ast.EIdentifier{ref}},
-			}},
-			Right: ast.Expr{loc, &ast.EString{lexer.StringToUTF16("symbol")}},
-		}},
-		Yes: ast.Expr{loc, &ast.EIdentifier{ref}},
-		No: ast.Expr{loc, &ast.EBinary{
-			Op:    ast.BinOpAdd,
-			Left:  ast.Expr{loc, &ast.EIdentifier{ref}},
-			Right: ast.Expr{loc, &ast.EString{}},
-		}},
-	}}
-}
-
-func (p *parser) exprForExportedBindingInNamespace(binding ast.Binding, value ast.Expr) ast.Expr {
-	loc := binding.Loc
-
-	switch d := binding.Data.(type) {
-	case *ast.BMissing:
-		return ast.Expr{}
-
-	case *ast.BIdentifier:
-		return ast.Expr{loc, &ast.EBinary{
-			ast.BinOpAssign,
-			ast.Expr{loc, &ast.EDot{
-				Target:  ast.Expr{loc, &ast.EIdentifier{*p.enclosingNamespaceRef}},
-				Name:    p.symbols[d.Ref.InnerIndex].Name,
-				NameLoc: loc,
-			}},
-			value,
-		}}
-
-	case *ast.BArray:
-		var expr ast.Expr
-		valueFunc, wrapFunc := p.captureValueWithPossibleSideEffects(loc, len(d.Items), value)
-		for i, item := range d.Items {
-			var itemValue ast.Expr
-			if d.HasSpread && i+1 == len(d.Items) {
-				// "array.slice(i)"
-				itemValue = ast.Expr{loc, &ast.ECall{
-					Target: ast.Expr{loc, &ast.EDot{
-						Target:  valueFunc(),
-						Name:    "slice",
-						NameLoc: loc,
-					}},
-					Args: []ast.Expr{ast.Expr{loc, &ast.ENumber{float64(i)}}},
-				}}
-			} else {
-				// "array[i]"
-				itemValue = ast.Expr{loc, &ast.EIndex{
-					Target: valueFunc(),
-					Index:  ast.Expr{loc, &ast.ENumber{float64(i)}},
-				}}
-			}
-
-			// Handle default values
-			if item.DefaultValue != nil {
-				tempRef := p.generateTempRef(tempRefNeedsDeclare)
-				expr = maybeJoinWithComma(expr, ast.Expr{loc, &ast.EBinary{
-					ast.BinOpAssign,
-					ast.Expr{loc, &ast.EIdentifier{tempRef}},
-					itemValue,
-				}})
-				itemValue = ast.Expr{loc, &ast.EIf{
-					ast.Expr{loc, &ast.EBinary{
-						ast.BinOpStrictEq,
-						ast.Expr{loc, &ast.EIdentifier{tempRef}},
-						ast.Expr{loc, &ast.EUndefined{}},
-					}},
-					*item.DefaultValue,
-					ast.Expr{loc, &ast.EIdentifier{tempRef}},
-				}}
-			}
-
-			expr = maybeJoinWithComma(expr, p.exprForExportedBindingInNamespace(item.Binding, itemValue))
-		}
-		return wrapFunc(expr)
-
-	case *ast.BObject:
-		var expr ast.Expr
-		valueFunc, wrapFunc := p.captureValueWithPossibleSideEffects(loc, len(d.Properties), value)
-
-		// We will need to track the keys we use if this pattern contains a spread
-		keysForSpread := []ast.Expr{}
-		isSpread := false
-		for _, property := range d.Properties {
-			if property.IsSpread {
-				isSpread = true
-				break
-			}
-		}
-
-		for _, property := range d.Properties {
-			var propertyValue ast.Expr
-			if property.IsSpread {
-				// Call out to the __rest() helper function to implement spread
-				p.usedRuntimeSyms |= runtime.RestSym
-				propertyValue = ast.Expr{loc, &ast.ERuntimeCall{
-					Sym: runtime.RestSym,
-					Args: []ast.Expr{
-						valueFunc(),
-						ast.Expr{loc, &ast.EArray{keysForSpread}},
-					},
-				}}
-			} else {
-				key := property.Key
-
-				// We need to save a copy of the key if there's a spread later on
-				if isSpread {
-					// Do different things based on the key expression. Certain
-					// expressions can be converted to keys more efficiently than others.
-					switch k := key.Data.(type) {
-					case *ast.EString:
-						keysForSpread = append(keysForSpread, ast.Expr{key.Loc, &ast.EString{k.Value}})
-
-					case *ast.ENumber:
-						asUint32 := uint32(k.Value)
-						if k.Value == float64(asUint32) {
-							// If this is an integer, emit it as a string
-							text := lexer.StringToUTF16(strconv.FormatInt(int64(asUint32), 10))
-							keysForSpread = append(keysForSpread, ast.Expr{key.Loc, &ast.EString{text}})
-						} else {
-							// Otherwise, emit it as the number plus a string (i.e. call
-							// toString() on it). It's important to do it this way instead of
-							// trying to print the float as a string because Go's floating-
-							// point printer doesn't behave exactly the same as JavaScript
-							// and if they are different, the generated code will be wrong.
-							keysForSpread = append(keysForSpread, ast.Expr{key.Loc, &ast.EBinary{
-								Op:    ast.BinOpAdd,
-								Left:  ast.Expr{key.Loc, &ast.ENumber{k.Value}},
-								Right: ast.Expr{key.Loc, &ast.EString{}},
-							}})
-						}
-
-					case *ast.EIdentifier:
-						keysForSpread = append(keysForSpread, symbolOrString(key.Loc, k.Ref))
-
-					default:
-						tempRef := p.generateTempRef(tempRefNeedsDeclare)
-						key = ast.Expr{loc, &ast.EBinary{
-							ast.BinOpAssign,
-							ast.Expr{loc, &ast.EIdentifier{tempRef}},
-							key,
-						}}
-						keysForSpread = append(keysForSpread, symbolOrString(key.Loc, tempRef))
-					}
-				}
-
-				// Try to use a dot expression but fall back to an index expression
-				name := ""
-				if id, ok := key.Data.(*ast.EString); ok && lexer.IsIdentifierUTF16(id.Value) {
-					name = lexer.UTF16ToString(id.Value)
-				}
-				if name != "" {
-					propertyValue = ast.Expr{loc, &ast.EDot{
-						Target:  valueFunc(),
-						Name:    name,
-						NameLoc: loc,
-					}}
-				} else {
-					propertyValue = ast.Expr{loc, &ast.EIndex{
-						Target: valueFunc(),
-						Index:  key,
-					}}
-				}
-			}
-
-			// Handle default values
-			if property.DefaultValue != nil {
-				tempRef := p.generateTempRef(tempRefNeedsDeclare)
-				expr = maybeJoinWithComma(expr, ast.Expr{loc, &ast.EBinary{
-					ast.BinOpAssign,
-					ast.Expr{loc, &ast.EIdentifier{tempRef}},
-					propertyValue,
-				}})
-				propertyValue = ast.Expr{loc, &ast.EIf{
-					ast.Expr{loc, &ast.EBinary{
-						ast.BinOpStrictEq,
-						ast.Expr{loc, &ast.EIdentifier{tempRef}},
-						ast.Expr{loc, &ast.EUndefined{}},
-					}},
-					*property.DefaultValue,
-					ast.Expr{loc, &ast.EIdentifier{tempRef}},
-				}}
-			}
-
-			expr = maybeJoinWithComma(expr, p.exprForExportedBindingInNamespace(property.Value, propertyValue))
-		}
-		return wrapFunc(expr)
-
-	default:
-		panic(fmt.Sprintf("Unexpected binding of type %T", binding.Data))
-		return ast.Expr{}
+func (p *parser) visitTSDecorators(tsDecorators []ast.Expr) []ast.Expr {
+	for i, decorator := range tsDecorators {
+		tsDecorators[i] = p.visitExpr(decorator)
 	}
+	return tsDecorators
 }
 
 func (p *parser) visitClass(class *ast.Class) {
+	class.TSDecorators = p.visitTSDecorators(class.TSDecorators)
+
 	if class.Extends != nil {
 		*class.Extends = p.visitExpr(*class.Extends)
 	}
@@ -7007,8 +6429,17 @@ func (p *parser) visitClass(class *ast.Class) {
 	oldIsThisCaptured := p.isThisCaptured
 	p.isThisCaptured = true
 
+	// A scope is needed for private identifiers
+	p.pushScopeForVisitPass(ast.ScopeClassBody, class.BodyLoc)
+	defer p.popScope()
+
 	for i, property := range class.Properties {
-		class.Properties[i].Key = p.visitExpr(property.Key)
+		property.TSDecorators = p.visitTSDecorators(property.TSDecorators)
+
+		// Special-case EPrivateIdentifier to allow it here
+		if _, ok := property.Key.Data.(*ast.EPrivateIdentifier); !ok {
+			class.Properties[i].Key = p.visitExpr(property.Key)
+		}
 		if property.Value != nil {
 			*property.Value = p.visitExpr(*property.Value)
 		}
@@ -7022,6 +6453,7 @@ func (p *parser) visitClass(class *ast.Class) {
 
 func (p *parser) visitArgs(args []ast.Arg) {
 	for _, arg := range args {
+		arg.TSDecorators = p.visitTSDecorators(arg.TSDecorators)
 		p.visitBinding(arg.Binding)
 		if arg.Default != nil {
 			*arg.Default = p.visitExpr(*arg.Default)
@@ -7034,7 +6466,7 @@ func (p *parser) isDotDefineMatch(expr ast.Expr, parts []string) bool {
 		// Intermediates must be dot expressions
 		e, ok := expr.Data.(*ast.EDot)
 		last := len(parts) - 1
-		return ok && parts[last] == e.Name && !e.IsOptionalChain && p.isDotDefineMatch(e.Target, parts[:last])
+		return ok && parts[last] == e.Name && e.OptionalChain == ast.OptionalChainNone && p.isDotDefineMatch(e.Target, parts[:last])
 	}
 
 	// The last expression must be an identifier
@@ -7060,22 +6492,36 @@ func (p *parser) isDotDefineMatch(expr ast.Expr, parts []string) bool {
 	return p.symbols[result.ref.InnerIndex].Kind == ast.SymbolUnbound
 }
 
-func (p *parser) stringsToMemberExpression(loc ast.Loc, parts []string) ast.Expr {
+func (p *parser) jsxStringsToMemberExpression(loc ast.Loc, parts []string, assignTarget ast.AssignTarget) ast.Expr {
+	// Generate an identifier for the first part
 	ref := p.findSymbol(parts[0]).ref
-	value := ast.Expr{loc, &ast.EIdentifier{ref}}
-
-	// Substitute an EImportIdentifier now if this is an import item
-	if p.isImportItem[ref] {
-		value.Data = &ast.EImportIdentifier{ref}
+	targetIfLast := ast.AssignTargetNone
+	if len(parts) == 1 {
+		targetIfLast = assignTarget
 	}
+	value := p.handleIdentifier(loc, targetIfLast, &ast.EIdentifier{
+		Ref: ref,
 
+		// Enable tree shaking
+		CanBeRemovedIfUnused: true,
+	})
+
+	// Build up a chain of property access expressions for subsequent parts
 	for i := 1; i < len(parts); i++ {
-		value = p.maybeRewriteDot(loc, &ast.EDot{
+		targetIfLast = ast.AssignTargetNone
+		if i+1 == len(parts) {
+			targetIfLast = assignTarget
+		}
+		value = p.maybeRewriteDot(loc, targetIfLast, &ast.EDot{
 			Target:  value,
 			Name:    parts[i],
 			NameLoc: loc,
+
+			// Enable tree shaking
+			CanBeRemovedIfUnused: true,
 		})
 	}
+
 	return value
 }
 
@@ -7083,7 +6529,7 @@ func (p *parser) warnAboutEqualityCheck(op string, value ast.Expr, afterOpLoc as
 	switch e := value.Data.(type) {
 	case *ast.ENumber:
 		if e.Value == 0 && math.Signbit(e.Value) {
-			p.log.AddWarning(p.source, value.Loc,
+			p.log.AddWarning(&p.source, value.Loc,
 				fmt.Sprintf("Comparison with -0 using the %s operator will also match 0", op))
 			return true
 		}
@@ -7091,7 +6537,7 @@ func (p *parser) warnAboutEqualityCheck(op string, value ast.Expr, afterOpLoc as
 	case *ast.EArray, *ast.EArrow, *ast.EClass,
 		*ast.EFunction, *ast.EObject, *ast.ERegExp:
 		index := strings.LastIndex(p.source.Contents[:afterOpLoc.Start], op)
-		p.log.AddRangeWarning(p.source, ast.Range{ast.Loc{int32(index)}, int32(len(op))},
+		p.log.AddRangeWarning(&p.source, ast.Range{Loc: ast.Loc{Start: int32(index)}, Len: int32(len(op))},
 			fmt.Sprintf("Comparison using the %s operator here is always %v", op, op[0] == '!'))
 		return true
 	}
@@ -7102,32 +6548,36 @@ func (p *parser) warnAboutEqualityCheck(op string, value ast.Expr, afterOpLoc as
 // EDot nodes represent a property access. This function may return an
 // expression to replace the property access with. It assumes that the
 // target of the EDot expression has already been visited.
-func (p *parser) maybeRewriteDot(loc ast.Loc, data *ast.EDot) ast.Expr {
-	if id, ok := data.Target.Data.(*ast.EIdentifier); ok {
+func (p *parser) maybeRewriteDot(loc ast.Loc, assignTarget ast.AssignTarget, dot *ast.EDot) ast.Expr {
+	if id, ok := dot.Target.Data.(*ast.EIdentifier); ok {
 		// Rewrite property accesses on explicit namespace imports as an identifier.
 		// This lets us replace them easily in the printer to rebind them to
 		// something else without paying the cost of a whole-tree traversal during
 		// module linking just to rewrite these EDot expressions.
 		if importItems, ok := p.importItemsForNamespace[id.Ref]; ok {
-			var itemRef ast.Ref
-
 			// Cache translation so each property access resolves to the same import
-			itemRef, ok := importItems[data.Name]
+			item, ok := importItems[dot.Name]
 			if !ok {
 				// Generate a new import item symbol in the module scope
-				itemRef = p.newSymbol(ast.SymbolOther, data.Name)
-				p.moduleScope.Generated = append(p.moduleScope.Generated, itemRef)
+				item = ast.LocRef{Loc: dot.NameLoc, Ref: p.newSymbol(ast.SymbolImport, dot.Name)}
+				p.moduleScope.Generated = append(p.moduleScope.Generated, item.Ref)
 
 				// Link the namespace import and the import item together
-				importItems[data.Name] = itemRef
-				p.isImportItem[itemRef] = true
+				importItems[dot.Name] = item
+				p.isImportItem[item.Ref] = true
 
-				// Make sure the printer prints this as a property access
-				if !p.isBundling {
-					p.symbols[itemRef.InnerIndex].NamespaceAlias = &ast.NamespaceAlias{
+				symbol := &p.symbols[item.Ref.InnerIndex]
+				if !p.IsBundling {
+					// Make sure the printer prints this as a property access
+					symbol.NamespaceAlias = &ast.NamespaceAlias{
 						NamespaceRef: id.Ref,
-						Alias:        data.Name,
+						Alias:        dot.Name,
 					}
+				} else {
+					// Mark this as generated in case it's missing. We don't want to
+					// generate errors for missing import items that are automatically
+					// generated.
+					symbol.ImportItemStatus = ast.ImportItemGenerated
 				}
 			}
 
@@ -7139,26 +6589,26 @@ func (p *parser) maybeRewriteDot(loc ast.Loc, data *ast.EDot) ast.Expr {
 			// imported module end up in the same module group and the namespace
 			// symbol has never been captured, then we don't need to generate
 			// any code for the namespace at all.
-			if p.isBundling {
+			if p.IsBundling {
 				p.ignoreUsage(id.Ref)
 			}
 
 			// Track how many times we've referenced this symbol
-			p.recordUsage(itemRef)
-			return ast.Expr{loc, &ast.EImportIdentifier{itemRef}}
+			p.recordUsage(item.Ref)
+			return p.handleIdentifier(dot.NameLoc, assignTarget, &ast.EIdentifier{Ref: item.Ref})
 		}
 
 		// If this is a known enum value, inline the value of the enum
-		if p.ts.Parse {
+		if p.TS.Parse && dot.OptionalChain == ast.OptionalChainNone {
 			if enumValueMap, ok := p.knownEnumValues[id.Ref]; ok {
-				if number, ok := enumValueMap[data.Name]; ok {
-					return ast.Expr{loc, &ast.ENumber{number}}
+				if number, ok := enumValueMap[dot.Name]; ok {
+					return ast.Expr{Loc: loc, Data: &ast.ENumber{Value: number}}
 				}
 			}
 		}
 	}
 
-	return ast.Expr{loc, data}
+	return ast.Expr{Loc: loc, Data: dot}
 }
 
 func joinStrings(a []uint16, b []uint16) []uint16 {
@@ -7173,11 +6623,11 @@ func foldStringAddition(left ast.Expr, right ast.Expr) *ast.Expr {
 	case *ast.EString:
 		switch r := right.Data.(type) {
 		case *ast.EString:
-			return &ast.Expr{left.Loc, &ast.EString{joinStrings(l.Value, r.Value)}}
+			return &ast.Expr{Loc: left.Loc, Data: &ast.EString{Value: joinStrings(l.Value, r.Value)}}
 
 		case *ast.ETemplate:
 			if r.Tag == nil {
-				return &ast.Expr{left.Loc, &ast.ETemplate{nil, joinStrings(l.Value, r.Head), "", r.Parts}}
+				return &ast.Expr{Loc: left.Loc, Data: &ast.ETemplate{Head: joinStrings(l.Value, r.Head), Parts: r.Parts}}
 			}
 		}
 
@@ -7194,7 +6644,7 @@ func foldStringAddition(left ast.Expr, right ast.Expr) *ast.Expr {
 					copy(parts, l.Parts)
 					parts[n-1].Tail = joinStrings(parts[n-1].Tail, r.Value)
 				}
-				return &ast.Expr{left.Loc, &ast.ETemplate{nil, head, "", parts}}
+				return &ast.Expr{Loc: left.Loc, Data: &ast.ETemplate{Head: head, Parts: parts}}
 
 			case *ast.ETemplate:
 				if r.Tag == nil {
@@ -7208,7 +6658,7 @@ func foldStringAddition(left ast.Expr, right ast.Expr) *ast.Expr {
 						copy(parts[:n], l.Parts)
 						parts[n-1].Tail = joinStrings(parts[n-1].Tail, r.Head)
 					}
-					return &ast.Expr{left.Loc, &ast.ETemplate{nil, head, "", parts}}
+					return &ast.Expr{Loc: left.Loc, Data: &ast.ETemplate{Head: head, Parts: parts}}
 				}
 			}
 		}
@@ -7221,7 +6671,7 @@ func (p *parser) visitBooleanExpr(expr ast.Expr) ast.Expr {
 	expr = p.visitExpr(expr)
 
 	// Simplify syntax when we know it's used inside a boolean context
-	if p.mangleSyntax {
+	if p.MangleSyntax {
 		for {
 			// "!!a" => "a"
 			if not, ok := expr.Data.(*ast.EUnary); ok && not.Op == ast.UnOpNot {
@@ -7236,193 +6686,6 @@ func (p *parser) visitBooleanExpr(expr ast.Expr) ast.Expr {
 	}
 
 	return expr
-}
-
-// Lower optional chaining for environments that don't support it
-func (p *parser) lowerOptionalChain(expr ast.Expr, in exprIn, out exprOut, thisArgFunc func() ast.Expr) (ast.Expr, exprOut) {
-	valueWhenUndefined := ast.Expr{expr.Loc, &ast.EUndefined{}}
-	endsWithPropertyAccess := false
-	startsWithCall := false
-	originalExpr := expr
-	chain := []ast.Expr{}
-	loc := expr.Loc
-
-	// Step 1: Get an array of all expressions in the chain. We're traversing the
-	// chain from the outside in, so the array will be filled in "backwards".
-flatten:
-	for {
-		chain = append(chain, expr)
-
-		switch e := expr.Data.(type) {
-		case *ast.EDot:
-			expr = e.Target
-			if len(chain) == 1 {
-				endsWithPropertyAccess = true
-			}
-			if e.IsOptionalChain {
-				break flatten
-			}
-
-		case *ast.EIndex:
-			expr = e.Target
-			if len(chain) == 1 {
-				endsWithPropertyAccess = true
-			}
-			if e.IsOptionalChain {
-				break flatten
-			}
-
-		case *ast.ECall:
-			expr = e.Target
-			if e.IsOptionalChain {
-				startsWithCall = true
-				break flatten
-			}
-
-		case *ast.EUnary: // UnOpDelete
-			valueWhenUndefined = ast.Expr{loc, &ast.EBoolean{Value: true}}
-			expr = e.Value
-
-		default:
-			panic("Internal error")
-		}
-	}
-
-	// Stop now if we can strip the whole chain as dead code. Since the chain is
-	// lazily evaluated, it's safe to just drop the code entirely.
-	switch expr.Data.(type) {
-	case *ast.ENull, *ast.EUndefined:
-		return valueWhenUndefined, exprOut{}
-	}
-
-	// Don't lower this if we don't need to. This check must be done here instead
-	// of earlier so we can do the dead code elimination above when the target is
-	// null or undefined.
-	if p.target >= ES2020 {
-		return originalExpr, exprOut{}
-	}
-
-	// Step 2: Figure out if we need to capture the value for "this" for the
-	// initial ECall. This will be passed to ".call(this, ...args)" later.
-	var thisArg ast.Expr
-	var targetWrapFunc func(ast.Expr) ast.Expr
-	if startsWithCall {
-		if thisArgFunc != nil {
-			// The initial value is a nested optional chain that ended in a property
-			// access. The nested chain was processed first and has saved the
-			// appropriate value for "this". The callback here will return a
-			// reference to that saved location.
-			thisArg = thisArgFunc()
-		} else {
-			// The initial value is a normal expression. If it's a property access,
-			// strip the property off and save the target of the property access to
-			// be used as the value for "this".
-			switch e := expr.Data.(type) {
-			case *ast.EDot:
-				targetFunc, wrapFunc := p.captureValueWithPossibleSideEffects(loc, 2, e.Target)
-				expr = ast.Expr{loc, &ast.EDot{
-					Target:  targetFunc(),
-					Name:    e.Name,
-					NameLoc: e.NameLoc,
-				}}
-				thisArg = targetFunc()
-				targetWrapFunc = wrapFunc
-
-			case *ast.EIndex:
-				targetFunc, wrapFunc := p.captureValueWithPossibleSideEffects(loc, 2, e.Target)
-				expr = ast.Expr{loc, &ast.EIndex{
-					Target: targetFunc(),
-					Index:  e.Index,
-				}}
-				thisArg = targetFunc()
-				targetWrapFunc = wrapFunc
-			}
-		}
-	}
-
-	// Step 3: Figure out if we need to capture the starting value. We don't need
-	// to capture it if it doesn't have any side effects (e.g. it's just a bare
-	// identifier). Skipping the capture reduces code size and matches the output
-	// of the TypeScript compiler.
-	exprFunc, exprWrapFunc := p.captureValueWithPossibleSideEffects(loc, 2, expr)
-	expr = exprFunc()
-	result := exprFunc()
-
-	// Step 4: Wrap the starting value by each expression in the chain. We
-	// traverse the chain in reverse because we want to go from the inside out
-	// and the chain was built from the outside in.
-	for i := len(chain) - 1; i >= 0; i-- {
-		// Save a reference to the value of "this" for our parent ECall
-		if i == 0 && in.storeThisArgForParentOptionalChain != nil && endsWithPropertyAccess {
-			result = in.storeThisArgForParentOptionalChain(result)
-		}
-
-		switch e := chain[i].Data.(type) {
-		case *ast.EDot:
-			result = ast.Expr{loc, &ast.EDot{
-				Target:  result,
-				Name:    e.Name,
-				NameLoc: e.NameLoc,
-			}}
-
-		case *ast.EIndex:
-			result = ast.Expr{loc, &ast.EIndex{
-				Target: result,
-				Index:  e.Index,
-			}}
-
-		case *ast.ECall:
-			// If this is the initial ECall in the chain and it's being called off of
-			// a property access, invoke the function using ".call(this, ...args)" to
-			// explicitly provide the value for "this".
-			if i == len(chain)-1 && thisArg.Data != nil {
-				result = ast.Expr{loc, &ast.ECall{
-					Target: ast.Expr{loc, &ast.EDot{
-						Target:  result,
-						Name:    "call",
-						NameLoc: loc,
-					}},
-					Args: append([]ast.Expr{thisArg}, e.Args...),
-				}}
-				break
-			}
-
-			result = ast.Expr{loc, &ast.ECall{
-				Target:       result,
-				Args:         e.Args,
-				IsDirectEval: e.IsDirectEval,
-			}}
-
-		case *ast.EUnary:
-			result = ast.Expr{loc, &ast.EUnary{
-				Op:    ast.UnOpDelete,
-				Value: result,
-			}}
-
-		default:
-			panic("Internal error")
-		}
-	}
-
-	// Step 5: Wrap it all in a conditional that returns the chain or the default
-	// value if the initial value is null/undefined. The default value is usually
-	// "undefined" but is "true" if the chain ends in a "delete" operator.
-	result = ast.Expr{loc, &ast.EIf{
-		Test: ast.Expr{loc, &ast.EBinary{
-			Op:    ast.BinOpLooseEq,
-			Left:  expr,
-			Right: ast.Expr{loc, &ast.ENull{}},
-		}},
-		Yes: valueWhenUndefined,
-		No:  result,
-	}}
-	if exprWrapFunc != nil {
-		result = exprWrapFunc(result)
-	}
-	if targetWrapFunc != nil {
-		result = targetWrapFunc(result)
-	}
-	return result, exprOut{}
 }
 
 func toInt32(f float64) int32 {
@@ -7456,9 +6719,9 @@ type exprIn struct {
 	//   a?.b[c] // EIndex
 	//   a?.b()  // ECall
 	//
-	// Note that this is false if our parent is a node with a IsOptionalChain
-	// value of true. That means it's the start of a new chain, so it's not
-	// considered part of this one.
+	// Note that this is false if our parent is a node with a OptionalChain
+	// value of OptionalChainStart. That means it's the start of a new chain, so
+	// it's not considered part of this one.
 	//
 	// Some examples:
 	//
@@ -7466,13 +6729,24 @@ type exprIn struct {
 	//   a?.b?.[c] // EIndex
 	//   a?.b?.()  // ECall
 	//
+	// Also note that this is false if our parent is a node with a OptionalChain
+	// value of OptionalChainNone. That means it's outside parentheses, which
+	// means it's no longer part of the chain.
+	//
+	// Some examples:
+	//
+	//   (a?.b).c  // EDot
+	//   (a?.b)[c] // EIndex
+	//   (a?.b)()  // ECall
+	//
 	hasChainParent bool
 
-	// If our parent is an ECall node with an IsOptionalChain value of true, then
-	// we will need to store the value for the "this" of that call somewhere if
-	// the current expression is an optional chain that ends in a property access.
-	// That's because the value for "this" will be used twice: once for the inner
-	// optional chain and once for the outer optional chain.
+	// If our parent is an ECall node with an OptionalChain value of
+	// OptionalChainStart, then we will need to store the value for the "this" of
+	// that call somewhere if the current expression is an optional chain that
+	// ends in a property access. That's because the value for "this" will be
+	// used twice: once for the inner optional chain and once for the outer
+	// optional chain.
 	//
 	// Example:
 	//
@@ -7491,7 +6765,7 @@ type exprIn struct {
 	// For example, we shouldn't transform "undefined = 1" into "void 0 = 1". This
 	// isn't something real-world code would do but it matters for conformance
 	// tests.
-	isAssignTarget bool
+	assignTarget ast.AssignTarget
 }
 
 type exprOut struct {
@@ -7505,6 +6779,25 @@ func (p *parser) visitExpr(expr ast.Expr) ast.Expr {
 	return expr
 }
 
+func (p *parser) valueForThis(loc ast.Loc) (ast.Expr, bool) {
+	if p.IsBundling && !p.isThisCaptured {
+		if p.hasES6ImportSyntax || p.hasES6ExportSyntax {
+			// In an ES6 module, "this" is supposed to be undefined. Instead of
+			// doing this at runtime using "fn.call(undefined)", we do it at
+			// compile time using expression substitution here.
+			return ast.Expr{Loc: loc, Data: &ast.EUndefined{}}, true
+		} else {
+			// In a CommonJS module, "this" is supposed to be the same as "exports".
+			// Instead of doing this at runtime using "fn.call(module.exports)", we
+			// do it at compile time using expression substitution here.
+			p.recordUsage(p.exportsRef)
+			return ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: p.exportsRef}}, true
+		}
+	}
+
+	return ast.Expr{}, false
+}
+
 func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 	switch e := expr.Data.(type) {
 	case *ast.EMissing, *ast.ENull, *ast.ESuper, *ast.EString,
@@ -7512,18 +6805,15 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		*ast.ERegExp, *ast.ENewTarget, *ast.EUndefined:
 
 	case *ast.EThis:
-		// In a CommonJS module, "this" is supposed to be the same as "exports".
-		// Instead of doing this at runtime using "fn.call(module.exports)", we
-		// do it at compile time using expression substitution here.
-		if p.isBundling && !p.isThisCaptured {
-			p.symbols[p.exportsRef.InnerIndex].UseCountEstimate++
-			return ast.Expr{expr.Loc, &ast.EIdentifier{p.exportsRef}}, exprOut{}
+		if value, ok := p.valueForThis(expr.Loc); ok {
+			return value, exprOut{}
 		}
 
 	case *ast.EImportMeta:
-		if p.isBundling {
-			// Replace "import.meta" with a dummy object when bundling
-			return ast.Expr{expr.Loc, &ast.EObject{}}, exprOut{}
+		if p.importMetaRef != ast.InvalidRef {
+			// Replace "import.meta" with a reference to the symbol
+			p.recordUsage(p.importMetaRef)
+			return ast.Expr{Loc: expr.Loc, Data: &ast.EIdentifier{Ref: p.importMetaRef}}, exprOut{}
 		}
 
 	case *ast.ESpread:
@@ -7536,24 +6826,39 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 
 		// Substitute user-specified defines for unbound symbols
 		if p.symbols[e.Ref.InnerIndex].Kind == ast.SymbolUnbound && !result.isInsideWithScope {
-			if defineFunc, ok := p.identifierDefines[name]; ok {
-				new := p.valueForDefine(expr.Loc, defineFunc)
+			if data, ok := p.Defines.IdentifierDefines[name]; ok {
+				if data.DefineFunc != nil {
+					new := p.valueForDefine(expr.Loc, in.assignTarget, data.DefineFunc)
 
-				// Don't substitute an identifier for a non-identifier if this is an
-				// assignment target, since it'll cause a syntax error
-				if _, ok := new.Data.(*ast.EIdentifier); !in.isAssignTarget || ok {
-					return new, exprOut{}
+					// Don't substitute an identifier for a non-identifier if this is an
+					// assignment target, since it'll cause a syntax error
+					if _, ok := new.Data.(*ast.EIdentifier); in.assignTarget == ast.AssignTargetNone || ok {
+						return new, exprOut{}
+					}
 				}
+
+				// Copy the call side effect flag over in case this expression is called
+				if data.CallCanBeUnwrappedIfUnused {
+					e.CallCanBeUnwrappedIfUnused = true
+				}
+
+				// All identifier defines that don't have user-specified replacements
+				// are known to be side-effect free. Mark them as such if we get here.
+				e.CanBeRemovedIfUnused = true
 			}
 		}
 
-		return p.handleIdentifier(expr.Loc, e), exprOut{}
+		return p.handleIdentifier(expr.Loc, in.assignTarget, e), exprOut{}
+
+	case *ast.EPrivateIdentifier:
+		// We should never get here
+		panic("Internal error")
 
 	case *ast.EJSXElement:
 		// A missing tag is a fragment
 		tag := e.Tag
 		if tag == nil {
-			value := p.stringsToMemberExpression(expr.Loc, p.jsx.Fragment)
+			value := p.jsxStringsToMemberExpression(expr.Loc, p.JSX.Fragment, in.assignTarget)
 			tag = &value
 		} else {
 			*tag = p.visitExpr(*tag)
@@ -7576,9 +6881,11 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		// Arguments to createElement()
 		args := []ast.Expr{*tag}
 		if len(e.Properties) > 0 {
-			args = append(args, p.lowerObjectSpread(expr.Loc, &ast.EObject{e.Properties}))
+			args = append(args, p.lowerObjectSpread(expr.Loc, &ast.EObject{
+				Properties: e.Properties,
+			}))
 		} else {
-			args = append(args, ast.Expr{expr.Loc, &ast.ENull{}})
+			args = append(args, ast.Expr{Loc: expr.Loc, Data: &ast.ENull{}})
 		}
 		if len(e.Children) > 0 {
 			for _, child := range e.Children {
@@ -7587,9 +6894,12 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		}
 
 		// Call createElement()
-		return ast.Expr{expr.Loc, &ast.ECall{
-			Target: p.stringsToMemberExpression(expr.Loc, p.jsx.Factory),
+		return ast.Expr{Loc: expr.Loc, Data: &ast.ECall{
+			Target: p.jsxStringsToMemberExpression(expr.Loc, p.JSX.Factory, in.assignTarget),
 			Args:   args,
+
+			// Enable tree shaking
+			CanBeUnwrappedIfUnused: true,
 		}}, exprOut{}
 
 	case *ast.ETemplate:
@@ -7600,46 +6910,90 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 			e.Parts[i].Value = p.visitExpr(part.Value)
 		}
 
+		// "`a${'b'}c`" => "`abc`"
+		if p.MangleSyntax && e.Tag == nil {
+			end := 0
+			for _, part := range e.Parts {
+				if str, ok := part.Value.Data.(*ast.EString); ok {
+					if end == 0 {
+						e.Head = append(append(e.Head, str.Value...), part.Tail...)
+					} else {
+						prevPart := &e.Parts[end-1]
+						prevPart.Tail = append(append(prevPart.Tail, str.Value...), part.Tail...)
+					}
+				} else {
+					e.Parts[end] = part
+					end++
+				}
+			}
+			e.Parts = e.Parts[:end]
+		}
+
 	case *ast.EBinary:
-		e.Left, _ = p.visitExprInOut(e.Left, exprIn{isAssignTarget: e.Op.IsBinaryAssign()})
+		isCallTarget := e == p.callTarget
+		e.Left, _ = p.visitExprInOut(e.Left, exprIn{assignTarget: e.Op.BinaryAssignTarget()})
+
+		// Pattern-match "typeof require == 'function' && ___" from browserify
+		if e.Op == ast.BinOpLogicalAnd && e.Left.Data == p.typeofRequireEqualsFn {
+			p.typeofRequireEqualsFnTarget = e.Right.Data
+		}
+
 		e.Right = p.visitExpr(e.Right)
 
-		// Fold constants
+		// Post-process the binary expression
 		switch e.Op {
+		case ast.BinOpComma:
+			// "(1, 2)" => "2"
+			// "(sideEffects(), 2)" => "(sideEffects(), 2)"
+			if p.MangleSyntax {
+				e.Left = p.simplifyUnusedExpr(e.Left)
+				if e.Left.Data == nil {
+					// "(1, fn)()" => "fn()"
+					// "(1, this.fn)" => "this.fn"
+					// "(1, this.fn)()" => "(0, this.fn)()"
+					if isCallTarget && hasValueForThisInCall(e.Right) {
+						return ast.JoinWithComma(ast.Expr{Loc: e.Left.Loc, Data: &ast.ENumber{}}, e.Right), exprOut{}
+					}
+					return e.Right, exprOut{}
+				}
+			}
+
 		case ast.BinOpLooseEq:
 			if result, ok := checkEqualityIfNoSideEffects(e.Left.Data, e.Right.Data); ok {
-				return ast.Expr{expr.Loc, &ast.EBoolean{result}}, exprOut{}
-			} else if !p.omitWarnings {
-				if !p.warnAboutEqualityCheck("==", e.Left, e.Right.Loc) {
-					p.warnAboutEqualityCheck("==", e.Right, e.Right.Loc)
+				data := &ast.EBoolean{Value: result}
+
+				// Pattern-match "typeof require == 'function'" from browserify. Also
+				// match "'function' == typeof require" because some minifiers such as
+				// terser transpose the left and right operands to "==" to form a
+				// different but equivalent expression.
+				if result && (e.Left.Data == p.typeofRequire || e.Right.Data == p.typeofRequire) {
+					p.typeofRequireEqualsFn = data
 				}
+
+				return ast.Expr{Loc: expr.Loc, Data: data}, exprOut{}
+			} else if !p.warnAboutEqualityCheck("==", e.Left, e.Right.Loc) {
+				p.warnAboutEqualityCheck("==", e.Right, e.Right.Loc)
 			}
 
 		case ast.BinOpStrictEq:
 			if result, ok := checkEqualityIfNoSideEffects(e.Left.Data, e.Right.Data); ok {
-				return ast.Expr{expr.Loc, &ast.EBoolean{result}}, exprOut{}
-			} else if !p.omitWarnings {
-				if !p.warnAboutEqualityCheck("===", e.Left, e.Right.Loc) {
-					p.warnAboutEqualityCheck("===", e.Right, e.Right.Loc)
-				}
+				return ast.Expr{Loc: expr.Loc, Data: &ast.EBoolean{Value: result}}, exprOut{}
+			} else if !p.warnAboutEqualityCheck("===", e.Left, e.Right.Loc) {
+				p.warnAboutEqualityCheck("===", e.Right, e.Right.Loc)
 			}
 
 		case ast.BinOpLooseNe:
 			if result, ok := checkEqualityIfNoSideEffects(e.Left.Data, e.Right.Data); ok {
-				return ast.Expr{expr.Loc, &ast.EBoolean{!result}}, exprOut{}
-			} else if !p.omitWarnings {
-				if !p.warnAboutEqualityCheck("!=", e.Left, e.Right.Loc) {
-					p.warnAboutEqualityCheck("!=", e.Right, e.Right.Loc)
-				}
+				return ast.Expr{Loc: expr.Loc, Data: &ast.EBoolean{Value: !result}}, exprOut{}
+			} else if !p.warnAboutEqualityCheck("!=", e.Left, e.Right.Loc) {
+				p.warnAboutEqualityCheck("!=", e.Right, e.Right.Loc)
 			}
 
 		case ast.BinOpStrictNe:
 			if result, ok := checkEqualityIfNoSideEffects(e.Left.Data, e.Right.Data); ok {
-				return ast.Expr{expr.Loc, &ast.EBoolean{!result}}, exprOut{}
-			} else if !p.omitWarnings {
-				if !p.warnAboutEqualityCheck("!==", e.Left, e.Right.Loc) {
-					p.warnAboutEqualityCheck("!==", e.Right, e.Right.Loc)
-				}
+				return ast.Expr{Loc: expr.Loc, Data: &ast.EBoolean{Value: !result}}, exprOut{}
+			} else if !p.warnAboutEqualityCheck("!==", e.Left, e.Right.Loc) {
+				p.warnAboutEqualityCheck("!==", e.Right, e.Right.Loc)
 			}
 
 		case ast.BinOpNullishCoalescing:
@@ -7649,22 +7003,17 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 				return e.Left, exprOut{}
 
 			case *ast.ENull, *ast.EUndefined:
+				// "(null ?? fn)()" => "fn()"
+				// "(null ?? this.fn)" => "this.fn"
+				// "(null ?? this.fn)()" => "(0, this.fn)()"
+				if isCallTarget && hasValueForThisInCall(e.Right) {
+					return ast.JoinWithComma(ast.Expr{Loc: e.Left.Loc, Data: &ast.ENumber{}}, e.Right), exprOut{}
+				}
 				return e.Right, exprOut{}
 
 			default:
-				if p.target < ES2020 {
-					// "a ?? b" => "a != null ? a : b"
-					// "a() ?? b()" => "_ = a(), _ != null ? _ : b"
-					leftFunc, wrapFunc := p.captureValueWithPossibleSideEffects(expr.Loc, 2, e.Left)
-					return wrapFunc(ast.Expr{e.Right.Loc, &ast.EIf{
-						ast.Expr{expr.Loc, &ast.EBinary{
-							ast.BinOpLooseNe,
-							leftFunc(),
-							ast.Expr{expr.Loc, &ast.ENull{}},
-						}},
-						leftFunc(),
-						e.Right,
-					}}), exprOut{}
+				if p.UnsupportedFeatures.Has(compat.NullishCoalescing) {
+					return p.lowerNullishCoalescing(expr.Loc, e.Left, e.Right), exprOut{}
 				}
 			}
 
@@ -7673,6 +7022,12 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 				if boolean {
 					return e.Left, exprOut{}
 				} else {
+					// "(0 || fn)()" => "fn()"
+					// "(0 || this.fn)" => "this.fn"
+					// "(0 || this.fn)()" => "(0, this.fn)()"
+					if isCallTarget && hasValueForThisInCall(e.Right) {
+						return ast.JoinWithComma(ast.Expr{Loc: e.Left.Loc, Data: &ast.ENumber{}}, e.Right), exprOut{}
+					}
 					return e.Right, exprOut{}
 				}
 			}
@@ -7680,6 +7035,12 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		case ast.BinOpLogicalAnd:
 			if boolean, ok := toBooleanWithoutSideEffects(e.Left.Data); ok {
 				if boolean {
+					// "(1 && fn)()" => "fn()"
+					// "(1 && this.fn)" => "this.fn"
+					// "(1 && this.fn)()" => "(0, this.fn)()"
+					if isCallTarget && hasValueForThisInCall(e.Right) {
+						return ast.JoinWithComma(ast.Expr{Loc: e.Left.Loc, Data: &ast.ENumber{}}, e.Right), exprOut{}
+					}
 					return e.Right, exprOut{}
 				} else {
 					return e.Left, exprOut{}
@@ -7689,7 +7050,7 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		case ast.BinOpAdd:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{left + right}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: left + right}}, exprOut{}
 				}
 			}
 
@@ -7701,136 +7062,268 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 			if left, ok := e.Left.Data.(*ast.EBinary); ok && left.Op == ast.BinOpAdd {
 				// "x + 'abc' + 'xyz'" => "x + 'abcxyz'"
 				if result := foldStringAddition(left.Right, e.Right); result != nil {
-					return ast.Expr{expr.Loc, &ast.EBinary{left.Op, left.Left, *result}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.EBinary{Op: left.Op, Left: left.Left, Right: *result}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpSub:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{left - right}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: left - right}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpMul:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{left * right}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: left * right}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpDiv:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{left / right}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: left / right}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpRem:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{math.Mod(left, right)}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: math.Mod(left, right)}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpPow:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{math.Pow(left, right)}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: math.Pow(left, right)}}, exprOut{}
 				}
 			}
 
 			// Lower the exponentiation operator for browsers that don't support it
-			if p.target < ES2016 {
-				p.usedRuntimeSyms |= runtime.PowSym
-				return ast.Expr{expr.Loc, &ast.ERuntimeCall{
-					Sym:  runtime.PowSym,
-					Args: []ast.Expr{e.Left, e.Right},
-				}}, exprOut{}
-			}
-
-		case ast.BinOpPowAssign:
-			// Lower the exponentiation operator for browsers that don't support it
-			if p.target < ES2016 {
-				return p.lowerExponentiationAssignmentOperator(expr.Loc, e), exprOut{}
+			if p.UnsupportedFeatures.Has(compat.ExponentOperator) {
+				return p.callRuntime(expr.Loc, "__pow", []ast.Expr{e.Left, e.Right}), exprOut{}
 			}
 
 		case ast.BinOpShl:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{float64(toInt32(left) << (toUint32(right) & 31))}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: float64(toInt32(left) << (toUint32(right) & 31))}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpShr:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{float64(toInt32(left) >> (toUint32(right) & 31))}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: float64(toInt32(left) >> (toUint32(right) & 31))}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpUShr:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{float64(toUint32(left) >> (toUint32(right) & 31))}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: float64(toUint32(left) >> (toUint32(right) & 31))}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpBitwiseAnd:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{float64(toInt32(left) & toInt32(right))}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: float64(toInt32(left) & toInt32(right))}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpBitwiseOr:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{float64(toInt32(left) | toInt32(right))}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: float64(toInt32(left) | toInt32(right))}}, exprOut{}
 				}
 			}
 
 		case ast.BinOpBitwiseXor:
 			if p.shouldFoldNumericConstants {
 				if left, right, ok := extractNumericValues(e.Left, e.Right); ok {
-					return ast.Expr{expr.Loc, &ast.ENumber{float64(toInt32(left) ^ toInt32(right))}}, exprOut{}
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: float64(toInt32(left) ^ toInt32(right))}}, exprOut{}
 				}
+			}
+
+			////////////////////////////////////////////////////////////////////////////////
+			// All assignment operators below here
+
+		case ast.BinOpAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSet(target, loc, private, e.Right), exprOut{}
+			}
+
+			// Lower object rest patterns for browsers that don't support them. Note
+			// that assignment expressions are used to represent initializers in
+			// binding patterns, so only do this if we're not ourselves the target of
+			// an assignment. Example: "[a = b] = c"
+			if in.assignTarget == ast.AssignTargetNone {
+				if result, ok := p.lowerObjectRestInAssign(e.Left, e.Right); ok {
+					return result, exprOut{}
+				}
+			}
+
+		case ast.BinOpAddAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpAdd, e.Right), exprOut{}
+			}
+
+		case ast.BinOpSubAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpSub, e.Right), exprOut{}
+			}
+
+		case ast.BinOpMulAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpMul, e.Right), exprOut{}
+			}
+
+		case ast.BinOpDivAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpDiv, e.Right), exprOut{}
+			}
+
+		case ast.BinOpRemAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpRem, e.Right), exprOut{}
+			}
+
+		case ast.BinOpPowAssign:
+			// Lower the exponentiation operator for browsers that don't support it
+			if p.UnsupportedFeatures.Has(compat.ExponentOperator) {
+				return p.lowerExponentiationAssignmentOperator(expr.Loc, e), exprOut{}
+			}
+
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpPow, e.Right), exprOut{}
+			}
+
+		case ast.BinOpShlAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpShl, e.Right), exprOut{}
+			}
+
+		case ast.BinOpShrAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpShr, e.Right), exprOut{}
+			}
+
+		case ast.BinOpUShrAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpUShr, e.Right), exprOut{}
+			}
+
+		case ast.BinOpBitwiseOrAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpBitwiseOr, e.Right), exprOut{}
+			}
+
+		case ast.BinOpBitwiseAndAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpBitwiseAnd, e.Right), exprOut{}
+			}
+
+		case ast.BinOpBitwiseXorAssign:
+			if target, loc, private := p.extractPrivateIndex(e.Left); private != nil {
+				return p.lowerPrivateSetBinOp(target, loc, private, ast.BinOpBitwiseXor, e.Right), exprOut{}
+			}
+
+		case ast.BinOpNullishCoalescingAssign:
+			if p.UnsupportedFeatures.Has(compat.LogicalAssignment) {
+				return p.lowerNullishCoalescingAssignmentOperator(expr.Loc, e), exprOut{}
+			}
+
+		case ast.BinOpLogicalAndAssign:
+			if p.UnsupportedFeatures.Has(compat.LogicalAssignment) {
+				return p.lowerLogicalAssignmentOperator(expr.Loc, e, ast.BinOpLogicalAnd), exprOut{}
+			}
+
+		case ast.BinOpLogicalOrAssign:
+			if p.UnsupportedFeatures.Has(compat.LogicalAssignment) {
+				return p.lowerLogicalAssignmentOperator(expr.Loc, e, ast.BinOpLogicalOr), exprOut{}
 			}
 		}
 
 	case *ast.EIndex:
-		target, out := p.visitExprInOut(e.Target, exprIn{hasChainParent: !e.IsOptionalChain})
+		// "a['b']" => "a.b"
+		if p.MangleSyntax {
+			if str, ok := e.Index.Data.(*ast.EString); ok && lexer.IsIdentifierUTF16(str.Value) {
+				return p.visitExprInOut(ast.Expr{Loc: expr.Loc, Data: &ast.EDot{
+					Target:        e.Target,
+					Name:          lexer.UTF16ToString(str.Value),
+					NameLoc:       e.Index.Loc,
+					OptionalChain: e.OptionalChain,
+				}}, in)
+			}
+		}
+
+		isCallTarget := e == p.callTarget
+		target, out := p.visitExprInOut(e.Target, exprIn{
+			hasChainParent: e.OptionalChain == ast.OptionalChainContinue,
+		})
 		e.Target = target
-		e.Index = p.visitExpr(e.Index)
+
+		// Special-case EPrivateIdentifier to allow it here
+		if private, ok := e.Index.Data.(*ast.EPrivateIdentifier); ok {
+			name := p.loadNameFromRef(private.Ref)
+			result := p.findSymbol(name)
+			private.Ref = result.ref
+
+			// Unlike regular identifiers, there are no unbound private identifiers
+			kind := p.symbols[result.ref.InnerIndex].Kind
+			if !kind.IsPrivate() {
+				r := ast.Range{Loc: e.Index.Loc, Len: int32(len(name))}
+				p.log.AddRangeError(&p.source, r, fmt.Sprintf("Private name %q must be declared in an enclosing class", name))
+			} else if in.assignTarget != ast.AssignTargetNone && (kind == ast.SymbolPrivateGet || kind == ast.SymbolPrivateStaticGet) {
+				r := ast.Range{Loc: e.Index.Loc, Len: int32(len(name))}
+				p.log.AddRangeWarning(&p.source, r, fmt.Sprintf("Writing to getter-only property %q will throw", name))
+			} else if in.assignTarget != ast.AssignTargetReplace && (kind == ast.SymbolPrivateSet || kind == ast.SymbolPrivateStaticSet) {
+				r := ast.Range{Loc: e.Index.Loc, Len: int32(len(name))}
+				p.log.AddRangeWarning(&p.source, r, fmt.Sprintf("Reading from setter-only property %q will throw", name))
+			}
+
+			// Lower private member access only if we're sure the target isn't needed
+			// for the value of "this" for a call expression. All other cases will be
+			// taken care of by the enclosing call expression.
+			if p.UnsupportedFeatures.Has(kind.Feature()) && e.OptionalChain == ast.OptionalChainNone &&
+				in.assignTarget == ast.AssignTargetNone && !isCallTarget {
+				// "foo.#bar" => "__privateGet(foo, #bar)"
+				return p.lowerPrivateGet(e.Target, e.Index.Loc, private), exprOut{}
+			}
+		} else {
+			e.Index = p.visitExpr(e.Index)
+		}
+
+		// Create an error for assigning to an import namespace
+		if in.assignTarget != ast.AssignTargetNone {
+			if id, ok := e.Target.Data.(*ast.EIdentifier); ok && p.symbols[id.Ref.InnerIndex].Kind == ast.SymbolImport {
+				if str, ok := e.Index.Data.(*ast.EString); ok && lexer.IsIdentifierUTF16(str.Value) {
+					r := p.source.RangeOfString(e.Index.Loc)
+					p.log.AddRangeError(&p.source, r, fmt.Sprintf("Cannot assign to import %q", lexer.UTF16ToString(str.Value)))
+				} else {
+					r := lexer.RangeOfIdentifier(p.source, e.Target.Loc)
+					p.log.AddRangeError(&p.source, r, fmt.Sprintf("Cannot assign to property on import %q", p.symbols[id.Ref.InnerIndex].Name))
+				}
+			}
+		}
 
 		// Lower optional chaining if we're the top of the chain
-		containsOptionalChain := e.IsOptionalChain || out.childContainsOptionalChain
-		isEndOfChain := e.IsParenthesized || !in.hasChainParent
-		if containsOptionalChain && isEndOfChain {
+		containsOptionalChain := e.OptionalChain != ast.OptionalChainNone
+		if containsOptionalChain && !in.hasChainParent {
 			return p.lowerOptionalChain(expr, in, out, nil)
 		}
 
-		if p.mangleSyntax || p.ts.Parse {
+		// If this is a known enum value, inline the value of the enum
+		if p.TS.Parse && e.OptionalChain == ast.OptionalChainNone {
 			if str, ok := e.Index.Data.(*ast.EString); ok {
-				// If this is a known enum value, inline the value of the enum
-				if p.ts.Parse {
-					if id, ok := e.Target.Data.(*ast.EIdentifier); ok {
-						if enumValueMap, ok := p.knownEnumValues[id.Ref]; ok {
-							if number, ok := enumValueMap[lexer.UTF16ToString(str.Value)]; ok {
-								return ast.Expr{expr.Loc, &ast.ENumber{number}}, exprOut{}
-							}
+				if id, ok := e.Target.Data.(*ast.EIdentifier); ok {
+					if enumValueMap, ok := p.knownEnumValues[id.Ref]; ok {
+						if number, ok := enumValueMap[lexer.UTF16ToString(str.Value)]; ok {
+							return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: number}}, exprOut{}
 						}
-					}
-				}
-
-				// "a['b']" => "a.b"
-				if p.mangleSyntax {
-					if lexer.IsIdentifierUTF16(str.Value) {
-						return p.maybeRewriteDot(expr.Loc, &ast.EDot{
-							Target:  e.Target,
-							Name:    lexer.UTF16ToString(str.Value),
-							NameLoc: e.Index.Loc,
-						}), exprOut{}
 					}
 				}
 			}
@@ -7846,7 +7339,7 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 			p.typeofTarget = e.Value.Data
 
 		case ast.UnOpDelete:
-			value, out := p.visitExprInOut(e.Value, exprIn{hasChainParent: true, isAssignTarget: true})
+			value, out := p.visitExprInOut(e.Value, exprIn{hasChainParent: true, assignTarget: ast.AssignTargetReplace})
 			e.Value = value
 
 			// Lower optional chaining if present since we're guaranteed to be the
@@ -7858,63 +7351,106 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 			return expr, exprOut{}
 		}
 
-		e.Value, _ = p.visitExprInOut(e.Value, exprIn{isAssignTarget: e.Op.IsUnaryUpdate()})
+		e.Value, _ = p.visitExprInOut(e.Value, exprIn{assignTarget: e.Op.UnaryAssignTarget()})
 
-		// Fold constants
+		// Post-process the binary expression
 		switch e.Op {
 		case ast.UnOpNot:
 			if boolean, ok := toBooleanWithoutSideEffects(e.Value.Data); ok {
-				return ast.Expr{expr.Loc, &ast.EBoolean{!boolean}}, exprOut{}
+				return ast.Expr{Loc: expr.Loc, Data: &ast.EBoolean{Value: !boolean}}, exprOut{}
 			}
 
 		case ast.UnOpVoid:
-			if hasNoSideEffects(e.Value.Data) {
-				return ast.Expr{expr.Loc, &ast.EUndefined{}}, exprOut{}
+			if p.exprCanBeRemovedIfUnused(e.Value) {
+				return ast.Expr{Loc: expr.Loc, Data: &ast.EUndefined{}}, exprOut{}
 			}
 
 		case ast.UnOpTypeof:
 			// "typeof require" => "'function'"
 			if id, ok := e.Value.Data.(*ast.EIdentifier); ok && id.Ref == p.requireRef {
-				p.symbols[p.requireRef.InnerIndex].UseCountEstimate--
-				return ast.Expr{expr.Loc, &ast.EString{lexer.StringToUTF16("function")}}, exprOut{}
+				p.ignoreUsage(p.requireRef)
+				p.typeofRequire = &ast.EString{Value: lexer.StringToUTF16("function")}
+				return ast.Expr{Loc: expr.Loc, Data: p.typeofRequire}, exprOut{}
 			}
 
 			if typeof, ok := typeofWithoutSideEffects(e.Value.Data); ok {
-				return ast.Expr{expr.Loc, &ast.EString{lexer.StringToUTF16(typeof)}}, exprOut{}
+				return ast.Expr{Loc: expr.Loc, Data: &ast.EString{Value: lexer.StringToUTF16(typeof)}}, exprOut{}
 			}
 
 		case ast.UnOpPos:
 			if number, ok := toNumberWithoutSideEffects(e.Value.Data); ok {
-				return ast.Expr{expr.Loc, &ast.ENumber{number}}, exprOut{}
+				return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: number}}, exprOut{}
 			}
 
 		case ast.UnOpNeg:
 			if number, ok := toNumberWithoutSideEffects(e.Value.Data); ok {
-				return ast.Expr{expr.Loc, &ast.ENumber{-number}}, exprOut{}
+				return ast.Expr{Loc: expr.Loc, Data: &ast.ENumber{Value: -number}}, exprOut{}
+			}
+
+			////////////////////////////////////////////////////////////////////////////////
+			// All assignment operators below here
+
+		case ast.UnOpPreDec:
+			if target, loc, private := p.extractPrivateIndex(e.Value); private != nil {
+				return p.lowerPrivateSetUnOp(target, loc, private, ast.BinOpSub, false), exprOut{}
+			}
+
+		case ast.UnOpPreInc:
+			if target, loc, private := p.extractPrivateIndex(e.Value); private != nil {
+				return p.lowerPrivateSetUnOp(target, loc, private, ast.BinOpAdd, false), exprOut{}
+			}
+
+		case ast.UnOpPostDec:
+			if target, loc, private := p.extractPrivateIndex(e.Value); private != nil {
+				return p.lowerPrivateSetUnOp(target, loc, private, ast.BinOpSub, true), exprOut{}
+			}
+
+		case ast.UnOpPostInc:
+			if target, loc, private := p.extractPrivateIndex(e.Value); private != nil {
+				return p.lowerPrivateSetUnOp(target, loc, private, ast.BinOpAdd, true), exprOut{}
 			}
 		}
 
 	case *ast.EDot:
-		// Substitute user-specified defines
-		if define, ok := p.dotDefines[e.Name]; ok && p.isDotDefineMatch(expr, define.parts) {
-			return p.valueForDefine(expr.Loc, define.defineFunc), exprOut{}
+		// Check both user-specified defines and known globals
+		if defines, ok := p.Defines.DotDefines[e.Name]; ok {
+			for _, define := range defines {
+				if p.isDotDefineMatch(expr, define.Parts) {
+					// Substitute user-specified defines
+					if define.Data.DefineFunc != nil {
+						return p.valueForDefine(expr.Loc, in.assignTarget, define.Data.DefineFunc), exprOut{}
+					}
+
+					// Copy the call side effect flag over in case this expression is called
+					if define.Data.CallCanBeUnwrappedIfUnused {
+						e.CallCanBeUnwrappedIfUnused = true
+					}
+
+					// All dot defines that don't have user-specified replacements are
+					// known to be side-effect free. Mark them as such if we get here.
+					e.CanBeRemovedIfUnused = true
+					break
+				}
+			}
 		}
 
-		target, out := p.visitExprInOut(e.Target, exprIn{hasChainParent: !e.IsOptionalChain})
+		target, out := p.visitExprInOut(e.Target, exprIn{
+			hasChainParent: e.OptionalChain == ast.OptionalChainContinue,
+		})
 		e.Target = target
 
 		// Lower optional chaining if we're the top of the chain
-		containsOptionalChain := e.IsOptionalChain || out.childContainsOptionalChain
-		isEndOfChain := e.IsParenthesized || !in.hasChainParent
-		if containsOptionalChain && isEndOfChain {
+		containsOptionalChain := e.OptionalChain != ast.OptionalChainNone
+		if containsOptionalChain && !in.hasChainParent {
 			return p.lowerOptionalChain(expr, in, out, nil)
 		}
 
-		return p.maybeRewriteDot(expr.Loc, e), exprOut{
+		return p.maybeRewriteDot(expr.Loc, in.assignTarget, e), exprOut{
 			childContainsOptionalChain: containsOptionalChain,
 		}
 
 	case *ast.EIf:
+		isCallTarget := e == p.callTarget
 		e.Test = p.visitBooleanExpr(e.Test)
 		e.Yes = p.visitExpr(e.Yes)
 		e.No = p.visitExpr(e.No)
@@ -7922,13 +7458,25 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		// Fold constants
 		if boolean, ok := toBooleanWithoutSideEffects(e.Test.Data); ok {
 			if boolean {
+				// "(1 ? fn : 2)()" => "fn()"
+				// "(1 ? this.fn : 2)" => "this.fn"
+				// "(1 ? this.fn : 2)()" => "(0, this.fn)()"
+				if isCallTarget && hasValueForThisInCall(e.Yes) {
+					return ast.JoinWithComma(ast.Expr{Loc: e.Test.Loc, Data: &ast.ENumber{}}, e.Yes), exprOut{}
+				}
 				return e.Yes, exprOut{}
 			} else {
+				// "(0 ? 1 : fn)()" => "fn()"
+				// "(0 ? 1 : this.fn)" => "this.fn"
+				// "(0 ? 1 : this.fn)()" => "(0, this.fn)()"
+				if isCallTarget && hasValueForThisInCall(e.No) {
+					return ast.JoinWithComma(ast.Expr{Loc: e.Test.Loc, Data: &ast.ENumber{}}, e.No), exprOut{}
+				}
 				return e.No, exprOut{}
 			}
 		}
 
-		if p.mangleSyntax {
+		if p.MangleSyntax {
 			// "!a ? b : c" => "a ? c : b"
 			if not, ok := e.Test.Data.(*ast.EUnary); ok && not.Op == ast.UnOpNot {
 				e.Test = not.Value
@@ -7939,60 +7487,71 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 	case *ast.EAwait:
 		e.Value = p.visitExpr(e.Value)
 
+		// "await" expressions turn into "yield" expressions when lowering
+		if p.UnsupportedFeatures.Has(compat.AsyncAwait) {
+			return ast.Expr{Loc: expr.Loc, Data: &ast.EYield{Value: &e.Value}}, exprOut{}
+		}
+
 	case *ast.EYield:
 		if e.Value != nil {
 			*e.Value = p.visitExpr(*e.Value)
 		}
 
 	case *ast.EArray:
+		if in.assignTarget != ast.AssignTargetNone {
+			p.markSyntaxFeature(compat.Destructuring, ast.Range{Loc: expr.Loc, Len: 1})
+		}
 		for i, item := range e.Items {
-			e.Items[i], _ = p.visitExprInOut(item, exprIn{isAssignTarget: in.isAssignTarget})
+			e.Items[i], _ = p.visitExprInOut(item, exprIn{assignTarget: in.assignTarget})
 		}
 
 	case *ast.EObject:
+		if in.assignTarget != ast.AssignTargetNone {
+			p.markSyntaxFeature(compat.Destructuring, ast.Range{Loc: expr.Loc, Len: 1})
+		}
 		for i, property := range e.Properties {
 			if property.Kind != ast.PropertySpread {
 				e.Properties[i].Key = p.visitExpr(property.Key)
 			}
 			if property.Value != nil {
-				*property.Value, _ = p.visitExprInOut(*property.Value, exprIn{isAssignTarget: in.isAssignTarget})
+				*property.Value, _ = p.visitExprInOut(*property.Value, exprIn{assignTarget: in.assignTarget})
 			}
 			if property.Initializer != nil {
 				*property.Initializer = p.visitExpr(*property.Initializer)
 			}
 		}
-		return p.lowerObjectSpread(expr.Loc, e), exprOut{}
+
+		// Object expressions represent both object literals and binding patterns.
+		// Only lower object spread if we're an object literal, not a binding pattern.
+		if in.assignTarget == ast.AssignTargetNone {
+			return p.lowerObjectSpread(expr.Loc, e), exprOut{}
+		}
 
 	case *ast.EImport:
 		e.Expr = p.visitExpr(e.Expr)
 
-		// Track calls to import() so we can use them while bundling
-		if p.isBundling {
-			// Convert no-substitution template literals into strings when bundling
-			if template, ok := e.Expr.Data.(*ast.ETemplate); ok && template.Tag == nil && len(template.Parts) == 0 {
-				e.Expr.Data = &ast.EString{template.Head}
-			}
+		// Convert no-substitution template literals into strings
+		if template, ok := e.Expr.Data.(*ast.ETemplate); ok && template.Tag == nil && len(template.Parts) == 0 {
+			e.Expr.Data = &ast.EString{Value: template.Head}
+		}
 
-			// The argument must be a string
-			str, ok := e.Expr.Data.(*ast.EString)
-			if !ok {
-				p.log.AddError(p.source, e.Expr.Loc, "The argument to import() must be a string literal")
-				return expr, exprOut{}
-			}
-
+		// The argument must be a string
+		if str, ok := e.Expr.Data.(*ast.EString); ok {
 			// Ignore calls to import() if the control flow is provably dead here.
 			// We don't want to spend time scanning the required files if they will
 			// never be used.
 			if p.isControlFlowDead {
-				return ast.Expr{expr.Loc, &ast.ENull{}}, exprOut{}
+				return ast.Expr{Loc: expr.Loc, Data: &ast.ENull{}}, exprOut{}
 			}
 
-			path := ast.Path{e.Expr.Loc, lexer.UTF16ToString(str.Value)}
+			importRecordIndex := p.addImportRecord(ast.ImportDynamic, e.Expr.Loc, lexer.UTF16ToString(str.Value))
+			p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, importRecordIndex)
 
-			// Only track import paths if we want dependencies
-			if p.isBundling {
-				p.importPaths = append(p.importPaths, ast.ImportPath{Path: path, Kind: ast.ImportDynamic})
-			}
+			e.ImportRecordIndex = &importRecordIndex
+		} else if p.IsBundling {
+			r := lexer.RangeOfIdentifier(p.source, expr.Loc)
+			p.log.AddRangeWarning(&p.source, r,
+				"This dynamic import will not be bundled because the argument is not a string literal")
 		}
 
 	case *ast.ECall:
@@ -8000,7 +7559,7 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		var thisArgFunc func() ast.Expr
 		var thisArgWrapFunc func(ast.Expr) ast.Expr
 		p.callTarget = e.Target.Data
-		if e.IsOptionalChain {
+		if e.OptionalChain == ast.OptionalChainStart {
 			// Signal to our child if this is an ECall at the start of an optional
 			// chain. If so, the child will need to stash the "this" context for us
 			// that we need for the ".call(this, ...args)".
@@ -8011,7 +7570,7 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		}
 		_, wasIdentifierBeforeVisit := e.Target.Data.(*ast.EIdentifier)
 		target, out := p.visitExprInOut(e.Target, exprIn{
-			hasChainParent:                     !e.IsOptionalChain,
+			hasChainParent:                     e.OptionalChain == ast.OptionalChainContinue,
 			storeThisArgForParentOptionalChain: storeThisArg,
 		})
 		e.Target = target
@@ -8036,10 +7595,21 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 			}
 		}
 
+		// Copy the call side effect flag over if this is a known target
+		switch t := target.Data.(type) {
+		case *ast.EIdentifier:
+			if t.CallCanBeUnwrappedIfUnused {
+				e.CanBeUnwrappedIfUnused = true
+			}
+		case *ast.EDot:
+			if t.CallCanBeUnwrappedIfUnused {
+				e.CanBeUnwrappedIfUnused = true
+			}
+		}
+
 		// Lower optional chaining if we're the top of the chain
-		containsOptionalChain := e.IsOptionalChain || out.childContainsOptionalChain
-		isEndOfChain := e.IsParenthesized || !in.hasChainParent
-		if containsOptionalChain && isEndOfChain {
+		containsOptionalChain := e.OptionalChain != ast.OptionalChainNone
+		if containsOptionalChain && !in.hasChainParent {
 			result, out := p.lowerOptionalChain(expr, in, out, thisArgFunc)
 			if thisArgWrapFunc != nil {
 				result = thisArgWrapFunc(result)
@@ -8047,45 +7617,61 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 			return result, out
 		}
 
+		// If this is a plain call expression (instead of an optional chain), lower
+		// private member access in the call target now if there is one
+		if !containsOptionalChain {
+			if target, loc, private := p.extractPrivateIndex(e.Target); private != nil {
+				// "foo.#bar(123)" => "__privateGet(foo, #bar).call(foo, 123)"
+				targetFunc, targetWrapFunc := p.captureValueWithPossibleSideEffects(target.Loc, 2, target)
+				return targetWrapFunc(ast.Expr{Loc: target.Loc, Data: &ast.ECall{
+					Target: ast.Expr{Loc: target.Loc, Data: &ast.EDot{
+						Target:  p.lowerPrivateGet(targetFunc(), loc, private),
+						Name:    "call",
+						NameLoc: target.Loc,
+					}},
+					Args:                   append([]ast.Expr{targetFunc()}, e.Args...),
+					CanBeUnwrappedIfUnused: e.CanBeUnwrappedIfUnused,
+				}}), exprOut{}
+			}
+		}
+
 		// Track calls to require() so we can use them while bundling
-		if id, ok := e.Target.Data.(*ast.EIdentifier); ok && id.Ref == p.requireRef && p.isBundling {
+		if id, ok := e.Target.Data.(*ast.EIdentifier); ok && id.Ref == p.requireRef && p.IsBundling {
 			// There must be one argument
 			if len(e.Args) != 1 {
-				p.log.AddError(p.source, expr.Loc,
-					fmt.Sprintf("Calls to %s() must take a single argument", p.symbols[id.Ref.InnerIndex].Name))
-				return expr, exprOut{}
+				r := lexer.RangeOfIdentifier(p.source, e.Target.Loc)
+				p.log.AddRangeWarning(&p.source, r, fmt.Sprintf(
+					"This call to \"require\" will not be bundled because it has %d arguments", len(e.Args)))
+			} else {
+				arg := e.Args[0]
+
+				// Convert no-substitution template literals into strings when bundling
+				if template, ok := arg.Data.(*ast.ETemplate); ok && template.Tag == nil && len(template.Parts) == 0 {
+					arg.Data = &ast.EString{Value: template.Head}
+				}
+
+				// The argument must be a string
+				if str, ok := arg.Data.(*ast.EString); ok {
+					// Ignore calls to require() if the control flow is provably dead here.
+					// We don't want to spend time scanning the required files if they will
+					// never be used.
+					if p.isControlFlowDead {
+						return ast.Expr{Loc: expr.Loc, Data: &ast.ENull{}}, exprOut{}
+					}
+
+					importRecordIndex := p.addImportRecord(ast.ImportRequire, arg.Loc, lexer.UTF16ToString(str.Value))
+					p.importRecords[importRecordIndex].IsInsideTryBody = p.tryBodyCount != 0
+					p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, importRecordIndex)
+
+					// Create a new expression to represent the operation
+					p.ignoreUsage(p.requireRef)
+					return ast.Expr{Loc: expr.Loc, Data: &ast.ERequire{ImportRecordIndex: importRecordIndex}}, exprOut{}
+				}
+
+				r := lexer.RangeOfIdentifier(p.source, e.Target.Loc)
+				p.log.AddRangeWarning(&p.source, r,
+					"This call to \"require\" will not be bundled because the argument is not a string literal")
 			}
-			arg := e.Args[0]
-
-			// Convert no-substitution template literals into strings when bundling
-			if template, ok := arg.Data.(*ast.ETemplate); ok && template.Tag == nil && len(template.Parts) == 0 {
-				arg.Data = &ast.EString{template.Head}
-			}
-
-			// The argument must be a string
-			str, ok := arg.Data.(*ast.EString)
-			if !ok {
-				p.log.AddError(p.source, arg.Loc,
-					fmt.Sprintf("The argument to %s() must be a string literal", p.symbols[id.Ref.InnerIndex].Name))
-				return expr, exprOut{}
-			}
-
-			// Ignore calls to require() if the control flow is provably dead here.
-			// We don't want to spend time scanning the required files if they will
-			// never be used.
-			if p.isControlFlowDead {
-				return ast.Expr{expr.Loc, &ast.ENull{}}, exprOut{}
-			}
-
-			path := ast.Path{arg.Loc, lexer.UTF16ToString(str.Value)}
-
-			// Only track import paths if we want dependencies
-			if p.isBundling {
-				p.importPaths = append(p.importPaths, ast.ImportPath{Path: path, Kind: ast.ImportRequire})
-			}
-
-			// Create a new expression to represent the operation
-			return ast.Expr{expr.Loc, &ast.ERequire{Path: path}}, exprOut{}
 		}
 
 		return expr, exprOut{
@@ -8107,9 +7693,10 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		p.pushScopeForVisitPass(ast.ScopeFunctionBody, e.Body.Loc)
 		e.Body.Stmts = p.visitStmtsAndPrependTempRefs(e.Body.Stmts)
 		p.popScope()
+		p.lowerFunction(&e.IsAsync, &e.Args, e.Body.Loc, &e.Body.Stmts, &e.PreferExpr)
 		p.popScope()
 
-		if p.mangleSyntax && len(e.Body.Stmts) == 1 {
+		if p.MangleSyntax && len(e.Body.Stmts) == 1 {
 			if s, ok := e.Body.Stmts[0].Data.(*ast.SReturn); ok {
 				if s.Value == nil {
 					// "() => { return }" => "() => {}"
@@ -8136,10 +7723,7 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 		}
 
 		// Lower class field syntax for browsers that don't support it
-		_, newExpr := p.lowerClass(expr.Loc, &e.Class, false /* isStmt */)
-		if newExpr.Data != nil {
-			expr = newExpr
-		}
+		_, expr = p.lowerClass(ast.Stmt{}, expr)
 
 	default:
 		panic(fmt.Sprintf("Unexpected expression of type %T", expr.Data))
@@ -8148,68 +7732,71 @@ func (p *parser) visitExprInOut(expr ast.Expr, in exprIn) (ast.Expr, exprOut) {
 	return expr, exprOut{}
 }
 
-func (p *parser) valueForDefine(loc ast.Loc, defineFunc DefineFunc) ast.Expr {
-	expr := ast.Expr{loc, defineFunc(p.findSymbolHelper)}
+func (p *parser) valueForDefine(loc ast.Loc, assignTarget ast.AssignTarget, defineFunc config.DefineFunc) ast.Expr {
+	expr := ast.Expr{Loc: loc, Data: defineFunc(p.findSymbolHelper)}
 	if id, ok := expr.Data.(*ast.EIdentifier); ok {
-		return p.handleIdentifier(loc, id)
+		return p.handleIdentifier(loc, assignTarget, id)
 	}
 	return expr
 }
 
-func (p *parser) handleIdentifier(loc ast.Loc, e *ast.EIdentifier) ast.Expr {
+func (p *parser) handleIdentifier(loc ast.Loc, assignTarget ast.AssignTarget, e *ast.EIdentifier) ast.Expr {
+	ref := e.Ref
+
+	if assignTarget != ast.AssignTargetNone {
+		if p.symbols[ref.InnerIndex].Kind == ast.SymbolImport {
+			// Create an error for assigning to an import namespace
+			r := lexer.RangeOfIdentifier(p.source, loc)
+			p.log.AddRangeError(&p.source, r, fmt.Sprintf("Cannot assign to import %q", p.symbols[ref.InnerIndex].Name))
+		} else {
+			// Remember that this part assigns to this symbol for code splitting
+			use := p.symbolUses[ref]
+			use.IsAssigned = true
+			p.symbolUses[ref] = use
+		}
+	}
+
 	// Substitute an EImportIdentifier now if this is an import item
-	if p.isImportItem[e.Ref] {
-		return ast.Expr{loc, &ast.EImportIdentifier{e.Ref}}
+	if p.isImportItem[ref] {
+		return ast.Expr{Loc: loc, Data: &ast.EImportIdentifier{Ref: ref}}
 	}
 
 	// Substitute a namespace export reference now if appropriate
-	if p.ts.Parse {
-		if nsRef, ok := p.isExportedInsideNamespace[e.Ref]; ok {
-			name := p.symbols[e.Ref.InnerIndex].Name
+	if p.TS.Parse {
+		if nsRef, ok := p.isExportedInsideNamespace[ref]; ok {
+			name := p.symbols[ref.InnerIndex].Name
 
 			// If this is a known enum value, inline the value of the enum
 			if enumValueMap, ok := p.knownEnumValues[nsRef]; ok {
 				if number, ok := enumValueMap[name]; ok {
-					return ast.Expr{loc, &ast.ENumber{number}}
+					return ast.Expr{Loc: loc, Data: &ast.ENumber{Value: number}}
 				}
 			}
 
 			// Otherwise, create a property access on the namespace
-			return ast.Expr{loc, &ast.EDot{
-				Target:  ast.Expr{loc, &ast.EIdentifier{nsRef}},
+			return ast.Expr{Loc: loc, Data: &ast.EDot{
+				Target:  ast.Expr{Loc: loc, Data: &ast.EIdentifier{Ref: nsRef}},
 				Name:    name,
 				NameLoc: loc,
 			}}
 		}
 	}
 
-	// Disallow capturing the "require" variable without calling it
-	if e.Ref == p.requireRef && (e != p.callTarget && e != p.typeofTarget) {
-		if p.tryBodyCount == 0 {
-			r := lexer.RangeOfIdentifier(p.source, loc)
-			p.log.AddRangeError(p.source, r, "\"require\" must not be called indirectly")
+	// Warn about uses of "require" other than a direct call
+	if ref == p.requireRef && e != p.callTarget && e != p.typeofTarget && p.tryBodyCount == 0 {
+		// "typeof require == 'function' && require"
+		if e == p.typeofRequireEqualsFnTarget {
+			// Become "false" in the browser and "require" in node
+			if p.Platform == config.PlatformBrowser {
+				return ast.Expr{Loc: loc, Data: &ast.EBoolean{Value: false}}
+			}
 		} else {
-			// The "moment" library contains code that looks like this:
-			//
-			//   try {
-			//     oldLocale = globalLocale._abbr;
-			//     var aliasedRequire = require;
-			//     aliasedRequire('./locale/' + name);
-			//     getSetGlobalLocale(oldLocale);
-			//   } catch (e) {}
-			//
-			// This is unfortunate because it prevents the module graph from being
-			// statically determined. However, the dependencies are optional and
-			// the library will work fine without them.
-			//
-			// Handle this case by deliberately ignoring code that uses require
-			// incorrectly inside a try statement like this. We replace it with
-			// null so it's guaranteed to crash at runtime.
-			return ast.Expr{loc, &ast.ENull{}}
+			r := lexer.RangeOfIdentifier(p.source, loc)
+			p.log.AddRangeWarning(&p.source, r, "Indirect calls to \"require\" will not be bundled")
 		}
 	}
 
-	return ast.Expr{loc, e}
+	return ast.Expr{Loc: loc, Data: e}
 }
 
 func extractNumericValues(left ast.Expr, right ast.Expr) (float64, float64, bool) {
@@ -8224,21 +7811,25 @@ func extractNumericValues(left ast.Expr, right ast.Expr) (float64, float64, bool
 func (p *parser) visitFn(fn *ast.Fn, scopeLoc ast.Loc) {
 	oldTryBodyCount := p.tryBodyCount
 	oldIsThisCaptured := p.isThisCaptured
+	oldArgumentsRef := p.argumentsRef
 	p.tryBodyCount = 0
 	p.isThisCaptured = true
+	p.argumentsRef = &fn.ArgumentsRef
 
 	p.pushScopeForVisitPass(ast.ScopeFunctionArgs, scopeLoc)
 	p.visitArgs(fn.Args)
 	p.pushScopeForVisitPass(ast.ScopeFunctionBody, fn.Body.Loc)
 	fn.Body.Stmts = p.visitStmtsAndPrependTempRefs(fn.Body.Stmts)
 	p.popScope()
+	p.lowerFunction(&fn.IsAsync, &fn.Args, fn.Body.Loc, &fn.Body.Stmts, nil)
 	p.popScope()
 
 	p.tryBodyCount = oldTryBodyCount
 	p.isThisCaptured = oldIsThisCaptured
+	p.argumentsRef = oldArgumentsRef
 }
 
-func (p *parser) scanForImportPaths(stmts []ast.Stmt, isBundling bool) []ast.Stmt {
+func (p *parser) scanForImportsAndExports(stmts []ast.Stmt, isBundling bool) []ast.Stmt {
 	stmtsEnd := 0
 
 	for _, stmt := range stmts {
@@ -8247,7 +7838,7 @@ func (p *parser) scanForImportPaths(stmts []ast.Stmt, isBundling bool) []ast.Stm
 			// TypeScript always trims unused imports. This is important for
 			// correctness since some imports might be fake (only in the type
 			// system and used for type-only imports).
-			if p.mangleSyntax || p.ts.Parse {
+			if p.MangleSyntax || p.TS.Parse {
 				foundImports := false
 				isUnusedInTypeScript := true
 
@@ -8257,7 +7848,7 @@ func (p *parser) scanForImportPaths(stmts []ast.Stmt, isBundling bool) []ast.Stm
 					symbol := p.symbols[s.DefaultName.Ref.InnerIndex]
 
 					// TypeScript has a separate definition of unused
-					if p.ts.Parse && p.tsUseCounts[s.DefaultName.Ref.InnerIndex] != 0 {
+					if p.TS.Parse && p.tsUseCounts[s.DefaultName.Ref.InnerIndex] != 0 {
 						isUnusedInTypeScript = false
 					}
 
@@ -8268,12 +7859,12 @@ func (p *parser) scanForImportPaths(stmts []ast.Stmt, isBundling bool) []ast.Stm
 				}
 
 				// Remove the star import if it's unused
-				if s.StarLoc != nil {
+				if s.StarNameLoc != nil {
 					foundImports = true
 					symbol := p.symbols[s.NamespaceRef.InnerIndex]
 
 					// TypeScript has a separate definition of unused
-					if p.ts.Parse && p.tsUseCounts[s.NamespaceRef.InnerIndex] != 0 {
+					if p.TS.Parse && p.tsUseCounts[s.NamespaceRef.InnerIndex] != 0 {
 						isUnusedInTypeScript = false
 					}
 
@@ -8282,7 +7873,7 @@ func (p *parser) scanForImportPaths(stmts []ast.Stmt, isBundling bool) []ast.Stm
 						// Make sure we don't remove this if it was used for a property
 						// access while bundling
 						if importItems, ok := p.importItemsForNamespace[s.NamespaceRef]; ok && len(importItems) == 0 {
-							s.StarLoc = nil
+							s.StarNameLoc = nil
 						}
 					}
 				}
@@ -8296,7 +7887,7 @@ func (p *parser) scanForImportPaths(stmts []ast.Stmt, isBundling bool) []ast.Stm
 						symbol := p.symbols[item.Name.Ref.InnerIndex]
 
 						// TypeScript has a separate definition of unused
-						if p.ts.Parse && p.tsUseCounts[item.Name.Ref.InnerIndex] != 0 {
+						if p.TS.Parse && p.tsUseCounts[item.Name.Ref.InnerIndex] != 0 {
 							isUnusedInTypeScript = false
 						}
 
@@ -8328,28 +7919,34 @@ func (p *parser) scanForImportPaths(stmts []ast.Stmt, isBundling bool) []ast.Stm
 				//
 				// We do not want to do this culling in JavaScript though because the
 				// module may have side effects even if all imports are unused.
-				if p.ts.Parse && foundImports && isUnusedInTypeScript {
+				if p.TS.Parse && foundImports && isUnusedInTypeScript {
 					continue
 				}
 			}
 
-			// Only track import paths if we want dependencies
 			if isBundling {
-				p.importPaths = append(p.importPaths, ast.ImportPath{Path: s.Path})
-
-				if s.StarLoc != nil {
+				if s.StarNameLoc != nil {
 					// If we're bundling a star import, add any import items we generated
 					// for this namespace while parsing as explicit import items instead.
 					// That will cause the bundler to bundle them more efficiently when
 					// both this module and the imported module are in the same group.
 					if importItems, ok := p.importItemsForNamespace[s.NamespaceRef]; ok && len(importItems) > 0 {
-						starLoc := *s.StarLoc
 						items := s.Items
 						if items == nil {
 							items = &[]ast.ClauseItem{}
 						}
-						for name, itemRef := range importItems {
-							*items = append(*items, ast.ClauseItem{name, starLoc, ast.LocRef{starLoc, itemRef}})
+						for alias, name := range importItems {
+							originalName := p.symbols[name.Ref.InnerIndex].Name
+							*items = append(*items, ast.ClauseItem{
+								Alias:        alias,
+								AliasLoc:     name.Loc,
+								Name:         name,
+								OriginalName: originalName,
+							})
+							p.declaredSymbols = append(p.declaredSymbols, ast.DeclaredSymbol{
+								Ref:        name.Ref,
+								IsTopLevel: true,
+							})
 						}
 						s.Items = items
 					}
@@ -8363,21 +7960,107 @@ func (p *parser) scanForImportPaths(stmts []ast.Stmt, isBundling bool) []ast.Stm
 					// accesses directly with the appropriate symbols instead (since both
 					// this module and the imported module are in the same group).
 					if p.symbols[s.NamespaceRef.InnerIndex].UseCountEstimate == 0 {
-						s.StarLoc = nil
+						s.StarNameLoc = nil
+					}
+				}
+
+				if s.DefaultName != nil {
+					p.namedImports[s.DefaultName.Ref] = ast.NamedImport{
+						Alias:             "default",
+						AliasLoc:          s.DefaultName.Loc,
+						NamespaceRef:      s.NamespaceRef,
+						ImportRecordIndex: s.ImportRecordIndex,
+					}
+				}
+
+				if s.StarNameLoc != nil {
+					p.namedImports[s.NamespaceRef] = ast.NamedImport{
+						Alias:             "*",
+						AliasLoc:          *s.StarNameLoc,
+						NamespaceRef:      ast.InvalidRef,
+						ImportRecordIndex: s.ImportRecordIndex,
+					}
+				}
+
+				if s.Items != nil {
+					for _, item := range *s.Items {
+						p.namedImports[item.Name.Ref] = ast.NamedImport{
+							Alias:             item.Alias,
+							AliasLoc:          item.AliasLoc,
+							NamespaceRef:      s.NamespaceRef,
+							ImportRecordIndex: s.ImportRecordIndex,
+						}
 					}
 				}
 			}
 
+			p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, s.ImportRecordIndex)
+
+			// This is true for import statements without imports like "import 'foo'"
+			if s.DefaultName == nil && s.StarNameLoc == nil && s.Items == nil {
+				p.importRecords[s.ImportRecordIndex].DoesNotUseExports = true
+			}
+
 		case *ast.SExportStar:
+			p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, s.ImportRecordIndex)
+
 			// Only track import paths if we want dependencies
 			if isBundling {
-				p.importPaths = append(p.importPaths, ast.ImportPath{Path: s.Path})
+				if s.Alias != nil {
+					// "export * as ns from 'path'"
+					p.namedImports[s.NamespaceRef] = ast.NamedImport{
+						Alias:             "*",
+						AliasLoc:          s.Alias.Loc,
+						NamespaceRef:      ast.InvalidRef,
+						ImportRecordIndex: s.ImportRecordIndex,
+					}
+				} else {
+					// "export * from 'path'"
+					p.exportStarImportRecords = append(p.exportStarImportRecords, s.ImportRecordIndex)
+				}
 			}
 
 		case *ast.SExportFrom:
+			p.importRecordsForCurrentPart = append(p.importRecordsForCurrentPart, s.ImportRecordIndex)
+
 			// Only track import paths if we want dependencies
 			if isBundling {
-				p.importPaths = append(p.importPaths, ast.ImportPath{Path: s.Path})
+				for _, item := range s.Items {
+					// Note that the imported alias is not item.Alias, which is the
+					// exported alias. This is somewhat confusing because each
+					// SExportFrom statement is basically SImport + SExportClause in one.
+					p.namedImports[item.Name.Ref] = ast.NamedImport{
+						Alias:             p.symbols[item.Name.Ref.InnerIndex].Name,
+						AliasLoc:          item.Name.Loc,
+						NamespaceRef:      s.NamespaceRef,
+						ImportRecordIndex: s.ImportRecordIndex,
+						IsExported:        true,
+					}
+				}
+			}
+
+		case *ast.SExportClause:
+			// Strip exports of non-local symbols in TypeScript, since those likely
+			// correspond to type-only exports
+			if p.TS.Parse {
+				itemsEnd := 0
+				for _, item := range s.Items {
+					if p.symbols[item.Name.Ref.InnerIndex].Kind != ast.SymbolUnbound {
+						s.Items[itemsEnd] = item
+						itemsEnd++
+
+						// Mark re-exported imports as such
+						if namedImport, ok := p.namedImports[item.Name.Ref]; ok {
+							namedImport.IsExported = true
+							p.namedImports[item.Name.Ref] = namedImport
+						}
+					}
+				}
+				if itemsEnd == 0 {
+					// Remove empty export statements entirely
+					continue
+				}
+				s.Items = s.Items[:itemsEnd]
 			}
 		}
 
@@ -8389,69 +8072,441 @@ func (p *parser) scanForImportPaths(stmts []ast.Stmt, isBundling bool) []ast.Stm
 	return stmts[:stmtsEnd]
 }
 
-type LanguageTarget int8
-
-const (
-	// These are arranged such that ESNext is the default zero value and such
-	// that earlier releases are less than later releases
-	ES2015 = -6
-	ES2016 = -5
-	ES2017 = -4
-	ES2018 = -3
-	ES2019 = -2
-	ES2020 = -1
-	ESNext = 0
-)
-
-var targetTable = map[LanguageTarget]string{
-	ES2015: "ES2015",
-	ES2016: "ES2016",
-	ES2017: "ES2017",
-	ES2018: "ES2018",
-	ES2019: "ES2019",
-	ES2020: "ES2020",
-	ESNext: "ESNext",
+func (p *parser) appendPart(parts []ast.Part, stmts []ast.Stmt) []ast.Part {
+	p.symbolUses = make(map[ast.Ref]ast.SymbolUse)
+	p.declaredSymbols = nil
+	p.importRecordsForCurrentPart = nil
+	part := ast.Part{
+		Stmts:      p.visitStmtsAndPrependTempRefs(stmts),
+		SymbolUses: p.symbolUses,
+	}
+	if len(part.Stmts) > 0 {
+		part.CanBeRemovedIfUnused = p.stmtsCanBeRemovedIfUnused(part.Stmts)
+		part.DeclaredSymbols = p.declaredSymbols
+		part.ImportRecordIndices = p.importRecordsForCurrentPart
+		parts = append(parts, part)
+	}
+	return parts
 }
 
-type JSXOptions struct {
-	Parse    bool
-	Factory  []string
-	Fragment []string
+func (p *parser) stmtsCanBeRemovedIfUnused(stmts []ast.Stmt) bool {
+	for _, stmt := range stmts {
+		switch s := stmt.Data.(type) {
+		case *ast.SFunction, *ast.SEmpty:
+			// These never have side effects
+
+		case *ast.SImport:
+			// Let these be removed if they are unused. Note that we also need to
+			// check if the imported file is marked as "sideEffects: false" before we
+			// can remove a SImport statement. Otherwise the import must be kept for
+			// its side effects.
+
+		case *ast.SClass:
+			if !p.classCanBeRemovedIfUnused(s.Class) {
+				return false
+			}
+
+		case *ast.SExpr:
+			if !p.exprCanBeRemovedIfUnused(s.Value) {
+				return false
+			}
+
+		case *ast.SLocal:
+			for _, decl := range s.Decls {
+				if !p.bindingCanBeRemovedIfUnused(decl.Binding) {
+					return false
+				}
+				if decl.Value != nil && !p.exprCanBeRemovedIfUnused(*decl.Value) {
+					return false
+				}
+			}
+
+		case *ast.SExportClause:
+			// Exports are tracked separately, so this isn't necessary
+
+		case *ast.SExportDefault:
+			switch {
+			case s.Value.Expr != nil:
+				if !p.exprCanBeRemovedIfUnused(*s.Value.Expr) {
+					return false
+				}
+
+			case s.Value.Stmt != nil:
+				switch s2 := s.Value.Stmt.Data.(type) {
+				case *ast.SFunction:
+					// These never have side effects
+
+				case *ast.SClass:
+					if !p.classCanBeRemovedIfUnused(s2.Class) {
+						return false
+					}
+
+				default:
+					panic("Internal error")
+				}
+			}
+
+		default:
+			// Assume that all statements not explicitly special-cased here have side
+			// effects, and cannot be removed even if unused
+			return false
+		}
+	}
+
+	return true
 }
 
-type TypeScriptOptions struct {
-	Parse bool
+func (p *parser) classCanBeRemovedIfUnused(class ast.Class) bool {
+	if class.Extends != nil && !p.exprCanBeRemovedIfUnused(*class.Extends) {
+		return false
+	}
+
+	for _, property := range class.Properties {
+		if !p.exprCanBeRemovedIfUnused(property.Key) {
+			return false
+		}
+		if property.Value != nil && !p.exprCanBeRemovedIfUnused(*property.Value) {
+			return false
+		}
+		if property.Initializer != nil && !p.exprCanBeRemovedIfUnused(*property.Initializer) {
+			return false
+		}
+	}
+
+	return true
 }
 
-type FindSymbol func(name string) ast.Ref
-type DefineFunc func(FindSymbol) ast.E
+func (p *parser) bindingCanBeRemovedIfUnused(binding ast.Binding) bool {
+	switch b := binding.Data.(type) {
+	case *ast.BArray:
+		for _, item := range b.Items {
+			if !p.bindingCanBeRemovedIfUnused(item.Binding) {
+				return false
+			}
+			if item.DefaultValue != nil && !p.exprCanBeRemovedIfUnused(*item.DefaultValue) {
+				return false
+			}
+		}
 
-type ParseOptions struct {
-	// true: imports are scanned and bundled along with the file
-	// false: imports are left alone and the file is passed through as-is
-	IsBundling bool
+	case *ast.BObject:
+		for _, property := range b.Properties {
+			if !property.IsSpread && !p.exprCanBeRemovedIfUnused(property.Key) {
+				return false
+			}
+			if !p.bindingCanBeRemovedIfUnused(property.Value) {
+				return false
+			}
+			if property.DefaultValue != nil && !p.exprCanBeRemovedIfUnused(*property.DefaultValue) {
+				return false
+			}
+		}
+	}
 
-	Defines      map[string]DefineFunc
-	MangleSyntax bool
-	OmitWarnings bool
-	TS           TypeScriptOptions
-	JSX          JSXOptions
-	Target       LanguageTarget
+	return true
 }
 
-func newParser(log logging.Log, source logging.Source, lexer lexer.Lexer, options ParseOptions) *parser {
+func (p *parser) exprCanBeRemovedIfUnused(expr ast.Expr) bool {
+	switch e := expr.Data.(type) {
+	case *ast.ENull, *ast.EUndefined, *ast.EMissing, *ast.EBoolean, *ast.ENumber, *ast.EBigInt,
+		*ast.EString, *ast.EThis, *ast.ERegExp, *ast.EFunction, *ast.EArrow, *ast.EImportMeta:
+		return true
+
+	case *ast.EDot:
+		return e.CanBeRemovedIfUnused
+
+	case *ast.EClass:
+		return p.classCanBeRemovedIfUnused(e.Class)
+
+	case *ast.EIdentifier:
+		if e.CanBeRemovedIfUnused || p.symbols[e.Ref.InnerIndex].Kind != ast.SymbolUnbound {
+			return true
+		}
+
+	case *ast.EIf:
+		return p.exprCanBeRemovedIfUnused(e.Test) && p.exprCanBeRemovedIfUnused(e.Yes) && p.exprCanBeRemovedIfUnused(e.No)
+
+	case *ast.EArray:
+		for _, item := range e.Items {
+			if !p.exprCanBeRemovedIfUnused(item) {
+				return false
+			}
+		}
+		return true
+
+	case *ast.EObject:
+		for _, property := range e.Properties {
+			// The key must still be evaluated if it's computed or a spread
+			if property.Kind == ast.PropertySpread || property.IsComputed {
+				return false
+			}
+			if property.Value != nil && !p.exprCanBeRemovedIfUnused(*property.Value) {
+				return false
+			}
+		}
+		return true
+
+	case *ast.ECall:
+		// A call that has been marked "__PURE__" can be removed if all arguments
+		// can be removed. The annotation causes us to ignore the target.
+		if e.CanBeUnwrappedIfUnused {
+			for _, arg := range e.Args {
+				if !p.exprCanBeRemovedIfUnused(arg) {
+					return false
+				}
+			}
+			return true
+		}
+
+	case *ast.ENew:
+		// A constructor call that has been marked "__PURE__" can be removed if all
+		// arguments can be removed. The annotation causes us to ignore the target.
+		if e.CanBeUnwrappedIfUnused {
+			for _, arg := range e.Args {
+				if !p.exprCanBeRemovedIfUnused(arg) {
+					return false
+				}
+			}
+			return true
+		}
+	}
+
+	// Assume all other expression types have side effects and cannot be removed
+	return false
+}
+
+// This will return a nil expression if the expression can be totally removed
+func (p *parser) simplifyUnusedExpr(expr ast.Expr) ast.Expr {
+	switch e := expr.Data.(type) {
+	case *ast.ENull, *ast.EUndefined, *ast.EMissing, *ast.EBoolean, *ast.ENumber, *ast.EBigInt,
+		*ast.EString, *ast.EThis, *ast.ERegExp, *ast.EFunction, *ast.EArrow, *ast.EImportMeta:
+		return ast.Expr{}
+
+	case *ast.EDot:
+		if e.CanBeRemovedIfUnused {
+			return ast.Expr{}
+		}
+
+	case *ast.EIdentifier:
+		if e.CanBeRemovedIfUnused || p.symbols[e.Ref.InnerIndex].Kind != ast.SymbolUnbound {
+			return ast.Expr{}
+		}
+
+	case *ast.ETemplate:
+		if e.Tag == nil {
+			var result ast.Expr
+			for _, part := range e.Parts {
+				// Make sure "ToString" is still evaluated on the value
+				if result.Data == nil {
+					result = ast.Expr{Loc: part.Value.Loc, Data: &ast.EString{}}
+				}
+				result = ast.Expr{Loc: part.Value.Loc, Data: &ast.EBinary{
+					Op:    ast.BinOpAdd,
+					Left:  result,
+					Right: part.Value,
+				}}
+			}
+			return result
+		}
+
+	case *ast.EArray:
+		// Arrays with "..." spread expressions can't be unwrapped because the
+		// "..." triggers code evaluation via iterators. In that case, just trim
+		// the other items instead and leave the array expression there.
+		for _, spread := range e.Items {
+			if _, ok := spread.Data.(*ast.ESpread); ok {
+				end := 0
+				for _, item := range e.Items {
+					item = p.simplifyUnusedExpr(item)
+					if item.Data != nil {
+						e.Items[end] = item
+						end++
+					}
+				}
+				e.Items = e.Items[:end]
+				return expr
+			}
+		}
+
+		// Otherwise, the array can be completely removed. We only need to keep any
+		// array items with side effects. Apply this simplification recursively.
+		var result ast.Expr
+		for _, item := range e.Items {
+			result = maybeJoinWithComma(result, p.simplifyUnusedExpr(item))
+		}
+		return result
+
+	case *ast.EObject:
+		// Objects with "..." spread expressions can't be unwrapped because the
+		// "..." triggers code evaluation via getters. In that case, just trim
+		// the other items instead and leave the object expression there.
+		for _, spread := range e.Properties {
+			if spread.Kind == ast.PropertySpread {
+				end := 0
+				for _, property := range e.Properties {
+					// Spread properties must always be evaluated
+					if property.Kind != ast.PropertySpread {
+						value := p.simplifyUnusedExpr(*property.Value)
+						if value.Data != nil {
+							// Keep the value
+							*property.Value = value
+						} else if !property.IsComputed {
+							// Skip this property if the key doesn't need to be computed
+							continue
+						} else {
+							// Replace values without side effects with "0" because it's short
+							property.Value.Data = &ast.ENumber{}
+						}
+					}
+					e.Properties[end] = property
+					end++
+				}
+				e.Properties = e.Properties[:end]
+				return expr
+			}
+		}
+
+		// Otherwise, the object can be completely removed. We only need to keep any
+		// object properties with side effects. Apply this simplification recursively.
+		var result ast.Expr
+		for _, property := range e.Properties {
+			if property.IsComputed {
+				// Make sure "ToString" is still evaluated on the key
+				result = maybeJoinWithComma(result, ast.Expr{Loc: property.Key.Loc, Data: &ast.EBinary{
+					Op:    ast.BinOpAdd,
+					Left:  property.Key,
+					Right: ast.Expr{Loc: property.Key.Loc, Data: &ast.EString{}},
+				}})
+			}
+			result = maybeJoinWithComma(result, p.simplifyUnusedExpr(*property.Value))
+		}
+		return result
+
+	case *ast.EIf:
+		e.Yes = p.simplifyUnusedExpr(e.Yes)
+		e.No = p.simplifyUnusedExpr(e.No)
+
+		// "foo() ? 1 : 2" => "foo()"
+		if e.Yes.Data == nil && e.No.Data == nil {
+			return p.simplifyUnusedExpr(e.Test)
+		}
+
+		// "foo() ? 1 : bar()" => "foo() || bar()"
+		if e.Yes.Data == nil {
+			return ast.Expr{Loc: expr.Loc, Data: &ast.EBinary{
+				Op:    ast.BinOpLogicalOr,
+				Left:  e.Test,
+				Right: e.No,
+			}}
+		}
+
+		// "foo() ? bar() : 2" => "foo() && bar()"
+		if e.No.Data == nil {
+			return ast.Expr{Loc: expr.Loc, Data: &ast.EBinary{
+				Op:    ast.BinOpLogicalAnd,
+				Left:  e.Test,
+				Right: e.Yes,
+			}}
+		}
+
+	case *ast.EBinary:
+		switch e.Op {
+		case ast.BinOpComma:
+			e.Left = p.simplifyUnusedExpr(e.Left)
+			e.Right = p.simplifyUnusedExpr(e.Right)
+			if e.Left.Data == nil {
+				return e.Right
+			}
+			if e.Right.Data == nil {
+				return e.Left
+			}
+
+		case ast.BinOpLogicalAnd, ast.BinOpLogicalOr, ast.BinOpNullishCoalescing:
+			e.Right = p.simplifyUnusedExpr(e.Right)
+			if e.Right.Data == nil {
+				return p.simplifyUnusedExpr(e.Left)
+			}
+
+		case ast.BinOpAdd:
+			if result, isStringAddition := simplifyUnusedStringAdditionChain(expr); isStringAddition {
+				return result
+			}
+		}
+
+	case *ast.ECall:
+		// A call that has been marked "__PURE__" can be removed if all arguments
+		// can be removed. The annotation causes us to ignore the target.
+		if e.CanBeUnwrappedIfUnused {
+			expr = ast.Expr{}
+			for _, arg := range e.Args {
+				expr = maybeJoinWithComma(expr, p.simplifyUnusedExpr(arg))
+			}
+		}
+
+	case *ast.ENew:
+		// A constructor call that has been marked "__PURE__" can be removed if all
+		// arguments can be removed. The annotation causes us to ignore the target.
+		if e.CanBeUnwrappedIfUnused {
+			expr = ast.Expr{}
+			for _, arg := range e.Args {
+				expr = maybeJoinWithComma(expr, p.simplifyUnusedExpr(arg))
+			}
+		}
+	}
+
+	return expr
+}
+
+func simplifyUnusedStringAdditionChain(expr ast.Expr) (ast.Expr, bool) {
+	switch e := expr.Data.(type) {
+	case *ast.EString:
+		// "'x' + y" => "'' + y"
+		return ast.Expr{Loc: expr.Loc, Data: &ast.EString{}}, true
+
+	case *ast.EBinary:
+		if e.Op == ast.BinOpAdd {
+			left, leftIsStringAddition := simplifyUnusedStringAdditionChain(e.Left)
+			e.Left = left
+
+			if _, rightIsString := e.Right.Data.(*ast.EString); rightIsString {
+				// "('' + x) + 'y'" => "'' + x"
+				if leftIsStringAddition {
+					return left, true
+				}
+
+				// "x + 'y'" => "x + ''"
+				if !leftIsStringAddition {
+					e.Right.Data = &ast.EString{}
+					return expr, true
+				}
+			}
+
+			return expr, leftIsStringAddition
+		}
+	}
+
+	return expr, false
+}
+
+func newParser(log logging.Log, source logging.Source, lexer lexer.Lexer, options *config.Options) *parser {
+	if options.Defines == nil {
+		defaultDefines := config.ProcessDefines(nil)
+		options.Defines = &defaultDefines
+	}
+
 	p := &parser{
-		log:           log,
-		source:        source,
-		lexer:         lexer,
-		allowIn:       true,
-		target:        options.Target,
-		ts:            options.TS,
-		jsx:           options.JSX,
-		omitWarnings:  options.OmitWarnings,
-		mangleSyntax:  options.MangleSyntax,
-		isBundling:    options.IsBundling,
-		currentFnOpts: fnOpts{isOutsideFn: true},
+		log:            log,
+		source:         source,
+		lexer:          lexer,
+		allowIn:        true,
+		Options:        *options,
+		currentFnOpts:  fnOpts{isOutsideFn: true},
+		runtimeImports: make(map[string]ast.Ref),
+
+		// For lowering private methods
+		weakMapRef:     ast.InvalidRef,
+		weakSetRef:     ast.InvalidRef,
+		privateGetters: make(map[ast.Ref]ast.Ref),
+		privateSetters: make(map[ast.Ref]ast.Ref),
 
 		// These are for TypeScript
 		emittedNamespaceVars:      make(map[ast.Ref]bool),
@@ -8459,32 +8514,19 @@ func newParser(log logging.Log, source logging.Source, lexer lexer.Lexer, option
 		knownEnumValues:           make(map[ast.Ref]map[string]float64),
 
 		// These are for handling ES6 imports and exports
-		importItemsForNamespace: make(map[ast.Ref]map[string]ast.Ref),
+		importItemsForNamespace: make(map[ast.Ref]map[string]ast.LocRef),
 		isImportItem:            make(map[ast.Ref]bool),
-		exportAliases:           make(map[string]bool),
-		identifierDefines:       make(map[string]DefineFunc),
-		dotDefines:              make(map[string]dotDefine),
+		namedImports:            make(map[ast.Ref]ast.NamedImport),
+		namedExports:            make(map[string]ast.Ref),
 	}
 
 	p.findSymbolHelper = func(name string) ast.Ref { return p.findSymbol(name).ref }
-	p.pushScopeForParsePass(ast.ScopeEntry, ast.Loc{locModuleScope})
-
-	// The bundler pre-declares these symbols
-	p.exportsRef = p.newSymbol(ast.SymbolHoisted, "exports")
-	p.requireRef = p.newSymbol(ast.SymbolHoisted, "require")
-	p.moduleRef = p.newSymbol(ast.SymbolHoisted, "module")
-
-	// Only declare these symbols if we're bundling
-	if options.IsBundling {
-		p.currentScope.Members["exports"] = p.exportsRef
-		p.currentScope.Members["require"] = p.requireRef
-		p.currentScope.Members["module"] = p.moduleRef
-	}
+	p.pushScopeForParsePass(ast.ScopeEntry, ast.Loc{Start: locModuleScope})
 
 	return p
 }
 
-func Parse(log logging.Log, source logging.Source, options ParseOptions) (result ast.AST, ok bool) {
+func Parse(log logging.Log, source logging.Source, options config.Options) (result ast.AST, ok bool) {
 	ok = true
 	defer func() {
 		r := recover()
@@ -8503,7 +8545,7 @@ func Parse(log logging.Log, source logging.Source, options ParseOptions) (result
 		options.JSX.Fragment = []string{"React", "Fragment"}
 	}
 
-	p := newParser(log, source, lexer.NewLexer(log, source), options)
+	p := newParser(log, source, lexer.NewLexer(log, source), &options)
 
 	// Consume a leading hashbang comment
 	hashbang := ""
@@ -8514,101 +8556,313 @@ func Parse(log logging.Log, source logging.Source, options ParseOptions) (result
 
 	// Parse the file in the first pass, but do not bind symbols
 	stmts := p.parseStmtsUpTo(lexer.TEndOfFile, parseStmtOpts{isModuleScope: true})
-	p.prepareForVisitPass()
+	p.prepareForVisitPass(&options)
 
-	// Load user-specified defines
-	if options.Defines != nil {
-		for k, v := range options.Defines {
-			parts := strings.Split(k, ".")
-			if len(parts) == 1 {
-				p.identifierDefines[k] = v
-			} else {
-				p.dotDefines[parts[len(parts)-1]] = dotDefine{parts, v}
-			}
+	// Strip off a leading "use strict" directive when not bundling
+	directive := ""
+	if !options.IsBundling && len(stmts) > 0 {
+		if s, ok := stmts[0].Data.(*ast.SDirective); ok {
+			directive = lexer.UTF16ToString(s.Value)
+			stmts = stmts[1:]
 		}
+	}
+
+	// Insert a variable for "import.meta" at the top of the file if it was used.
+	// We don't need to worry about "use strict" directives because this only
+	// happens when bundling, in which case we are flatting the module scopes of
+	// all modules together anyway so such directives are meaningless.
+	if p.importMetaRef != ast.InvalidRef {
+		importMetaStmt := ast.Stmt{Data: &ast.SLocal{
+			Kind: ast.LocalConst,
+			Decls: []ast.Decl{{
+				Binding: ast.Binding{Data: &ast.BIdentifier{Ref: p.importMetaRef}},
+				Value:   &ast.Expr{Data: &ast.EObject{}},
+			}},
+		}}
+		stmts = append(append(make([]ast.Stmt, 0, len(stmts)+1), importMetaStmt), stmts...)
 	}
 
 	// Bind symbols in a second pass over the AST. I started off doing this in a
 	// single pass, but it turns out it's pretty much impossible to do this
 	// correctly while handling arrow functions because of the grammar
 	// ambiguities.
-	stmts = p.visitStmtsAndPrependTempRefs(stmts)
+	parts := []ast.Part{}
+	if !p.IsBundling {
+		// When not bundling, everything comes in a single part
+		parts = p.appendPart(parts, stmts)
+	} else {
+		// When bundling, each top-level statement is potentially a separate part
+		var after []ast.Part
+		for _, stmt := range stmts {
+			switch s := stmt.Data.(type) {
+			case *ast.SLocal:
+				// Split up top-level multi-declaration variable statements
+				for _, decl := range s.Decls {
+					clone := *s
+					clone.Decls = []ast.Decl{decl}
+					parts = p.appendPart(parts, []ast.Stmt{{Loc: stmt.Loc, Data: &clone}})
+				}
 
-	// Translate "export = value;" into "module.exports = value;". This must
-	// happen at the end after everything is parsed because TypeScript moves
-	// this statement to the end when it generates code.
-	if p.exportEqualsStmt != nil {
-		stmts = append(stmts, *p.exportEqualsStmt)
+			case *ast.SExportEquals:
+				// TypeScript "export = value;" becomes "module.exports = value;". This
+				// must happen at the end after everything is parsed because TypeScript
+				// moves this statement to the end when it generates code.
+				after = p.appendPart(after, []ast.Stmt{stmt})
+
+			default:
+				parts = p.appendPart(parts, []ast.Stmt{stmt})
+			}
+		}
+		parts = append(parts, after...)
 	}
 
-	stmts = p.scanForImportPaths(stmts, options.IsBundling)
-	result = p.toAST(source, stmts, hashbang)
+	result = p.toAST(source, parts, hashbang, directive)
 	result.WasTypeScript = options.TS.Parse
+	result.SourceMapComment = p.lexer.SourceMappingURL
 	return
 }
 
-func ModuleExportsAST(log logging.Log, source logging.Source, options ParseOptions, expr ast.Expr) ast.AST {
+func LazyExportAST(log logging.Log, source logging.Source, options config.Options, expr ast.Expr, apiCall string) ast.AST {
 	// Don't create a new lexer using lexer.NewLexer() here since that will
 	// actually attempt to parse the first token, which might cause a syntax
 	// error.
-	p := newParser(log, source, lexer.Lexer{}, options)
-	p.prepareForVisitPass()
+	p := newParser(log, source, lexer.Lexer{}, &options)
+	p.prepareForVisitPass(&options)
 
 	// Make a symbol map that contains our file's symbols
-	symbols := ast.SymbolMap{make([][]ast.Symbol, source.Index+1)}
+	symbols := ast.SymbolMap{Outer: make([][]ast.Symbol, source.Index+1)}
 	symbols.Outer[source.Index] = p.symbols
 
-	// "module.exports = [expr]"
-	stmt := ast.Stmt{expr.Loc, &ast.SExpr{ast.Expr{expr.Loc, &ast.EBinary{
-		ast.BinOpAssign,
-		ast.Expr{expr.Loc, &ast.EDot{
-			Target:  ast.Expr{expr.Loc, &ast.EIdentifier{p.moduleRef}},
-			Name:    "exports",
-			NameLoc: expr.Loc,
-		}},
-		expr,
-	}}}}
+	// Optionally call a runtime API function to transform the expression
+	if apiCall != "" {
+		p.symbolUses = make(map[ast.Ref]ast.SymbolUse)
+		expr = p.callRuntime(expr.Loc, apiCall, []ast.Expr{expr})
+	}
 
-	// Mark that we used the "module" variable
-	p.symbols[p.moduleRef.InnerIndex].UseCountEstimate++
+	// Defer the actual code generation until linking
+	part := ast.Part{
+		Stmts:      []ast.Stmt{ast.Stmt{Loc: expr.Loc, Data: &ast.SLazyExport{Value: expr}}},
+		SymbolUses: p.symbolUses,
+	}
+	p.symbolUses = nil
 
-	return p.toAST(source, []ast.Stmt{stmt}, "")
+	ast := p.toAST(source, []ast.Part{part}, "", "")
+	ast.HasLazyExport = true
+	return ast
 }
 
-func (p *parser) prepareForVisitPass() {
-	p.pushScopeForVisitPass(ast.ScopeEntry, ast.Loc{locModuleScope})
+func (p *parser) validateJSX(span ast.Span, name string) []string {
+	if span.Text == "" {
+		return nil
+	}
+	parts := strings.Split(span.Text, ".")
+	for _, part := range parts {
+		if !lexer.IsIdentifier(part) {
+			p.log.AddRangeWarning(&p.source, span.Range, fmt.Sprintf("Invalid JSX %s: %s", name, span.Text))
+			return nil
+		}
+	}
+	return parts
+}
+
+func (p *parser) prepareForVisitPass(options *config.Options) {
+	p.pushScopeForVisitPass(ast.ScopeEntry, ast.Loc{Start: locModuleScope})
 	p.moduleScope = p.currentScope
 
-	// Swap in certain literal values because those can be constant folded
-	p.identifierDefines["undefined"] = func(FindSymbol) ast.E { return &ast.EUndefined{} }
-	p.identifierDefines["NaN"] = func(FindSymbol) ast.E { return &ast.ENumber{math.NaN()} }
-	p.identifierDefines["Infinity"] = func(FindSymbol) ast.E { return &ast.ENumber{math.Inf(1)} }
+	if options.IsBundling {
+		p.exportsRef = p.declareCommonJSSymbol(ast.SymbolHoisted, "exports")
+		p.requireRef = p.declareCommonJSSymbol(ast.SymbolUnbound, "require")
+		p.moduleRef = p.declareCommonJSSymbol(ast.SymbolHoisted, "module")
+	} else {
+		p.exportsRef = p.newSymbol(ast.SymbolHoisted, "exports")
+		p.requireRef = p.newSymbol(ast.SymbolUnbound, "require")
+		p.moduleRef = p.newSymbol(ast.SymbolHoisted, "module")
+	}
+
+	// Convert "import.meta" to a variable if it's not supported in the output format
+	if p.hasImportMeta && (p.UnsupportedFeatures.Has(compat.ImportMeta) || (options.IsBundling && !p.OutputFormat.KeepES6ImportExportSyntax())) {
+		p.importMetaRef = p.newSymbol(ast.SymbolOther, "import_meta")
+		p.moduleScope.Generated = append(p.moduleScope.Generated, p.importMetaRef)
+	} else {
+		p.importMetaRef = ast.InvalidRef
+	}
+
+	// Handle "@jsx" and "@jsxFrag" pragmas now that lexing is done
+	if p.JSX.Parse {
+		if value := p.validateJSX(p.lexer.JSXFactoryPragmaComment, "factory"); value != nil {
+			p.JSX.Factory = value
+		}
+		if value := p.validateJSX(p.lexer.JSXFragmentPragmaComment, "fragment"); value != nil {
+			p.JSX.Fragment = value
+		}
+	}
 }
 
-func (p *parser) toAST(source logging.Source, stmts []ast.Stmt, hashbang string) ast.AST {
+func (p *parser) declareCommonJSSymbol(kind ast.SymbolKind, name string) ast.Ref {
+	ref, ok := p.moduleScope.Members[name]
+
+	// If the code declared this symbol using "var name", then this is actually
+	// not a collision. For example, node will let you do this:
+	//
+	//   var exports;
+	//   module.exports.foo = 123;
+	//   console.log(exports.foo);
+	//
+	// This works because node's implementation of CommonJS wraps the entire
+	// source file like this:
+	//
+	//   (function(require, exports, module, __filename, __dirname) {
+	//     var exports;
+	//     module.exports.foo = 123;
+	//     console.log(exports.foo);
+	//   })
+	//
+	// Both the "exports" argument and "var exports" are hoisted variables, so
+	// they don't collide.
+	if ok && p.symbols[ref.InnerIndex].Kind == ast.SymbolHoisted &&
+		kind == ast.SymbolHoisted && !p.hasES6ImportSyntax && !p.hasES6ExportSyntax {
+		return ref
+	}
+
+	// Create a new symbol if we didn't merge with an existing one above
+	ref = p.newSymbol(kind, name)
+
+	// If the variable wasn't declared, declare it now. This means any references
+	// to this name will become bound to this symbol after this (since we haven't
+	// run the visit pass yet).
+	if !ok {
+		p.moduleScope.Members[name] = ref
+		return ref
+	}
+
+	// If the variable was declared, then it shadows this symbol. The code in
+	// this module will be unable to reference this symbol. However, we must
+	// still add the symbol to the scope so it gets minified (automatically-
+	// generated code may still reference the symbol).
+	p.moduleScope.Generated = append(p.moduleScope.Generated, ref)
+	return ref
+}
+
+func (p *parser) toAST(source logging.Source, parts []ast.Part, hashbang string, directive string) ast.AST {
+	// Insert an import statement for any runtime imports we generated
+	if len(p.runtimeImports) > 0 {
+		// Sort the imports for determinism
+		keys := make([]string, 0, len(p.runtimeImports))
+		for key := range p.runtimeImports {
+			keys = append(keys, key)
+		}
+		sort.Strings(keys)
+
+		namespaceRef := p.newSymbol(ast.SymbolOther, "runtime")
+		p.moduleScope.Generated = append(p.moduleScope.Generated, namespaceRef)
+		declaredSymbols := make([]ast.DeclaredSymbol, len(keys))
+		clauseItems := make([]ast.ClauseItem, len(keys))
+		importRecordIndex := p.addImportRecord(ast.ImportStmt, ast.Loc{}, "<runtime>")
+		sourceIndex := runtime.SourceIndex
+		p.importRecords[importRecordIndex].SourceIndex = &sourceIndex
+
+		// Create per-import information
+		for i, key := range keys {
+			ref := p.runtimeImports[key]
+			declaredSymbols[i] = ast.DeclaredSymbol{Ref: ref, IsTopLevel: true}
+			clauseItems[i] = ast.ClauseItem{Alias: key, Name: ast.LocRef{Ref: ref}}
+			p.namedImports[ref] = ast.NamedImport{
+				Alias:             key,
+				NamespaceRef:      namespaceRef,
+				ImportRecordIndex: importRecordIndex,
+			}
+		}
+
+		// Append a single import to the end of the file (ES6 imports are hoisted
+		// so we don't need to worry about where the import statement goes)
+		parts = append(parts, ast.Part{
+			DeclaredSymbols:     declaredSymbols,
+			ImportRecordIndices: []uint32{importRecordIndex},
+			Stmts: []ast.Stmt{{Data: &ast.SImport{
+				NamespaceRef:      namespaceRef,
+				Items:             &clauseItems,
+				ImportRecordIndex: importRecordIndex,
+			}}},
+		})
+	}
+
+	// Handle import paths after the whole file has been visited because we need
+	// symbol usage counts to be able to remove unused type-only imports in
+	// TypeScript code.
+	partsEnd := 0
+	for _, part := range parts {
+		p.importRecordsForCurrentPart = nil
+		p.declaredSymbols = nil
+		part.Stmts = p.scanForImportsAndExports(part.Stmts, p.IsBundling)
+		part.ImportRecordIndices = append(part.ImportRecordIndices, p.importRecordsForCurrentPart...)
+		part.DeclaredSymbols = append(part.DeclaredSymbols, p.declaredSymbols...)
+		if len(part.Stmts) > 0 {
+			parts[partsEnd] = part
+			partsEnd++
+		}
+	}
+	parts = parts[:partsEnd]
+
+	// Analyze cross-part dependencies for tree shaking and code splitting
+	{
+		// Map locals to parts
+		p.topLevelSymbolToParts = make(map[ast.Ref][]uint32)
+		for partIndex, part := range parts {
+			for _, declared := range part.DeclaredSymbols {
+				if declared.IsTopLevel {
+					p.topLevelSymbolToParts[declared.Ref] = append(
+						p.topLevelSymbolToParts[declared.Ref], uint32(partIndex))
+				}
+			}
+		}
+
+		// Each part tracks the other parts it depends on within this file
+		for partIndex, part := range parts {
+			localDependencies := make(map[uint32]bool)
+			for ref := range part.SymbolUses {
+				for _, otherPart := range p.topLevelSymbolToParts[ref] {
+					localDependencies[otherPart] = true
+				}
+
+				// Also map from imports to parts that use them
+				if namedImport, ok := p.namedImports[ref]; ok {
+					namedImport.LocalPartsWithUses = append(namedImport.LocalPartsWithUses, uint32(partIndex))
+					p.namedImports[ref] = namedImport
+				}
+			}
+			parts[partIndex].LocalDependencies = localDependencies
+		}
+	}
+
+	// Make a wrapper symbol in case we need to be wrapped in a closure
+	wrapperRef := p.newSymbol(ast.SymbolOther, "require_"+p.source.IdentifierName)
+
 	// Make a symbol map that contains our file's symbols
-	symbols := ast.SymbolMap{make([][]ast.Symbol, source.Index+1)}
+	symbols := ast.NewSymbolMap(int(source.Index) + 1)
 	symbols.Outer[source.Index] = p.symbols
 
-	// The following features cause us to need CommonJS mode:
-	// - Using the "exports" variable
-	// - Using the "module" variable
-	// - Using a top-level return statement
-	// - Using a direct call to eval()
-	usesCommonJSFeatures := p.hasTopLevelReturn ||
-		p.moduleScope.ContainsDirectEval ||
-		symbols.Get(p.exportsRef).UseCountEstimate > 0 ||
-		symbols.Get(p.moduleRef).UseCountEstimate > 0
-
 	return ast.AST{
-		ImportPaths:          p.importPaths,
-		UsesCommonJSFeatures: usesCommonJSFeatures,
-		Stmts:                stmts,
-		ModuleScope:          p.moduleScope,
-		Symbols:              &symbols,
-		ExportsRef:           p.exportsRef,
-		ModuleRef:            p.moduleRef,
-		Hashbang:             hashbang,
-		UsedRuntimeSyms:      p.usedRuntimeSyms,
+		Parts:                   parts,
+		ModuleScope:             p.moduleScope,
+		Symbols:                 symbols,
+		ExportsRef:              p.exportsRef,
+		ModuleRef:               p.moduleRef,
+		WrapperRef:              wrapperRef,
+		Hashbang:                hashbang,
+		Directive:               directive,
+		NamedImports:            p.namedImports,
+		NamedExports:            p.namedExports,
+		TopLevelSymbolToParts:   p.topLevelSymbolToParts,
+		ExportStarImportRecords: p.exportStarImportRecords,
+		ImportRecords:           p.importRecords,
+
+		// CommonJS features
+		HasTopLevelReturn: p.hasTopLevelReturn,
+		UsesExportsRef:    p.symbols[p.exportsRef.InnerIndex].UseCountEstimate > 0,
+		UsesModuleRef:     p.symbols[p.moduleRef.InnerIndex].UseCountEstimate > 0,
+
+		// ES6 features
+		HasES6Imports: p.hasES6ImportSyntax,
+		HasES6Exports: p.hasES6ExportSyntax,
 	}
 }

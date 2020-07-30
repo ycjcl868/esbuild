@@ -5,6 +5,7 @@ import (
 	"os"
 	"path"
 	"path/filepath"
+	"strings"
 	"sync"
 )
 
@@ -32,8 +33,10 @@ type FS interface {
 	Abs(path string) (string, bool)
 	Dir(path string) string
 	Base(path string) string
+	Ext(path string) string
 	Join(parts ...string) string
-	RelativeToCwd(path string) (string, bool)
+	Cwd() string
+	Rel(base string, target string) (string, bool)
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -95,12 +98,60 @@ func (*mockFS) Base(p string) string {
 	return path.Base(p)
 }
 
+func (*mockFS) Ext(p string) string {
+	return path.Ext(p)
+}
+
 func (*mockFS) Join(parts ...string) string {
 	return path.Clean(path.Join(parts...))
 }
 
-func (*mockFS) RelativeToCwd(path string) (string, bool) {
-	return "", false
+func (*mockFS) Cwd() string {
+	return ""
+}
+
+func splitOnSlash(path string) (string, string) {
+	if slash := strings.IndexByte(path, '/'); slash != -1 {
+		return path[:slash], path[slash+1:]
+	}
+	return path, ""
+}
+
+func (*mockFS) Rel(base string, target string) (string, bool) {
+	// Base cases
+	if base == "" || base == "." {
+		return target, true
+	}
+	if base == target {
+		return ".", true
+	}
+
+	// Find the common parent directory
+	for {
+		bHead, bTail := splitOnSlash(base)
+		tHead, tTail := splitOnSlash(target)
+		if bHead != tHead {
+			break
+		}
+		base = bTail
+		target = tTail
+	}
+
+	// Stop now if base is a subpath of target
+	if base == "" {
+		return target, true
+	}
+
+	// Traverse up to the common parent
+	commonParent := strings.Repeat("../", strings.Count(base, "/")+1)
+
+	// Stop now if target is a subpath of base
+	if target == "" {
+		return commonParent[:len(commonParent)-1], true
+	}
+
+	// Otherwise, down to the parent
+	return commonParent + target, true
 }
 
 ////////////////////////////////////////////////////////////////////////////////
@@ -111,16 +162,43 @@ type realFS struct {
 	entries      map[string]map[string]Entry
 
 	// For the current working directory
-	cwd   string
-	cwdOk bool
+	cwd string
+}
+
+func realpath(path string) string {
+	dir := filepath.Dir(path)
+	if dir == path {
+		return path
+	}
+	dir = realpath(dir)
+	path = filepath.Join(dir, filepath.Base(path))
+	if link, err := os.Readlink(path); err == nil {
+		if filepath.IsAbs(link) {
+			return link
+		}
+		return filepath.Join(dir, link)
+	}
+	return path
 }
 
 func RealFS() FS {
-	cwd, cwdErr := os.Getwd()
+	cwd, err := os.Getwd()
+	if err != nil {
+		cwd = ""
+	} else {
+		// Resolve symlinks in the current working directory. Symlinks are resolved
+		// when input file paths are converted to absolute paths because we need to
+		// recognize an input file as unique even if it has multiple symlinks
+		// pointing to it. The build will generate relative paths from the current
+		// working directory to the absolute input file paths for error messages,
+		// so the current working directory should be processed the same way. Not
+		// doing this causes test failures with esbuild when run from inside a
+		// symlinked directory.
+		cwd = realpath(cwd)
+	}
 	return &realFS{
 		entries: make(map[string]map[string]Entry),
 		cwd:     cwd,
-		cwdOk:   cwdErr == nil,
 	}
 }
 
@@ -209,15 +287,21 @@ func (*realFS) Base(p string) string {
 	return filepath.Base(p)
 }
 
+func (*realFS) Ext(p string) string {
+	return filepath.Ext(p)
+}
+
 func (*realFS) Join(parts ...string) string {
 	return filepath.Clean(filepath.Join(parts...))
 }
 
-func (fs *realFS) RelativeToCwd(path string) (string, bool) {
-	if fs.cwdOk {
-		if rel, err := filepath.Rel(fs.cwd, path); err == nil {
-			return rel, true
-		}
+func (fs *realFS) Cwd() string {
+	return fs.cwd
+}
+
+func (*realFS) Rel(base string, target string) (string, bool) {
+	if rel, err := filepath.Rel(base, target); err == nil {
+		return rel, true
 	}
 	return "", false
 }

@@ -9,15 +9,27 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 
 	"github.com/evanw/esbuild/internal/ast"
 )
 
 type Log struct {
-	msgs chan Msg
+	addMsg    func(Msg)
+	hasErrors func() bool
+	done      func() []Msg
 }
 
-type MsgKind int
+type LogLevel int8
+
+const (
+	LevelNone LogLevel = iota
+	LevelInfo
+	LevelWarning
+	LevelError
+)
+
+type MsgKind uint8
 
 const (
 	Error MsgKind = iota
@@ -25,19 +37,50 @@ const (
 )
 
 type Msg struct {
-	Source Source
-	Start  int32
-	Length int32
-	Text   string
-	Kind   MsgKind
+	Kind     MsgKind
+	Text     string
+	Location *MsgLocation
+}
+
+type MsgLocation struct {
+	File     string
+	Line     int // 1-based
+	Column   int // 0-based, in bytes
+	Length   int // in bytes
+	LineText string
 }
 
 type Source struct {
-	Index        uint32
-	IsStdin      bool
-	AbsolutePath string
-	PrettyPath   string
-	Contents     string
+	Index uint32
+
+	// This is used as a unique key to identify this source file. It should never
+	// be shown to the user (e.g. never print this to the terminal).
+	//
+	// If it's marked as an absolute path, it's a platform-dependent path that
+	// includes environment-specific things such as Windows backslash path
+	// separators and potentially the user's home directory. Only use this for
+	// passing to syscalls for reading and writing to the file system. Do not
+	// include this in any output data.
+	//
+	// If it's marked as not an absolute path, it's an opaque string that is used
+	// to refer to an automatically-generated module.
+	KeyPath ast.Path
+
+	// This is used for error messages and the metadata JSON file.
+	//
+	// This is a mostly platform-independent path. It's relative to the current
+	// working directory and always uses standard path separators. Use this for
+	// referencing a file in all output data. These paths still use the original
+	// case of the path so they may still work differently on file systems that
+	// are case-insensitive vs. case-sensitive.
+	PrettyPath string
+
+	// An identifier that is mixed in to automatically-generated symbol names to
+	// improve readability. For example, if the identifier is "util" then the
+	// symbol for an "export default" statement will be called "util_default".
+	IdentifierName string
+
+	Contents string
 }
 
 func (s *Source) TextForRange(r ast.Range) string {
@@ -47,7 +90,7 @@ func (s *Source) TextForRange(r ast.Range) string {
 func (s *Source) RangeOfString(loc ast.Loc) ast.Range {
 	text := s.Contents[loc.Start:]
 	if len(text) == 0 {
-		return ast.Range{loc, 0}
+		return ast.Range{Loc: loc, Len: 0}
 	}
 
 	quote := text[0]
@@ -56,23 +99,14 @@ func (s *Source) RangeOfString(loc ast.Loc) ast.Range {
 		for i := 1; i < len(text); i++ {
 			c := text[i]
 			if c == quote {
-				return ast.Range{loc, int32(i + 1)}
+				return ast.Range{Loc: loc, Len: int32(i + 1)}
 			} else if c == '\\' {
 				i += 1
 			}
 		}
 	}
 
-	return ast.Range{loc, 0}
-}
-
-func NewLog(msgs chan Msg) Log {
-	return Log{msgs}
-}
-
-type MsgCounts struct {
-	Errors   int
-	Warnings int
+	return ast.Range{Loc: loc, Len: 0}
 }
 
 func plural(prefix string, count int) string {
@@ -82,21 +116,16 @@ func plural(prefix string, count int) string {
 	return fmt.Sprintf("%d %ss", count, prefix)
 }
 
-func (counts MsgCounts) String() string {
-	if counts.Errors == 0 {
-		if counts.Warnings == 0 {
-			return "no errors"
-		} else {
-			return plural("warning", counts.Warnings)
-		}
-	} else {
-		if counts.Warnings == 0 {
-			return plural("error", counts.Errors)
-		} else {
-			return fmt.Sprintf("%s and %s",
-				plural("warning", counts.Warnings),
-				plural("error", counts.Errors))
-		}
+func errorAndWarningSummary(errors int, warnings int) string {
+	switch {
+	case errors == 0:
+		return plural("warning", warnings)
+	case warnings == 0:
+		return plural("error", errors)
+	default:
+		return fmt.Sprintf("%s and %s",
+			plural("warning", warnings),
+			plural("error", errors))
 	}
 }
 
@@ -106,11 +135,13 @@ type TerminalInfo struct {
 	Width           int
 }
 
-func NewStderrLog(options StderrOptions) (Log, func() MsgCounts) {
-	msgs := make(chan Msg)
-	done := make(chan MsgCounts)
-	log := NewLog(msgs)
+func NewStderrLog(options StderrOptions) Log {
+	var mutex sync.Mutex
+	var msgs []Msg
 	terminalInfo := GetTerminalInfo(os.Stderr)
+	errors := 0
+	warnings := 0
+	errorLimitWasHit := false
 
 	switch options.Color {
 	case ColorNever:
@@ -119,50 +150,106 @@ func NewStderrLog(options StderrOptions) (Log, func() MsgCounts) {
 		terminalInfo.UseColorEscapes = SupportsColorEscapes
 	}
 
-	go func(msgs chan Msg, done chan MsgCounts) {
-		counts := MsgCounts{}
-		for msg := range msgs {
-			os.Stderr.WriteString(msg.String(options, terminalInfo))
+	return Log{
+		addMsg: func(msg Msg) {
+			mutex.Lock()
+			defer mutex.Unlock()
+			msgs = append(msgs, msg)
+
+			// Be silent if we're past the limit so we don't flood the terminal
+			if errorLimitWasHit {
+				return
+			}
+
 			switch msg.Kind {
 			case Error:
-				counts.Errors++
+				errors++
+				if options.LogLevel <= LevelError {
+					os.Stderr.WriteString(msg.String(options, terminalInfo))
+				}
 			case Warning:
-				counts.Warnings++
+				warnings++
+				if options.LogLevel <= LevelWarning {
+					os.Stderr.WriteString(msg.String(options, terminalInfo))
+				}
 			}
-			if options.ExitWhenLimitIsHit && options.ErrorLimit != 0 && counts.Errors >= options.ErrorLimit {
-				fmt.Fprintf(os.Stderr, "%s reached (disable error limit with --error-limit=0)\n", counts.String())
-				os.Exit(1)
-			}
-		}
-		done <- counts
-	}(msgs, done)
 
-	return log, func() MsgCounts {
-		close(log.msgs)
-		counts := <-done
-		if counts.Warnings != 0 || counts.Errors != 0 {
-			fmt.Fprintf(os.Stderr, "%s\n", counts.String())
-		}
-		return counts
+			// Silence further output if we reached the error limit
+			if options.ErrorLimit != 0 && errors >= options.ErrorLimit {
+				errorLimitWasHit = true
+				if options.LogLevel <= LevelError {
+					fmt.Fprintf(os.Stderr, "%s reached (disable error limit with --error-limit=0)\n", errorAndWarningSummary(errors, warnings))
+				}
+			}
+		},
+		hasErrors: func() bool {
+			mutex.Lock()
+			defer mutex.Unlock()
+			return errors > 0
+		},
+		done: func() []Msg {
+			mutex.Lock()
+			defer mutex.Unlock()
+
+			// Print out a summary if the error limit wasn't hit
+			if !errorLimitWasHit && options.LogLevel <= LevelInfo && (warnings != 0 || errors != 0) {
+				fmt.Fprintf(os.Stderr, "%s\n", errorAndWarningSummary(errors, warnings))
+			}
+
+			return msgs
+		},
 	}
 }
 
-func NewDeferLog() (Log, func() []Msg) {
-	msgs := make(chan Msg)
-	done := make(chan []Msg)
-	log := NewLog(msgs)
+func PrintErrorToStderr(osArgs []string, text string) {
+	options := StderrOptions{}
 
-	go func(msgs chan Msg, done chan []Msg) {
-		result := []Msg{}
-		for msg := range msgs {
-			result = append(result, msg)
+	// Implement a mini argument parser so these options always work even if we
+	// haven't yet gotten to the general-purpose argument parsing code
+	for _, arg := range osArgs {
+		switch arg {
+		case "--color=false":
+			options.Color = ColorNever
+		case "--color=true":
+			options.Color = ColorAlways
+		case "--log-level=info":
+			options.LogLevel = LevelInfo
+		case "--log-level=warning":
+			options.LogLevel = LevelWarning
+		case "--log-level=error":
+			options.LogLevel = LevelError
 		}
-		done <- result
-	}(msgs, done)
+	}
 
-	return log, func() []Msg {
-		close(log.msgs)
-		return <-done
+	log := NewStderrLog(options)
+	log.AddError(nil, ast.Loc{}, text)
+	log.Done()
+}
+
+func NewDeferLog() Log {
+	var msgs []Msg
+	var mutex sync.Mutex
+	var hasErrors bool
+
+	return Log{
+		addMsg: func(msg Msg) {
+			mutex.Lock()
+			defer mutex.Unlock()
+			if msg.Kind == Error {
+				hasErrors = true
+			}
+			msgs = append(msgs, msg)
+		},
+		hasErrors: func() bool {
+			mutex.Lock()
+			defer mutex.Unlock()
+			return hasErrors
+		},
+		done: func() []Msg {
+			mutex.Lock()
+			defer mutex.Unlock()
+			return msgs
+		},
 	}
 }
 
@@ -182,10 +269,10 @@ const (
 )
 
 type StderrOptions struct {
-	IncludeSource      bool
-	ErrorLimit         int
-	ExitWhenLimitIsHit bool
-	Color              StderrColor
+	IncludeSource bool
+	ErrorLimit    int
+	Color         StderrColor
+	LogLevel      LogLevel
 }
 
 func (msg Msg) String(options StderrOptions, terminalInfo TerminalInfo) string {
@@ -197,7 +284,7 @@ func (msg Msg) String(options StderrOptions, terminalInfo TerminalInfo) string {
 		kindColor = colorMagenta
 	}
 
-	if msg.Source.PrettyPath == "" {
+	if msg.Location == nil {
 		if terminalInfo.UseColorEscapes {
 			return fmt.Sprintf("%s%s%s: %s%s%s\n",
 				colorBold, kindColor, kind,
@@ -211,13 +298,13 @@ func (msg Msg) String(options StderrOptions, terminalInfo TerminalInfo) string {
 	if !options.IncludeSource {
 		if terminalInfo.UseColorEscapes {
 			return fmt.Sprintf("%s%s: %s%s: %s%s%s\n",
-				colorBold, msg.Source.PrettyPath,
+				colorBold, msg.Location.File,
 				kindColor, kind,
 				colorResetBold, msg.Text,
 				colorReset)
 		}
 
-		return fmt.Sprintf("%s: %s: %s\n", msg.Source.PrettyPath, kind, msg.Text)
+		return fmt.Sprintf("%s: %s: %s\n", msg.Location.File, kind, msg.Text)
 	}
 
 	d := detailStruct(msg, terminalInfo)
@@ -255,50 +342,71 @@ type MsgDetail struct {
 	Marker string
 }
 
-func ComputeLineAndColumn(text string) (lineCount int, columnCount, lastLineStart int) {
+func computeLineAndColumn(contents string, offset int) (lineCount int, columnCount int, lineStart int, lineEnd int) {
 	var prevCodePoint rune
 
-	for i, codePoint := range text {
+	// Scan up to the offset and count lines
+	for i, codePoint := range contents[:offset] {
 		switch codePoint {
 		case '\n':
-			lastLineStart = i + 1
+			lineStart = i + 1
 			if prevCodePoint != '\r' {
 				lineCount++
 			}
 		case '\r', '\u2028', '\u2029':
-			lastLineStart = i + 1
+			lineStart = i + 1
 		}
 		prevCodePoint = codePoint
 	}
 
-	columnCount = len(text) - lastLineStart
-	return
-}
-
-func detailStruct(msg Msg, terminalInfo TerminalInfo) MsgDetail {
-	contents := msg.Source.Contents
-	lineCount, columnCount, lineStart := ComputeLineAndColumn(contents[0:msg.Start])
-	lineEnd := len(contents)
-
+	// Scan to the end of the line (or end of file if this is the last line)
+	lineEnd = len(contents)
 loop:
-	for i, codePoint := range contents[lineStart:] {
+	for i, codePoint := range contents[offset:] {
 		switch codePoint {
 		case '\r', '\n', '\u2028', '\u2029':
-			lineEnd = lineStart + i
+			lineEnd = offset + i
 			break loop
 		}
 	}
 
+	columnCount = offset - lineStart
+	return
+}
+
+func locationOrNil(source *Source, start int32, length int32) *MsgLocation {
+	if source == nil {
+		return nil
+	}
+
+	// Convert the index into a line and column number
+	lineCount, columnCount, lineStart, lineEnd := computeLineAndColumn(source.Contents, int(start))
+
+	return &MsgLocation{
+		File:     source.PrettyPath,
+		Line:     lineCount + 1, // 0-based to 1-based
+		Column:   columnCount,
+		Length:   int(length),
+		LineText: source.Contents[lineStart:lineEnd],
+	}
+}
+
+func detailStruct(msg Msg, terminalInfo TerminalInfo) MsgDetail {
 	spacesPerTab := 2
-	lineText := renderTabStops(contents[lineStart:lineEnd], spacesPerTab)
-	indent := strings.Repeat(" ", len(renderTabStops(contents[lineStart:msg.Start], spacesPerTab)))
+	loc := msg.Location
+	lineText := renderTabStops(loc.LineText, spacesPerTab)
+	indent := strings.Repeat(" ", len(renderTabStops(loc.LineText[:loc.Column], spacesPerTab)))
 	marker := "^"
 	markerStart := len(indent)
 	markerEnd := len(indent)
 
 	// Extend markers to cover the full range of the error
-	if msg.Length > 0 {
-		markerEnd = len(renderTabStops(contents[lineStart:msg.Start+msg.Length], spacesPerTab))
+	if loc.Length > 0 {
+		end := loc.Column + loc.Length
+		if end > len(loc.LineText) {
+			end = len(loc.LineText)
+		}
+		markerEnd = len(renderTabStops(loc.LineText[:end], spacesPerTab))
 	}
 
 	// Clip the marker to the bounds of the line
@@ -313,19 +421,23 @@ loop:
 	}
 
 	// Trim the line to fit the terminal width
-	if terminalInfo.Width > 0 && len(lineText) > terminalInfo.Width {
+	width := terminalInfo.Width
+	if width < 1 {
+		width = 80
+	}
+	if len(lineText) > width {
 		// Try to center the error
-		sliceStart := (markerStart + markerEnd - terminalInfo.Width) / 2
-		if sliceStart > markerStart-terminalInfo.Width/5 {
-			sliceStart = markerStart - terminalInfo.Width/5
+		sliceStart := (markerStart + markerEnd - width) / 2
+		if sliceStart > markerStart-width/5 {
+			sliceStart = markerStart - width/5
 		}
 		if sliceStart < 0 {
 			sliceStart = 0
 		}
-		if sliceStart > len(lineText)-terminalInfo.Width {
-			sliceStart = len(lineText) - terminalInfo.Width
+		if sliceStart > len(lineText)-width {
+			sliceStart = len(lineText) - width
 		}
-		sliceEnd := sliceStart + terminalInfo.Width
+		sliceEnd := sliceStart + width
 
 		// Slice the line
 		slicedLine := lineText[sliceStart:sliceEnd]
@@ -371,9 +483,9 @@ loop:
 	}
 
 	return MsgDetail{
-		Path:    msg.Source.PrettyPath,
-		Line:    lineCount + 1,
-		Column:  columnCount,
+		Path:    loc.File,
+		Line:    loc.Line,
+		Column:  loc.Column,
 		Kind:    kind,
 		Message: msg.Text,
 
@@ -411,18 +523,42 @@ func renderTabStops(withTabs string, spacesPerTab int) string {
 	return withoutTabs.String()
 }
 
-func (log Log) AddError(source Source, loc ast.Loc, text string) {
-	log.msgs <- Msg{source, loc.Start, 0, text, Error}
+func (log Log) HasErrors() bool {
+	return log.hasErrors()
 }
 
-func (log Log) AddWarning(source Source, loc ast.Loc, text string) {
-	log.msgs <- Msg{source, loc.Start, 0, text, Warning}
+func (log Log) Done() []Msg {
+	return log.done()
 }
 
-func (log Log) AddRangeError(source Source, r ast.Range, text string) {
-	log.msgs <- Msg{source, r.Loc.Start, r.Len, text, Error}
+func (log Log) AddError(source *Source, loc ast.Loc, text string) {
+	log.addMsg(Msg{
+		Kind:     Error,
+		Text:     text,
+		Location: locationOrNil(source, loc.Start, 0),
+	})
 }
 
-func (log Log) AddRangeWarning(source Source, r ast.Range, text string) {
-	log.msgs <- Msg{source, r.Loc.Start, r.Len, text, Warning}
+func (log Log) AddWarning(source *Source, loc ast.Loc, text string) {
+	log.addMsg(Msg{
+		Kind:     Warning,
+		Text:     text,
+		Location: locationOrNil(source, loc.Start, 0),
+	})
+}
+
+func (log Log) AddRangeError(source *Source, r ast.Range, text string) {
+	log.addMsg(Msg{
+		Kind:     Error,
+		Text:     text,
+		Location: locationOrNil(source, r.Loc.Start, r.Len),
+	})
+}
+
+func (log Log) AddRangeWarning(source *Source, r ast.Range, text string) {
+	log.addMsg(Msg{
+		Kind:     Warning,
+		Text:     text,
+		Location: locationOrNil(source, r.Loc.Start, r.Len),
+	})
 }

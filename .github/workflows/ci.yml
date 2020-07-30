@@ -25,12 +25,17 @@ jobs:
 
     - name: Setup Node.js environment
       uses: actions/setup-node@v1.4.2
+      with:
+        node-version: 12
 
     - name: Check out code into the Go module directory
       uses: actions/checkout@v2
 
     - name: go test
       run: go test ./internal/...
+
+    - name: go vet
+      run: go vet ./cmd/... ./internal/... ./pkg/...
 
     - name: npm ci
       run: cd scripts && npm ci
@@ -43,3 +48,11 @@ jobs:
 
     - name: JS API Tests
       run: node scripts/js-api-tests.js
+
+    - name: Sucrase Tests
+      if: matrix.os == 'ubuntu-latest'
+      run: make test-sucrase
+
+    - name: Esprima Tests
+      if: matrix.os == 'ubuntu-latest'
+      run: make test-esprima

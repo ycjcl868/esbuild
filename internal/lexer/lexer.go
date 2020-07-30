@@ -91,9 +91,11 @@ const (
 	TTilde
 
 	// Assignments
+	TAmpersandAmpersandEquals
 	TAmpersandEquals
 	TAsteriskAsteriskEquals
 	TAsteriskEquals
+	TBarBarEquals
 	TBarEquals
 	TCaretEquals
 	TEquals
@@ -103,7 +105,11 @@ const (
 	TMinusEquals
 	TPercentEquals
 	TPlusEquals
+	TQuestionQuestionEquals
 	TSlashEquals
+
+	// Class-private fields and methods
+	TPrivateIdentifier
 
 	// Identifiers
 	TIdentifier     // Contents are in lexer.Identifier (string)
@@ -223,6 +229,11 @@ type json struct {
 	allowComments bool
 }
 
+type Comment struct {
+	Loc  ast.Loc
+	Text string
+}
+
 type Lexer struct {
 	log                             logging.Log
 	source                          logging.Source
@@ -231,9 +242,14 @@ type Lexer struct {
 	end                             int
 	Token                           T
 	HasNewlineBefore                bool
+	HasPureCommentBefore            bool
+	CommentsToPreserveBefore        []Comment
 	codePoint                       rune
 	StringLiteral                   []uint16
 	Identifier                      string
+	JSXFactoryPragmaComment         ast.Span
+	JSXFragmentPragmaComment        ast.Span
+	SourceMappingURL                ast.Span
 	Number                          float64
 	rescanCloseBraceAsTemplateToken bool
 	json                            json
@@ -269,11 +285,11 @@ func NewLexerJSON(log logging.Log, source logging.Source, allowComments bool) Le
 }
 
 func (lexer *Lexer) Loc() ast.Loc {
-	return ast.Loc{int32(lexer.start)}
+	return ast.Loc{Start: int32(lexer.start)}
 }
 
 func (lexer *Lexer) Range() ast.Range {
-	return ast.Range{ast.Loc{int32(lexer.start)}, int32(lexer.end - lexer.start)}
+	return ast.Range{Loc: ast.Loc{Start: int32(lexer.start)}, Len: int32(lexer.end - lexer.start)}
 }
 
 func (lexer *Lexer) Raw() string {
@@ -311,7 +327,7 @@ func (lexer *Lexer) ExpectContextualKeyword(text string) {
 }
 
 func (lexer *Lexer) SyntaxError() {
-	loc := ast.Loc{int32(lexer.end)}
+	loc := ast.Loc{Start: int32(lexer.end)}
 	message := "Unexpected end of file"
 	if lexer.end < len(lexer.source.Contents) {
 		c, _ := utf8.DecodeRuneInString(lexer.source.Contents[lexer.end:])
@@ -535,10 +551,45 @@ func IsIdentifierContinue(codePoint rune) bool {
 	return unicode.Is(idContinue, codePoint)
 }
 
+// See the "White Space Code Points" table in the ECMAScript standard
+func IsWhitespace(codePoint rune) bool {
+	switch codePoint {
+	case
+		'\u0009', // character tabulation
+		'\u000B', // line tabulation
+		'\u000C', // form feed
+		'\u0020', // space
+		'\u00A0', // no-break space
+
+		// Unicode "Space_Separator" code points
+		'\u1680', // ogham space mark
+		'\u2000', // en quad
+		'\u2001', // em quad
+		'\u2002', // en space
+		'\u2003', // em space
+		'\u2004', // three-per-em space
+		'\u2005', // four-per-em space
+		'\u2006', // six-per-em space
+		'\u2007', // figure space
+		'\u2008', // punctuation space
+		'\u2009', // thin space
+		'\u200A', // hair space
+		'\u202F', // narrow no-break space
+		'\u205F', // medium mathematical space
+		'\u3000', // ideographic space
+
+		'\uFEFF': // zero width non-breaking space
+		return true
+
+	default:
+		return false
+	}
+}
+
 func RangeOfIdentifier(source logging.Source, loc ast.Loc) ast.Range {
 	text := source.Contents[loc.Start:]
 	if len(text) == 0 {
-		return ast.Range{loc, 0}
+		return ast.Range{Loc: loc, Len: 0}
 	}
 
 	i := 0
@@ -550,13 +601,14 @@ func RangeOfIdentifier(source logging.Source, loc ast.Loc) ast.Range {
 		for i < len(text) {
 			c2, width2 := utf8.DecodeRuneInString(text[i:])
 			if !IsIdentifierContinue(c2) {
-				return ast.Range{loc, int32(i)}
+				return ast.Range{Loc: loc, Len: int32(i)}
 			}
 			i += width2
 		}
 	}
 
-	return ast.Range{loc, 0}
+	// When minifying, this identifier may have originally been a string
+	return source.RangeOfString(loc)
 }
 
 func (lexer *Lexer) ExpectJSXElementChild(token T) {
@@ -578,15 +630,6 @@ func (lexer *Lexer) NextJSXElementChild() {
 		case -1: // This indicates the end of the file
 			lexer.Token = TEndOfFile
 
-		case '\r', '\n', '\u2028', '\u2029':
-			lexer.step()
-			lexer.HasNewlineBefore = true
-			continue
-
-		case '\t', '\f', '\v', ' ', '\xA0', '\uFEFF':
-			lexer.step()
-			continue
-
 		case '{':
 			lexer.step()
 			lexer.Token = TOpenBrace
@@ -596,8 +639,7 @@ func (lexer *Lexer) NextJSXElementChild() {
 			lexer.Token = TLessThan
 
 		default:
-			// This needs fixing if we skipped over whitespace characters earlier
-			needsFixing := lexer.start != originalStart
+			needsFixing := false
 
 		stringLiteral:
 			for {
@@ -630,6 +672,12 @@ func (lexer *Lexer) NextJSXElementChild() {
 			if needsFixing {
 				// Slow path
 				lexer.StringLiteral = fixWhitespaceAndDecodeJSXEntities(text)
+
+				// Skip this token if it turned out to be empty after trimming
+				if len(lexer.StringLiteral) == 0 {
+					lexer.HasNewlineBefore = true
+					continue
+				}
 			} else {
 				// Fast path
 				n := len(text)
@@ -668,7 +716,7 @@ func (lexer *Lexer) NextInsideJSXElement() {
 			lexer.HasNewlineBefore = true
 			continue
 
-		case '\t', '\f', '\v', ' ', '\xA0', '\uFEFF':
+		case '\t', ' ':
 			lexer.step()
 			continue
 
@@ -791,6 +839,12 @@ func (lexer *Lexer) NextInsideJSXElement() {
 			}
 
 		default:
+			// Check for unusual whitespace characters
+			if IsWhitespace(lexer.codePoint) {
+				lexer.step()
+				continue
+			}
+
 			if IsIdentifierStart(lexer.codePoint) {
 				lexer.step()
 				for IsIdentifierContinue(lexer.codePoint) || lexer.codePoint == '-' {
@@ -810,7 +864,9 @@ func (lexer *Lexer) NextInsideJSXElement() {
 }
 
 func (lexer *Lexer) Next() {
-	lexer.HasNewlineBefore = false
+	lexer.HasNewlineBefore = lexer.end == 0
+	lexer.HasPureCommentBefore = false
+	lexer.CommentsToPreserveBefore = nil
 
 	for {
 		lexer.start = lexer.end
@@ -822,6 +878,7 @@ func (lexer *Lexer) Next() {
 
 		case '#':
 			if lexer.start == 0 && strings.HasPrefix(lexer.source.Contents, "#!") {
+				// "#!/usr/bin/env node"
 				lexer.Token = THashbang
 			hashbang:
 				for {
@@ -836,7 +893,25 @@ func (lexer *Lexer) Next() {
 				}
 				lexer.Identifier = lexer.Raw()
 			} else {
-				lexer.SyntaxError()
+				// "#foo"
+				lexer.step()
+				if lexer.codePoint == '\\' {
+					lexer.Identifier, _ = lexer.scanIdentifierWithEscapes(privateIdentifier)
+				} else {
+					if !IsIdentifierStart(lexer.codePoint) {
+						lexer.SyntaxError()
+					}
+					lexer.step()
+					for IsIdentifierContinue(lexer.codePoint) {
+						lexer.step()
+					}
+					if lexer.codePoint == '\\' {
+						lexer.Identifier, _ = lexer.scanIdentifierWithEscapes(privateIdentifier)
+					} else {
+						lexer.Identifier = lexer.Raw()
+					}
+				}
+				lexer.Token = TPrivateIdentifier
 			}
 
 		case '\r', '\n', '\u2028', '\u2029':
@@ -844,7 +919,7 @@ func (lexer *Lexer) Next() {
 			lexer.HasNewlineBefore = true
 			continue
 
-		case '\t', '\f', '\v', ' ', '\xA0', '\uFEFF':
+		case '\t', ' ':
 			lexer.step()
 			continue
 
@@ -893,12 +968,18 @@ func (lexer *Lexer) Next() {
 			lexer.Token = TTilde
 
 		case '?':
-			// '?' or '??' or '?.'
+			// '?' or '?.' or '??' or '??='
 			lexer.step()
 			switch lexer.codePoint {
 			case '?':
 				lexer.step()
-				lexer.Token = TQuestionQuestion
+				switch lexer.codePoint {
+				case '=':
+					lexer.step()
+					lexer.Token = TQuestionQuestionEquals
+				default:
+					lexer.Token = TQuestionQuestion
+				}
 			case '.':
 				lexer.Token = TQuestion
 				current := lexer.current
@@ -928,7 +1009,7 @@ func (lexer *Lexer) Next() {
 			}
 
 		case '&':
-			// '&' or '&=' or '&&'
+			// '&' or '&=' or '&&' or '&&='
 			lexer.step()
 			switch lexer.codePoint {
 			case '=':
@@ -936,13 +1017,19 @@ func (lexer *Lexer) Next() {
 				lexer.Token = TAmpersandEquals
 			case '&':
 				lexer.step()
-				lexer.Token = TAmpersandAmpersand
+				switch lexer.codePoint {
+				case '=':
+					lexer.step()
+					lexer.Token = TAmpersandAmpersandEquals
+				default:
+					lexer.Token = TAmpersandAmpersand
+				}
 			default:
 				lexer.Token = TAmpersand
 			}
 
 		case '|':
-			// '|' or '|=' or '||'
+			// '|' or '|=' or '||' or '||='
 			lexer.step()
 			switch lexer.codePoint {
 			case '=':
@@ -950,7 +1037,13 @@ func (lexer *Lexer) Next() {
 				lexer.Token = TBarEquals
 			case '|':
 				lexer.step()
-				lexer.Token = TBarBar
+				switch lexer.codePoint {
+				case '=':
+					lexer.step()
+					lexer.Token = TBarBarEquals
+				default:
+					lexer.Token = TBarBar
+				}
 			default:
 				lexer.Token = TBar
 			}
@@ -981,7 +1074,7 @@ func (lexer *Lexer) Next() {
 			}
 
 		case '-':
-			// '-' or '-=' or '--'
+			// '-' or '-=' or '--' or '-->'
 			lexer.step()
 			switch lexer.codePoint {
 			case '=':
@@ -989,6 +1082,26 @@ func (lexer *Lexer) Next() {
 				lexer.Token = TMinusEquals
 			case '-':
 				lexer.step()
+
+				// Handle legacy HTML-style comments
+				if lexer.codePoint == '>' && lexer.HasNewlineBefore {
+					lexer.step()
+					lexer.log.AddRangeWarning(&lexer.source, lexer.Range(),
+						"Treating \"-->\" as the start of a legacy HTML single-line comment")
+				singleLineHTMLCloseComment:
+					for {
+						switch lexer.codePoint {
+						case '\r', '\n', '\u2028', '\u2029':
+							break singleLineHTMLCloseComment
+
+						case -1: // This indicates the end of the file
+							break singleLineHTMLCloseComment
+						}
+						lexer.step()
+					}
+					continue
+				}
+
 				lexer.Token = TMinusMinus
 			default:
 				lexer.Token = TMinus
@@ -1041,6 +1154,7 @@ func (lexer *Lexer) Next() {
 				if lexer.json.parse && !lexer.json.allowComments {
 					lexer.addRangeError(lexer.Range(), "JSON does not support comments")
 				}
+				lexer.scanCommentText()
 				continue
 
 			case '*':
@@ -1072,6 +1186,7 @@ func (lexer *Lexer) Next() {
 				if lexer.json.parse && !lexer.json.allowComments {
 					lexer.addRangeError(lexer.Range(), "JSON does not support comments")
 				}
+				lexer.scanCommentText()
 				continue
 
 			default:
@@ -1099,7 +1214,7 @@ func (lexer *Lexer) Next() {
 			}
 
 		case '<':
-			// '<' or '<<' or '<=' or '<<='
+			// '<' or '<<' or '<=' or '<<=' or '<!--'
 			lexer.step()
 			switch lexer.codePoint {
 			case '=':
@@ -1114,6 +1229,31 @@ func (lexer *Lexer) Next() {
 				default:
 					lexer.Token = TLessThanLessThan
 				}
+
+				// Handle legacy HTML-style comments
+			case '!':
+				if strings.HasPrefix(lexer.source.Contents[lexer.start:], "<!--") {
+					lexer.step()
+					lexer.step()
+					lexer.step()
+					lexer.log.AddRangeWarning(&lexer.source, lexer.Range(),
+						"Treating \"<!--\" as the start of a legacy HTML single-line comment")
+				singleLineHTMLOpenComment:
+					for {
+						switch lexer.codePoint {
+						case '\r', '\n', '\u2028', '\u2029':
+							break singleLineHTMLOpenComment
+
+						case -1: // This indicates the end of the file
+							break singleLineHTMLOpenComment
+						}
+						lexer.step()
+					}
+					continue
+				}
+
+				lexer.Token = TLessThan
+
 			default:
 				lexer.Token = TLessThan
 			}
@@ -1200,7 +1340,7 @@ func (lexer *Lexer) Next() {
 
 				case '\r', '\n':
 					if quote != '`' {
-						lexer.addError(ast.Loc{int32(lexer.end)}, "Unterminated string literal")
+						lexer.addError(ast.Loc{Start: int32(lexer.end)}, "Unterminated string literal")
 						panic(LexerPanic{})
 					}
 
@@ -1264,7 +1404,7 @@ func (lexer *Lexer) Next() {
 				lexer.step()
 			}
 			if lexer.codePoint == '\\' {
-				lexer.Identifier, lexer.Token = lexer.scanIdentifierWithEscapes()
+				lexer.Identifier, lexer.Token = lexer.scanIdentifierWithEscapes(normalIdentifier)
 			} else {
 				contents := lexer.Raw()
 				lexer.Identifier = contents
@@ -1275,19 +1415,25 @@ func (lexer *Lexer) Next() {
 			}
 
 		case '\\':
-			lexer.Identifier, lexer.Token = lexer.scanIdentifierWithEscapes()
+			lexer.Identifier, lexer.Token = lexer.scanIdentifierWithEscapes(normalIdentifier)
 
 		case '.', '0', '1', '2', '3', '4', '5', '6', '7', '8', '9':
 			lexer.parseNumericLiteralOrDot()
 
 		default:
+			// Check for unusual whitespace characters
+			if IsWhitespace(lexer.codePoint) {
+				lexer.step()
+				continue
+			}
+
 			if IsIdentifierStart(lexer.codePoint) {
 				lexer.step()
 				for IsIdentifierContinue(lexer.codePoint) {
 					lexer.step()
 				}
 				if lexer.codePoint == '\\' {
-					lexer.Identifier, lexer.Token = lexer.scanIdentifierWithEscapes()
+					lexer.Identifier, lexer.Token = lexer.scanIdentifierWithEscapes(normalIdentifier)
 				} else {
 					lexer.Token = TIdentifier
 					lexer.Identifier = lexer.Raw()
@@ -1303,9 +1449,16 @@ func (lexer *Lexer) Next() {
 	}
 }
 
+type identifierKind uint8
+
+const (
+	normalIdentifier identifierKind = iota
+	privateIdentifier
+)
+
 // This is an edge case that doesn't really exist in the wild, so it doesn't
 // need to be as fast as possible.
-func (lexer *Lexer) scanIdentifierWithEscapes() (string, T) {
+func (lexer *Lexer) scanIdentifierWithEscapes(kind identifierKind) (string, T) {
 	// First pass: scan over the identifier to see how long it is
 	for {
 		// Scan a unicode escape sequence. There is at least one because that's
@@ -1357,8 +1510,12 @@ func (lexer *Lexer) scanIdentifierWithEscapes() (string, T) {
 	text := string(utf16.Decode(lexer.decodeEscapeSequences(lexer.start, lexer.Raw())))
 
 	// Even though it was escaped, it must still be a valid identifier
-	if !IsIdentifier(text) {
-		lexer.addRangeError(ast.Range{ast.Loc{int32(lexer.start)}, int32(lexer.end - lexer.start)},
+	identifier := text
+	if kind == privateIdentifier {
+		identifier = identifier[1:] // Skip over the "#"
+	}
+	if !IsIdentifier(identifier) {
+		lexer.addRangeError(ast.Range{Loc: ast.Loc{Start: int32(lexer.start)}, Len: int32(lexer.end - lexer.start)},
 			fmt.Sprintf("Invalid identifier: %q", text))
 	}
 
@@ -1756,7 +1913,7 @@ func decodeJSXEntities(decoded []uint16, text string) []uint16 {
 }
 
 func fixWhitespaceAndDecodeJSXEntities(text string) []uint16 {
-	lastNonWhitespace := -1
+	afterLastNonWhitespace := -1
 	decoded := []uint16{}
 	i := 0
 
@@ -1770,25 +1927,28 @@ func fixWhitespaceAndDecodeJSXEntities(text string) []uint16 {
 		switch c {
 		case '\r', '\n', '\u2028', '\u2029':
 			// Newline
-			if firstNonWhitespace != -1 && lastNonWhitespace != -1 {
+			if firstNonWhitespace != -1 && afterLastNonWhitespace != -1 {
 				if len(decoded) > 0 {
 					decoded = append(decoded, ' ')
 				}
 
 				// Trim whitespace off the start and end of lines in the middle
-				decoded = decodeJSXEntities(decoded, text[firstNonWhitespace:lastNonWhitespace+1])
+				decoded = decodeJSXEntities(decoded, text[firstNonWhitespace:afterLastNonWhitespace])
 			}
 
 			// Reset for the next line
 			firstNonWhitespace = -1
 
-		case '\t', '\f', '\v', ' ', '\xA0', '\uFEFF':
+		case '\t', ' ':
 			// Whitespace
 
 		default:
-			lastNonWhitespace = i
-			if firstNonWhitespace == -1 {
-				firstNonWhitespace = i
+			// Check for unusual whitespace characters
+			if !IsWhitespace(c) {
+				afterLastNonWhitespace = i + width
+				if firstNonWhitespace == -1 {
+					firstNonWhitespace = i
+				}
 			}
 		}
 
@@ -1948,7 +2108,7 @@ func (lexer *Lexer) decodeEscapeSequences(start int, text string) []uint16 {
 					}
 
 					if isOutOfRange {
-						lexer.addRangeError(ast.Range{ast.Loc{int32(start + hexStart)}, int32(i - hexStart)},
+						lexer.addRangeError(ast.Range{Loc: ast.Loc{Start: int32(start + hexStart)}, Len: int32(i - hexStart)},
 							"Unicode escape sequence is out of range")
 						panic(LexerPanic{})
 					}
@@ -2051,14 +2211,194 @@ func (lexer *Lexer) step() {
 
 func (lexer *Lexer) addError(loc ast.Loc, text string) {
 	if !lexer.IsLogDisabled {
-		lexer.log.AddError(lexer.source, loc, text)
+		lexer.log.AddError(&lexer.source, loc, text)
 	}
 }
 
 func (lexer *Lexer) addRangeError(r ast.Range, text string) {
 	if !lexer.IsLogDisabled {
-		lexer.log.AddRangeError(lexer.source, r, text)
+		lexer.log.AddRangeError(&lexer.source, r, text)
 	}
+}
+
+func hasPrefixWithWordBoundary(text string, prefix string) bool {
+	t := len(text)
+	p := len(prefix)
+	if t >= p && text[0:p] == prefix {
+		if t == p {
+			return true
+		}
+		c, _ := utf8.DecodeRuneInString(text[p:])
+		if !IsIdentifierContinue(c) {
+			return true
+		}
+	}
+	return false
+}
+
+type pragmaArg uint8
+
+const (
+	pragmaNoSpaceFirst pragmaArg = iota
+	pragmaSkipSpaceFirst
+)
+
+func scanForPragmaArg(kind pragmaArg, start int, pragma string, text string) (ast.Span, bool) {
+	text = text[len(pragma):]
+	start += len(pragma)
+
+	if text == "" {
+		return ast.Span{}, false
+	}
+
+	// One or more whitespace characters
+	c, width := utf8.DecodeRuneInString(text)
+	if kind == pragmaSkipSpaceFirst {
+		if !IsWhitespace(c) {
+			return ast.Span{}, false
+		}
+		for IsWhitespace(c) {
+			text = text[width:]
+			start += width
+			if text == "" {
+				return ast.Span{}, false
+			}
+			c, width = utf8.DecodeRuneInString(text)
+		}
+	}
+
+	// One or more non-whitespace characters
+	i := 0
+	for !IsWhitespace(c) {
+		i += width
+		if i >= len(text) {
+			break
+		}
+		c, width = utf8.DecodeRuneInString(text[i:])
+		if IsWhitespace(c) {
+			break
+		}
+	}
+
+	return ast.Span{
+		Text: text[:i],
+		Range: ast.Range{
+			Loc: ast.Loc{Start: int32(start)},
+			Len: int32(i),
+		},
+	}, true
+}
+
+func (lexer *Lexer) scanCommentText() {
+	text := lexer.source.Contents[lexer.start:lexer.end]
+	hasPreserveAnnotation := len(text) > 2 && text[2] == '!'
+
+	for i, n := 0, len(text); i < n; i++ {
+		switch text[i] {
+		case '#':
+			rest := text[i+1:]
+			if hasPrefixWithWordBoundary(rest, "__PURE__") {
+				lexer.HasPureCommentBefore = true
+			} else if strings.HasPrefix(rest, " sourceMappingURL=") {
+				if arg, ok := scanForPragmaArg(pragmaNoSpaceFirst, lexer.start+i+1, " sourceMappingURL=", rest); ok {
+					lexer.SourceMappingURL = arg
+				}
+			}
+
+		case '@':
+			rest := text[i+1:]
+			if hasPrefixWithWordBoundary(rest, "__PURE__") {
+				lexer.HasPureCommentBefore = true
+			} else if hasPrefixWithWordBoundary(rest, "preserve") || hasPrefixWithWordBoundary(rest, "license") {
+				hasPreserveAnnotation = true
+			} else if hasPrefixWithWordBoundary(rest, "jsx") {
+				if arg, ok := scanForPragmaArg(pragmaSkipSpaceFirst, lexer.start+i+1, "jsx", rest); ok {
+					lexer.JSXFactoryPragmaComment = arg
+				}
+			} else if hasPrefixWithWordBoundary(rest, "jsxFrag") {
+				if arg, ok := scanForPragmaArg(pragmaSkipSpaceFirst, lexer.start+i+1, "jsxFrag", rest); ok {
+					lexer.JSXFragmentPragmaComment = arg
+				}
+			} else if strings.HasPrefix(rest, " sourceMappingURL=") {
+				if arg, ok := scanForPragmaArg(pragmaNoSpaceFirst, lexer.start+i+1, " sourceMappingURL=", rest); ok {
+					lexer.SourceMappingURL = arg
+				}
+			}
+		}
+	}
+
+	if hasPreserveAnnotation {
+		if text[1] == '*' {
+			text = removeMultiLineCommentIndent(lexer.source.Contents[:lexer.start], text)
+		}
+
+		lexer.CommentsToPreserveBefore = append(lexer.CommentsToPreserveBefore, Comment{
+			Loc:  ast.Loc{Start: int32(lexer.start)},
+			Text: text,
+		})
+	}
+}
+
+func removeMultiLineCommentIndent(prefix string, text string) string {
+	// Figure out the initial indent
+	indent := 0
+seekBackwardToNewline:
+	for len(prefix) > 0 {
+		c, size := utf8.DecodeLastRuneInString(prefix)
+		switch c {
+		case '\r', '\n', '\u2028', '\u2029':
+			break seekBackwardToNewline
+		}
+		prefix = prefix[:len(prefix)-size]
+		indent++
+	}
+
+	// Split the comment into lines
+	var lines []string
+	start := 0
+	for i, c := range text {
+		switch c {
+		case '\r', '\n':
+			// Don't double-append for Windows style "\r\n" newlines
+			if start <= i {
+				lines = append(lines, text[start:i])
+			}
+
+			start = i + 1
+
+			// Ignore the second part of Windows style "\r\n" newlines
+			if c == '\r' && start < len(text) && text[start] == '\n' {
+				start++
+			}
+
+		case '\u2028', '\u2029':
+			lines = append(lines, text[start:i])
+			start = i + 3
+		}
+	}
+	lines = append(lines, text[start:])
+
+	// Find the minimum indent over all lines after the first line
+	for _, line := range lines[1:] {
+		lineIndent := 0
+		for _, c := range line {
+			if !IsWhitespace(c) {
+				break
+			}
+			lineIndent++
+		}
+		if indent > lineIndent {
+			indent = lineIndent
+		}
+	}
+
+	// Trim the indent off of all lines after the first line
+	for i, line := range lines {
+		if i > 0 {
+			lines[i] = line[indent:]
+		}
+	}
+	return strings.Join(lines, "\n")
 }
 
 func StringToUTF16(text string) []uint16 {
@@ -2171,9 +2511,9 @@ func encodeWTF8Rune(p []byte, r rune) int {
 }
 
 // This is a clone of "utf8.DecodeRuneInString" that has been modified to
-// encode using WTF-8 instead. See https://simonsapin.github.io/wtf-8/ for
+// decode using WTF-8 instead. See https://simonsapin.github.io/wtf-8/ for
 // more info.
-func DecodeUTF8Rune(s string) (rune, int) {
+func DecodeWTF8Rune(s string) (rune, int) {
 	n := len(s)
 	if n < 1 {
 		return utf8.RuneError, 0

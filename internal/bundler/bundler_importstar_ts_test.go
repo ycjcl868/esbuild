@@ -3,10 +3,10 @@ package bundler
 import (
 	"testing"
 
-	"github.com/evanw/esbuild/internal/parser"
+	"github.com/evanw/esbuild/internal/config"
 )
 
-func TestTSImportStarES6Unused(t *testing.T) {
+func TestTSImportStarUnused(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -19,27 +19,20 @@ func TestTSImportStarES6Unused(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  0() {
-    // /entry.ts
-    let foo = 234;
-    console.log(foo);
-  }
-}, 0);
+			"/out.js": `// /entry.ts
+let foo = 234;
+console.log(foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6Capture(t *testing.T) {
+func TestTSImportStarCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -52,34 +45,27 @@ func TestTSImportStarES6Capture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  0() {
-    // /foo.ts
-    var exports = {};
-    __export(exports, {
-      foo: () => foo2
-    });
-    const foo2 = 123;
+			"/out.js": `// /foo.ts
+const foo_exports = {};
+__export(foo_exports, {
+  foo: () => foo2
+});
+const foo2 = 123;
 
-    // /entry.ts
-    let foo = 234;
-    console.log(exports, foo2, foo);
-  }
-}, 0);
+// /entry.ts
+let foo = 234;
+console.log(foo_exports, foo2, foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6NoCapture(t *testing.T) {
+func TestTSImportStarNoCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -92,30 +78,23 @@ func TestTSImportStarES6NoCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  0() {
-    // /foo.ts
-    const foo2 = 123;
+			"/out.js": `// /foo.ts
+const foo2 = 123;
 
-    // /entry.ts
-    let foo = 234;
-    console.log(foo2, foo2, foo);
-  }
-}, 0);
+// /entry.ts
+let foo = 234;
+console.log(foo2, foo2, foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6ExportImportStarUnused(t *testing.T) {
+func TestTSImportStarExportImportStarUnused(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -132,27 +111,20 @@ func TestTSImportStarES6ExportImportStarUnused(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  0() {
-    // /entry.ts
-    let foo = 234;
-    console.log(foo);
-  }
-}, 0);
+			"/out.js": `// /entry.ts
+let foo = 234;
+console.log(foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6ExportImportStarNoCapture(t *testing.T) {
+func TestTSImportStarExportImportStarNoCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -169,36 +141,29 @@ func TestTSImportStarES6ExportImportStarNoCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  1() {
-    // /foo.ts
-    var exports = {};
-    __export(exports, {
-      foo: () => foo2
-    });
-    const foo2 = 123;
+			"/out.js": `// /foo.ts
+const foo_exports = {};
+__export(foo_exports, {
+  foo: () => foo2
+});
+const foo2 = 123;
 
-    // /bar.ts
+// /bar.ts
 
-    // /entry.ts
-    let foo = 234;
-    console.log(exports.foo, exports.foo, foo);
-  }
-}, 1);
+// /entry.ts
+let foo = 234;
+console.log(foo_exports.foo, foo_exports.foo, foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6ExportImportStarCapture(t *testing.T) {
+func TestTSImportStarExportImportStarCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -215,36 +180,29 @@ func TestTSImportStarES6ExportImportStarCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  1() {
-    // /foo.ts
-    var exports = {};
-    __export(exports, {
-      foo: () => foo2
-    });
-    const foo2 = 123;
+			"/out.js": `// /foo.ts
+const foo_exports = {};
+__export(foo_exports, {
+  foo: () => foo2
+});
+const foo2 = 123;
 
-    // /bar.ts
+// /bar.ts
 
-    // /entry.ts
-    let foo = 234;
-    console.log(exports, exports.foo, foo);
-  }
-}, 1);
+// /entry.ts
+let foo = 234;
+console.log(foo_exports, foo_exports.foo, foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6ExportStarAsUnused(t *testing.T) {
+func TestTSImportStarExportStarAsUnused(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -260,27 +218,20 @@ func TestTSImportStarES6ExportStarAsUnused(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  0() {
-    // /entry.ts
-    let foo = 234;
-    console.log(foo);
-  }
-}, 0);
+			"/out.js": `// /entry.ts
+let foo = 234;
+console.log(foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6ExportStarAsNoCapture(t *testing.T) {
+func TestTSImportStarExportStarAsNoCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -296,36 +247,29 @@ func TestTSImportStarES6ExportStarAsNoCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  1() {
-    // /foo.ts
-    var exports = {};
-    __export(exports, {
-      foo: () => foo2
-    });
-    const foo2 = 123;
+			"/out.js": `// /foo.ts
+const foo_exports = {};
+__export(foo_exports, {
+  foo: () => foo2
+});
+const foo2 = 123;
 
-    // /bar.ts
+// /bar.ts
 
-    // /entry.ts
-    let foo = 234;
-    console.log(exports.foo, exports.foo, foo);
-  }
-}, 1);
+// /entry.ts
+let foo = 234;
+console.log(foo_exports.foo, foo_exports.foo, foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6ExportStarAsCapture(t *testing.T) {
+func TestTSImportStarExportStarAsCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -341,36 +285,29 @@ func TestTSImportStarES6ExportStarAsCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  1() {
-    // /foo.ts
-    var exports = {};
-    __export(exports, {
-      foo: () => foo2
-    });
-    const foo2 = 123;
+			"/out.js": `// /foo.ts
+const foo_exports = {};
+__export(foo_exports, {
+  foo: () => foo2
+});
+const foo2 = 123;
 
-    // /bar.ts
+// /bar.ts
 
-    // /entry.ts
-    let foo = 234;
-    console.log(exports, exports.foo, foo);
-  }
-}, 1);
+// /entry.ts
+let foo = 234;
+console.log(foo_exports, foo_exports.foo, foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6ExportStarUnused(t *testing.T) {
+func TestTSImportStarExportStarUnused(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -386,27 +323,20 @@ func TestTSImportStarES6ExportStarUnused(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  0() {
-    // /entry.ts
-    let foo = 234;
-    console.log(foo);
-  }
-}, 0);
+			"/out.js": `// /entry.ts
+let foo = 234;
+console.log(foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6ExportStarNoCapture(t *testing.T) {
+func TestTSImportStarExportStarNoCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -422,32 +352,25 @@ func TestTSImportStarES6ExportStarNoCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  1() {
-    // /foo.ts
-    const foo2 = 123;
+			"/out.js": `// /foo.ts
+const foo2 = 123;
 
-    // /bar.ts
+// /bar.ts
 
-    // /entry.ts
-    let foo = 234;
-    console.log(foo2, foo2, foo);
-  }
-}, 1);
+// /entry.ts
+let foo = 234;
+console.log(foo2, foo2, foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6ExportStarCapture(t *testing.T) {
+func TestTSImportStarExportStarCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -463,30 +386,23 @@ func TestTSImportStarES6ExportStarCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  1() {
-    // /foo.ts
-    const foo2 = 123;
+			"/out.js": `// /foo.ts
+const foo2 = 123;
 
-    // /bar.ts
-    var bar = {};
-    __export(bar, {
-      foo: () => foo2
-    });
+// /bar.ts
+const bar_exports = {};
+__export(bar_exports, {
+  foo: () => foo2
+});
 
-    // /entry.ts
-    let foo = 234;
-    console.log(bar, foo2, foo);
-  }
-}, 1);
+// /entry.ts
+let foo = 234;
+console.log(bar_exports, foo2, foo);
 `,
 		},
 	})
@@ -505,21 +421,14 @@ func TestTSImportStarCommonJSUnused(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  0() {
-    // /entry.ts
-    let foo = 234;
-    console.log(foo);
-  }
-}, 0);
+			"/out.js": `// /entry.ts
+let foo = 234;
+console.log(foo);
 `,
 		},
 	})
@@ -538,27 +447,20 @@ func TestTSImportStarCommonJSCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  1(exports) {
-    // /foo.ts
-    exports.foo = 123;
-  },
+			"/out.js": `// /foo.ts
+var require_foo = __commonJS((exports) => {
+  exports.foo = 123;
+});
 
-  0() {
-    // /entry.ts
-    const ns = __import(1 /* ./foo */);
-    let foo = 234;
-    console.log(ns, ns.foo, foo);
-  }
-}, 0);
+// /entry.ts
+const ns = __toModule(require_foo());
+let foo = 234;
+console.log(ns, ns.foo, foo);
 `,
 		},
 	})
@@ -577,93 +479,61 @@ func TestTSImportStarCommonJSNoCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out.js": `bootstrap({
-  1(exports) {
-    // /foo.ts
-    exports.foo = 123;
-  },
+			"/out.js": `// /foo.ts
+var require_foo = __commonJS((exports) => {
+  exports.foo = 123;
+});
 
-  0() {
-    // /entry.ts
-    const ns = __import(1 /* ./foo */);
-    let foo = 234;
-    console.log(ns.foo, ns.foo, foo);
-  }
-}, 0);
+// /entry.ts
+const ns = __toModule(require_foo());
+let foo = 234;
+console.log(ns.foo, ns.foo, foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6AndCommonJS(t *testing.T) {
+func TestTSImportStarAndCommonJS(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
-			"/entry1.js": `
+			"/entry.js": `
 				import * as ns from './foo'
-				console.log(ns.foo)
-			`,
-			"/entry2.js": `
-				const ns = require('./foo')
-				console.log(ns.foo)
+				const ns2 = require('./foo')
+				console.log(ns.foo, ns2.foo)
 			`,
 			"/foo.ts": `
 				export const foo = 123
 			`,
 		},
-		entryPaths: []string{"/entry1.js", "/entry2.js"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: true,
-		},
-		bundleOptions: BundleOptions{
-			IsBundling:   true,
-			AbsOutputDir: "/out",
+		entryPaths: []string{"/entry.js"},
+		options: config.Options{
+			IsBundling:    true,
+			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
-			"/out/entry1.js": `bootstrap({
-  2(exports) {
-    // /foo.ts
-    __export(exports, {
-      foo: () => foo
-    });
-    const foo = 123;
-  },
+			"/out.js": `// /foo.ts
+var require_foo = __commonJS((exports) => {
+  __export(exports, {
+    foo: () => foo2
+  });
+  const foo2 = 123;
+});
 
-  0() {
-    // /entry1.js
-    const ns = __import(2 /* ./foo */);
-    console.log(ns.foo);
-  }
-}, 0);
-`,
-			"/out/entry2.js": `bootstrap({
-  2(exports) {
-    // /foo.ts
-    __export(exports, {
-      foo: () => foo
-    });
-    const foo = 123;
-  },
-
-  1() {
-    // /entry2.js
-    const ns = __require(2 /* ./foo */);
-    console.log(ns.foo);
-  }
-}, 1);
+// /entry.js
+const ns = __toModule(require_foo());
+const ns2 = require_foo();
+console.log(ns.foo, ns2.foo);
 `,
 		},
 	})
 }
 
-func TestTSImportStarES6NoBundleUnused(t *testing.T) {
+func TestTSImportStarNoBundleUnused(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -673,10 +543,7 @@ func TestTSImportStarES6NoBundleUnused(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: false,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    false,
 			AbsOutputFile: "/out.js",
 		},
@@ -688,7 +555,7 @@ console.log(foo);
 	})
 }
 
-func TestTSImportStarES6NoBundleCapture(t *testing.T) {
+func TestTSImportStarNoBundleCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -698,10 +565,7 @@ func TestTSImportStarES6NoBundleCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: false,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    false,
 			AbsOutputFile: "/out.js",
 		},
@@ -714,7 +578,7 @@ console.log(ns, ns.foo, foo);
 	})
 }
 
-func TestTSImportStarES6NoBundleNoCapture(t *testing.T) {
+func TestTSImportStarNoBundleNoCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -724,10 +588,7 @@ func TestTSImportStarES6NoBundleNoCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling: false,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    false,
 			AbsOutputFile: "/out.js",
 		},
@@ -740,7 +601,7 @@ console.log(ns.foo, ns.foo, foo);
 	})
 }
 
-func TestTSImportStarES6MangleNoBundleUnused(t *testing.T) {
+func TestTSImportStarMangleNoBundleUnused(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -750,12 +611,9 @@ func TestTSImportStarES6MangleNoBundleUnused(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling:   false,
-			MangleSyntax: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    false,
+			MangleSyntax:  true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
@@ -766,7 +624,7 @@ console.log(foo);
 	})
 }
 
-func TestTSImportStarES6MangleNoBundleCapture(t *testing.T) {
+func TestTSImportStarMangleNoBundleCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -776,12 +634,9 @@ func TestTSImportStarES6MangleNoBundleCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling:   false,
-			MangleSyntax: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    false,
+			MangleSyntax:  true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{
@@ -793,7 +648,7 @@ console.log(ns, ns.foo, foo);
 	})
 }
 
-func TestTSImportStarES6MangleNoBundleNoCapture(t *testing.T) {
+func TestTSImportStarMangleNoBundleNoCapture(t *testing.T) {
 	expectBundled(t, bundled{
 		files: map[string]string{
 			"/entry.ts": `
@@ -803,12 +658,9 @@ func TestTSImportStarES6MangleNoBundleNoCapture(t *testing.T) {
 			`,
 		},
 		entryPaths: []string{"/entry.ts"},
-		parseOptions: parser.ParseOptions{
-			IsBundling:   false,
-			MangleSyntax: true,
-		},
-		bundleOptions: BundleOptions{
+		options: config.Options{
 			IsBundling:    false,
+			MangleSyntax:  true,
 			AbsOutputFile: "/out.js",
 		},
 		expected: map[string]string{

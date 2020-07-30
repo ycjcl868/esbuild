@@ -21,7 +21,7 @@ func (p *jsonParser) parseMaybeTrailingComma(closeToken lexer.T) bool {
 
 	if p.lexer.Token == closeToken {
 		if !p.allowTrailingCommas {
-			p.log.AddRangeError(p.source, commaRange, "JSON does not support trailing commas")
+			p.log.AddRangeError(&p.source, commaRange, "JSON does not support trailing commas")
 		}
 		return false
 	}
@@ -35,67 +35,91 @@ func (p *jsonParser) parseExpr() ast.Expr {
 	switch p.lexer.Token {
 	case lexer.TFalse:
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.EBoolean{false}}
+		return ast.Expr{Loc: loc, Data: &ast.EBoolean{Value: false}}
 
 	case lexer.TTrue:
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.EBoolean{true}}
+		return ast.Expr{Loc: loc, Data: &ast.EBoolean{Value: true}}
 
 	case lexer.TNull:
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.ENull{}}
+		return ast.Expr{Loc: loc, Data: &ast.ENull{}}
 
 	case lexer.TStringLiteral:
 		value := p.lexer.StringLiteral
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.EString{value}}
+		return ast.Expr{Loc: loc, Data: &ast.EString{Value: value}}
 
 	case lexer.TNumericLiteral:
 		value := p.lexer.Number
 		p.lexer.Next()
-		return ast.Expr{loc, &ast.ENumber{value}}
+		return ast.Expr{Loc: loc, Data: &ast.ENumber{Value: value}}
 
 	case lexer.TMinus:
 		p.lexer.Next()
 		value := p.lexer.Number
 		p.lexer.Expect(lexer.TNumericLiteral)
-		return ast.Expr{loc, &ast.ENumber{-value}}
+		return ast.Expr{Loc: loc, Data: &ast.ENumber{Value: -value}}
 
 	case lexer.TOpenBracket:
 		p.lexer.Next()
+		isSingleLine := !p.lexer.HasNewlineBefore
 		items := []ast.Expr{}
 
 		for p.lexer.Token != lexer.TCloseBracket {
-			if len(items) > 0 && !p.parseMaybeTrailingComma(lexer.TCloseBracket) {
-				break
+			if len(items) > 0 {
+				if p.lexer.HasNewlineBefore {
+					isSingleLine = false
+				}
+				if !p.parseMaybeTrailingComma(lexer.TCloseBracket) {
+					break
+				}
+				if p.lexer.HasNewlineBefore {
+					isSingleLine = false
+				}
 			}
 
 			item := p.parseExpr()
 			items = append(items, item)
 		}
 
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 		p.lexer.Expect(lexer.TCloseBracket)
-		return ast.Expr{loc, &ast.EArray{items}}
+		return ast.Expr{Loc: loc, Data: &ast.EArray{
+			Items:        items,
+			IsSingleLine: isSingleLine,
+		}}
 
 	case lexer.TOpenBrace:
 		p.lexer.Next()
+		isSingleLine := !p.lexer.HasNewlineBefore
 		properties := []ast.Property{}
 		duplicates := make(map[string]bool)
 
 		for p.lexer.Token != lexer.TCloseBrace {
-			if len(properties) > 0 && !p.parseMaybeTrailingComma(lexer.TCloseBrace) {
-				break
+			if len(properties) > 0 {
+				if p.lexer.HasNewlineBefore {
+					isSingleLine = false
+				}
+				if !p.parseMaybeTrailingComma(lexer.TCloseBrace) {
+					break
+				}
+				if p.lexer.HasNewlineBefore {
+					isSingleLine = false
+				}
 			}
 
 			keyString := p.lexer.StringLiteral
 			keyRange := p.lexer.Range()
-			key := ast.Expr{keyRange.Loc, &ast.EString{keyString}}
+			key := ast.Expr{Loc: keyRange.Loc, Data: &ast.EString{Value: keyString}}
 			p.lexer.Expect(lexer.TStringLiteral)
 
 			// Warn about duplicate keys
 			keyText := lexer.UTF16ToString(keyString)
 			if duplicates[keyText] {
-				p.log.AddRangeWarning(p.source, keyRange, fmt.Sprintf("Duplicate key: %q", keyText))
+				p.log.AddRangeWarning(&p.source, keyRange, fmt.Sprintf("Duplicate key: %q", keyText))
 			} else {
 				duplicates[keyText] = true
 			}
@@ -111,8 +135,14 @@ func (p *jsonParser) parseExpr() ast.Expr {
 			properties = append(properties, property)
 		}
 
+		if p.lexer.HasNewlineBefore {
+			isSingleLine = false
+		}
 		p.lexer.Expect(lexer.TCloseBrace)
-		return ast.Expr{loc, &ast.EObject{properties}}
+		return ast.Expr{Loc: loc, Data: &ast.EObject{
+			Properties:   properties,
+			IsSingleLine: isSingleLine,
+		}}
 
 	default:
 		p.lexer.Unexpected()

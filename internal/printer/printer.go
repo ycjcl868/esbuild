@@ -9,88 +9,15 @@ import (
 	"unicode/utf8"
 
 	"github.com/evanw/esbuild/internal/ast"
+	"github.com/evanw/esbuild/internal/compat"
+	"github.com/evanw/esbuild/internal/config"
 	"github.com/evanw/esbuild/internal/lexer"
-	"github.com/evanw/esbuild/internal/runtime"
+	"github.com/evanw/esbuild/internal/logging"
+	"github.com/evanw/esbuild/internal/sourcemap"
 )
 
-var base64 = []byte("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/")
 var positiveInfinity = math.Inf(1)
 var negativeInfinity = math.Inf(-1)
-
-// A single base 64 digit can contain 6 bits of data. For the base 64 variable
-// length quantities we use in the source map spec, the first bit is the sign,
-// the next four bits are the actual value, and the 6th bit is the continuation
-// bit. The continuation bit tells us whether there are more digits in this
-// value following this digit.
-//
-//   Continuation
-//   |    Sign
-//   |    |
-//   V    V
-//   101011
-//
-func encodeVLQ(value int) []byte {
-	var vlq int
-	if value < 0 {
-		vlq = ((-value) << 1) | 1
-	} else {
-		vlq = value << 1
-	}
-
-	// Handle the common case up front without allocations
-	if (vlq >> 5) == 0 {
-		digit := vlq & 31
-		return base64[digit : digit+1]
-	}
-
-	encoded := []byte{}
-	for {
-		digit := vlq & 31
-		vlq >>= 5
-
-		// If there are still more digits in this value, we must make sure the
-		// continuation bit is marked
-		if vlq != 0 {
-			digit |= 32
-		}
-
-		encoded = append(encoded, base64[digit])
-
-		if vlq == 0 {
-			break
-		}
-	}
-
-	return encoded
-}
-
-func decodeVLQ(encoded []byte, start int) (int, int) {
-	var vlq = 0
-
-	// Scan over the input
-	for {
-		index := bytes.IndexByte(base64, encoded[start])
-		if index < 0 {
-			break
-		}
-
-		// Decode a single byte
-		vlq = (vlq << 5) | (index & 31)
-		start++
-
-		// Stop if there's no continuation bit
-		if (vlq & 32) == 0 {
-			break
-		}
-	}
-
-	// Recover the value
-	var value = vlq >> 1
-	if (vlq & 1) != 0 {
-		value = -value
-	}
-	return value, start
-}
 
 // Coordinates in source maps are stored using relative offsets for size
 // reasons. When joining together chunks of a source map that were emitted
@@ -116,59 +43,123 @@ type SourceMapState struct {
 // After all chunks are computed, they are joined together in a second pass.
 // This rewrites the first mapping in each chunk to be relative to the end
 // state of the previous chunk.
-func AppendSourceMapChunk(buffer []byte, prevEndState SourceMapState, startState SourceMapState, sourceMap []byte) []byte {
+func AppendSourceMapChunk(j *Joiner, prevEndState SourceMapState, startState SourceMapState, sourceMap []byte) {
+	// Handle line breaks in between this mapping and the previous one
+	if startState.GeneratedLine != 0 {
+		j.AddBytes(bytes.Repeat([]byte{';'}, startState.GeneratedLine))
+	}
+
+	// Skip past any leading semicolons, which indicate line breaks
+	semicolons := 0
+	for sourceMap[semicolons] == ';' {
+		semicolons++
+	}
+	if semicolons > 0 {
+		j.AddBytes(sourceMap[:semicolons])
+		sourceMap = sourceMap[semicolons:]
+		startState.GeneratedColumn = 0
+	}
+
 	// Strip off the first mapping from the buffer. The first mapping should be
 	// for the start of the original file (the printer always generates one for
 	// the start of the file).
-	generatedColumn, i := decodeVLQ(sourceMap, 0)
-	sourceIndex, i := decodeVLQ(sourceMap, i)
-	originalLine, i := decodeVLQ(sourceMap, i)
-	originalColumn, i := decodeVLQ(sourceMap, i)
+	generatedColumn, i := sourcemap.DecodeVLQ(sourceMap, 0)
+	sourceIndex, i := sourcemap.DecodeVLQ(sourceMap, i)
+	originalLine, i := sourcemap.DecodeVLQ(sourceMap, i)
+	originalColumn, i := sourcemap.DecodeVLQ(sourceMap, i)
 	sourceMap = sourceMap[i:]
-
-	// Enforce invariants. All source map chunks should be relative to a default
-	// zero state. This is because they are computed in parallel and it's not
-	// possible to know what they should be relative to when computing them.
-	if sourceIndex != 0 || originalLine != 0 || originalColumn != 0 {
-		panic("Internal error")
-	}
 
 	// Rewrite the first mapping to be relative to the end state of the previous
 	// chunk. We now know what the end state is because we're in the second pass
 	// where all chunks have already been generated.
+	startState.SourceIndex += sourceIndex
 	startState.GeneratedColumn += generatedColumn
-	buffer = appendMapping(buffer, prevEndState, startState)
+	startState.OriginalLine = originalLine
+	startState.OriginalColumn = originalColumn
+	j.AddBytes(appendMapping(nil, j.lastByte, prevEndState, startState))
 
 	// Then append everything after that without modification.
-	buffer = append(buffer, sourceMap...)
-	return buffer
+	j.AddBytes(sourceMap)
 }
 
-func appendMapping(buffer []byte, prevState SourceMapState, currentState SourceMapState) []byte {
+func appendMapping(buffer []byte, lastByte byte, prevState SourceMapState, currentState SourceMapState) []byte {
 	// Put commas in between mappings
-	if len(buffer) != 0 {
-		c := buffer[len(buffer)-1]
-		if c != ';' && c != '"' {
-			buffer = append(buffer, ',')
-		}
+	if lastByte != 0 && lastByte != ';' && lastByte != '"' {
+		buffer = append(buffer, ',')
 	}
 
 	// Record the generated column (the line is recorded using ';' elsewhere)
-	buffer = append(buffer, encodeVLQ(currentState.GeneratedColumn-prevState.GeneratedColumn)...)
+	buffer = append(buffer, sourcemap.EncodeVLQ(currentState.GeneratedColumn-prevState.GeneratedColumn)...)
 	prevState.GeneratedColumn = currentState.GeneratedColumn
 
 	// Record the generated source
-	buffer = append(buffer, encodeVLQ(currentState.SourceIndex-prevState.SourceIndex)...)
+	buffer = append(buffer, sourcemap.EncodeVLQ(currentState.SourceIndex-prevState.SourceIndex)...)
 	prevState.SourceIndex = currentState.SourceIndex
 
 	// Record the original line
-	buffer = append(buffer, encodeVLQ(currentState.OriginalLine-prevState.OriginalLine)...)
+	buffer = append(buffer, sourcemap.EncodeVLQ(currentState.OriginalLine-prevState.OriginalLine)...)
 	prevState.OriginalLine = currentState.OriginalLine
 
 	// Record the original column
-	buffer = append(buffer, encodeVLQ(currentState.OriginalColumn-prevState.OriginalColumn)...)
+	buffer = append(buffer, sourcemap.EncodeVLQ(currentState.OriginalColumn-prevState.OriginalColumn)...)
 	prevState.OriginalColumn = currentState.OriginalColumn
 
+	return buffer
+}
+
+// This provides an efficient way to join lots of big string and byte slices
+// together. It avoids the cost of repeatedly reallocating as the buffer grows
+// by measuring exactly how big the buffer should be and then allocating once.
+// This is a measurable speedup.
+type Joiner struct {
+	lastByte byte
+	strings  []joinerString
+	bytes    []joinerBytes
+	length   uint32
+}
+
+type joinerString struct {
+	data   string
+	offset uint32
+}
+
+type joinerBytes struct {
+	data   []byte
+	offset uint32
+}
+
+func (j *Joiner) AddString(data string) {
+	if len(data) > 0 {
+		j.lastByte = data[len(data)-1]
+	}
+	j.strings = append(j.strings, joinerString{data, j.length})
+	j.length += uint32(len(data))
+}
+
+func (j *Joiner) AddBytes(data []byte) {
+	if len(data) > 0 {
+		j.lastByte = data[len(data)-1]
+	}
+	j.bytes = append(j.bytes, joinerBytes{data, j.length})
+	j.length += uint32(len(data))
+}
+
+func (j *Joiner) LastByte() byte {
+	return j.lastByte
+}
+
+func (j *Joiner) Length() uint32 {
+	return j.length
+}
+
+func (j *Joiner) Done() []byte {
+	buffer := make([]byte, j.length)
+	for _, item := range j.strings {
+		copy(buffer[item.offset:], item.data)
+	}
+	for _, item := range j.bytes {
+		copy(buffer[item.offset:], item.data)
+	}
 	return buffer
 }
 
@@ -240,7 +231,7 @@ func quoteImpl(text string, forJSON bool) string {
 			i++
 
 		default:
-			r, width := lexer.DecodeUTF8Rune(text[i:])
+			r, width := lexer.DecodeWTF8Rune(text[i:])
 			i += width
 			if r <= 0xFF && !forJSON {
 				b.WriteString("\\x")
@@ -306,11 +297,8 @@ func (p *printer) printQuotedUTF16(text []uint16, quote rune) {
 				js = append(js, '\n')
 
 				// Make sure to do with print() does for newlines
-				if p.writeSourceMap {
-					p.prevLineStart = len(js)
-					p.prevState.GeneratedLine++
-					p.prevState.GeneratedColumn = 0
-					p.sourceMap = append(p.sourceMap, ';')
+				if p.options.SourceForSourceMap != nil {
+					p.appendNewlineToSourceMap(len(js))
 				}
 			} else {
 				js = append(js, "\\n"...)
@@ -395,10 +383,11 @@ func (p *printer) printQuotedUTF16(text []uint16, quote rune) {
 }
 
 type printer struct {
-	symbols            *ast.SymbolMap
-	minify             bool
+	symbols            ast.SymbolMap
+	importRecords      []ast.ImportRecord
+	options            PrintOptions
+	extractedComments  map[string]bool
 	needsSemicolon     bool
-	indent             int
 	js                 []byte
 	stmtStart          int
 	exportDefaultStart int
@@ -407,29 +396,33 @@ type printer struct {
 	prevOpEnd          int
 	prevNumEnd         int
 	prevRegExpEnd      int
-
-	// For imports
-	resolvedImports map[string]uint32
-	runtimeSymRefs  map[runtime.Sym]ast.Ref
+	intToBytesBuffer   [64]byte
 
 	// For source maps
-	writeSourceMap bool
-	sourceMap      []byte
-	prevLoc        ast.Loc
-	prevLineStart  int
-	prevState      SourceMapState
-	lineStarts     []int32
+	sourceMap     []byte
+	prevLoc       ast.Loc
+	prevLineStart int
+	prevState     SourceMapState
+	hasPrevState  bool
+	lineStarts    []int32
+
+	// This is a workaround for a bug in the popular "source-map" library:
+	// https://github.com/mozilla/source-map/issues/261. The library will
+	// sometimes return null when querying a source map unless every line
+	// starts with a mapping at column zero.
+	//
+	// The workaround is to replicate the previous mapping if a line ends
+	// up not starting with a mapping. This is done lazily because we want
+	// to avoid replicating the previous mapping if we don't need to.
+	lineStartsWithMapping bool
 }
 
 func (p *printer) print(text string) {
-	if p.writeSourceMap {
+	if p.options.SourceForSourceMap != nil {
 		start := len(p.js)
 		for i, c := range text {
 			if c == '\n' {
-				p.prevLineStart = start + i + 1
-				p.prevState.GeneratedLine++
-				p.prevState.GeneratedColumn = 0
-				p.sourceMap = append(p.sourceMap, ';')
+				p.appendNewlineToSourceMap(start + i + 1)
 			}
 		}
 	}
@@ -437,10 +430,25 @@ func (p *printer) print(text string) {
 	p.js = append(p.js, text...)
 }
 
+// This is the same as "print(string(bytes))" without any unnecessary temporary
+// allocations
+func (p *printer) printBytes(bytes []byte) {
+	if p.options.SourceForSourceMap != nil {
+		start := len(p.js)
+		for i, c := range bytes {
+			if c == '\n' {
+				p.appendNewlineToSourceMap(start + i + 1)
+			}
+		}
+	}
+
+	p.js = append(p.js, bytes...)
+}
+
 // This is the same as "print(lexer.UTF16ToString(text))" without any
 // unnecessary temporary allocations
 func (p *printer) printUTF16(text []uint16) {
-	if p.writeSourceMap {
+	if p.options.SourceForSourceMap != nil {
 		start := len(p.js)
 		for i, c := range text {
 			if c == '\n' {
@@ -456,7 +464,7 @@ func (p *printer) printUTF16(text []uint16) {
 }
 
 func (p *printer) addSourceMapping(loc ast.Loc) {
-	if !p.writeSourceMap || loc == p.prevLoc {
+	if p.options.SourceForSourceMap == nil || loc == p.prevLoc {
 		return
 	}
 	p.prevLoc = loc
@@ -484,21 +492,86 @@ func (p *printer) addSourceMapping(loc ast.Loc) {
 
 	generatedColumn := len(p.js) - p.prevLineStart
 
-	currentState := SourceMapState{
-		GeneratedLine:   p.prevState.GeneratedLine,
-		GeneratedColumn: generatedColumn,
-		SourceIndex:     0, // Pretend the source index is 0, and later substitute the right one in AppendSourceMapChunk()
-		OriginalLine:    originalLine,
-		OriginalColumn:  originalColumn,
+	// If this line doesn't start with a mapping and we're about to add a mapping
+	// that's not at the start, insert a mapping first so the line starts with one.
+	if !p.lineStartsWithMapping && generatedColumn > 0 && p.hasPrevState {
+		p.appendMappingWithoutRemapping(SourceMapState{
+			GeneratedLine:   p.prevState.GeneratedLine,
+			GeneratedColumn: 0,
+			SourceIndex:     p.prevState.SourceIndex,
+			OriginalLine:    p.prevState.OriginalLine,
+			OriginalColumn:  p.prevState.OriginalColumn,
+		})
 	}
 
-	p.sourceMap = appendMapping(p.sourceMap, p.prevState, currentState)
+	p.appendMapping(SourceMapState{
+		GeneratedLine:   p.prevState.GeneratedLine,
+		GeneratedColumn: generatedColumn,
+		OriginalLine:    originalLine,
+		OriginalColumn:  originalColumn,
+	})
+
+	// This line now has a mapping on it, so don't insert another one
+	p.lineStartsWithMapping = true
+}
+
+func (p *printer) appendMapping(currentState SourceMapState) {
+	// If the input file had a source map, map all the way back to the original
+	if p.options.InputSourceMap != nil {
+		mapping := p.options.InputSourceMap.Find(
+			int32(currentState.OriginalLine),
+			int32(currentState.OriginalColumn))
+
+		// Some locations won't have a mapping
+		if mapping == nil {
+			return
+		}
+
+		currentState.SourceIndex = int(mapping.SourceIndex)
+		currentState.OriginalLine = int(mapping.OriginalLine)
+		currentState.OriginalColumn = int(mapping.OriginalColumn)
+	}
+
+	p.appendMappingWithoutRemapping(currentState)
+}
+
+func (p *printer) appendMappingWithoutRemapping(currentState SourceMapState) {
+	var lastByte byte
+	if len(p.sourceMap) != 0 {
+		lastByte = p.sourceMap[len(p.sourceMap)-1]
+	}
+
+	p.sourceMap = appendMapping(p.sourceMap, lastByte, p.prevState, currentState)
 	p.prevState = currentState
+	p.hasPrevState = true
+}
+
+// Don't call this directly. This is called automatically by p.print("\n").
+func (p *printer) appendNewlineToSourceMap(prevLineStart int) {
+	// If we're about to move to the next line and the previous line didn't have
+	// any mappings, add a mapping at the start of the previous line.
+	if !p.lineStartsWithMapping && p.hasPrevState {
+		p.appendMappingWithoutRemapping(SourceMapState{
+			GeneratedLine:   p.prevState.GeneratedLine,
+			GeneratedColumn: 0,
+			SourceIndex:     p.prevState.SourceIndex,
+			OriginalLine:    p.prevState.OriginalLine,
+			OriginalColumn:  p.prevState.OriginalColumn,
+		})
+	}
+
+	p.prevLineStart = prevLineStart
+	p.prevState.GeneratedLine++
+	p.prevState.GeneratedColumn = 0
+	p.sourceMap = append(p.sourceMap, ';')
+
+	// This new line doesn't have a mapping yet
+	p.lineStartsWithMapping = false
 }
 
 func (p *printer) printIndent() {
-	if !p.minify {
-		for i := 0; i < p.indent; i++ {
+	if !p.options.RemoveWhitespace {
+		for i := 0; i < p.options.Indent; i++ {
 			p.print("  ")
 		}
 	}
@@ -507,14 +580,6 @@ func (p *printer) printIndent() {
 func (p *printer) symbolName(ref ast.Ref) string {
 	ref = ast.FollowSymbols(p.symbols, ref)
 	return p.symbols.Get(ref).Name
-}
-
-func (p *printer) printRuntimeSym(sym runtime.Sym) {
-	ref, ok := p.runtimeSymRefs[sym]
-	if !ok {
-		panic("Internal error")
-	}
-	p.printSymbol(ref)
 }
 
 func (p *printer) printSymbol(ref ast.Ref) {
@@ -535,92 +600,128 @@ func (p *printer) printBinding(binding ast.Binding) {
 
 	case *ast.BArray:
 		p.print("[")
-		for i, item := range b.Items {
-			if i != 0 {
-				p.print(",")
-				p.printSpace()
-			}
-			if b.HasSpread && i+1 == len(b.Items) {
-				p.print("...")
-			}
-			p.printBinding(item.Binding)
-
-			if item.DefaultValue != nil {
-				p.printSpace()
-				p.print("=")
-				p.printSpace()
-				p.printExpr(*item.DefaultValue, ast.LComma, 0)
+		if len(b.Items) > 0 {
+			if !b.IsSingleLine {
+				p.options.Indent++
 			}
 
-			// Make sure there's a comma after trailing missing items
-			if _, ok := item.Binding.Data.(*ast.BMissing); ok && i == len(b.Items)-1 {
-				p.print(",")
+			for i, item := range b.Items {
+				if i != 0 {
+					p.print(",")
+					if b.IsSingleLine {
+						p.printSpace()
+					}
+				}
+				if !b.IsSingleLine {
+					p.printNewline()
+					p.printIndent()
+				}
+				if b.HasSpread && i+1 == len(b.Items) {
+					p.print("...")
+				}
+				p.printBinding(item.Binding)
+
+				if item.DefaultValue != nil {
+					p.printSpace()
+					p.print("=")
+					p.printSpace()
+					p.printExpr(*item.DefaultValue, ast.LComma, 0)
+				}
+
+				// Make sure there's a comma after trailing missing items
+				if _, ok := item.Binding.Data.(*ast.BMissing); ok && i == len(b.Items)-1 {
+					p.print(",")
+				}
+			}
+
+			if !b.IsSingleLine {
+				p.options.Indent--
+				p.printNewline()
+				p.printIndent()
 			}
 		}
 		p.print("]")
 
 	case *ast.BObject:
 		p.print("{")
-		for i, item := range b.Properties {
-			if i != 0 {
-				p.print(",")
-				p.printSpace()
+		if len(b.Properties) > 0 {
+			if !b.IsSingleLine {
+				p.options.Indent++
 			}
 
-			if item.IsSpread {
-				p.print("...")
-			} else {
-				if item.IsComputed {
-					p.print("[")
-					p.printExpr(item.Key, ast.LComma, 0)
-					p.print("]:")
-					p.printSpace()
-					p.printBinding(item.Value)
-
-					if item.DefaultValue != nil {
+			for i, property := range b.Properties {
+				if i != 0 {
+					p.print(",")
+					if b.IsSingleLine {
 						p.printSpace()
-						p.print("=")
-						p.printSpace()
-						p.printExpr(*item.DefaultValue, ast.LComma, 0)
 					}
-					continue
+				}
+				if !b.IsSingleLine {
+					p.printNewline()
+					p.printIndent()
 				}
 
-				if str, ok := item.Key.Data.(*ast.EString); ok {
-					if lexer.IsIdentifierUTF16(str.Value) {
-						p.printSpaceBeforeIdentifier()
-						p.printUTF16(str.Value)
+				if property.IsSpread {
+					p.print("...")
+				} else {
+					if property.IsComputed {
+						p.print("[")
+						p.printExpr(property.Key, ast.LComma, 0)
+						p.print("]:")
+						p.printSpace()
+						p.printBinding(property.Value)
 
-						// Use a shorthand property if the names are the same
-						if id, ok := item.Value.Data.(*ast.BIdentifier); ok && lexer.UTF16EqualsString(str.Value, p.symbolName(id.Ref)) {
-							if item.DefaultValue != nil {
-								p.printSpace()
-								p.print("=")
-								p.printSpace()
-								p.printExpr(*item.DefaultValue, ast.LComma, 0)
+						if property.DefaultValue != nil {
+							p.printSpace()
+							p.print("=")
+							p.printSpace()
+							p.printExpr(*property.DefaultValue, ast.LComma, 0)
+						}
+						continue
+					}
+
+					if str, ok := property.Key.Data.(*ast.EString); ok {
+						if lexer.IsIdentifierUTF16(str.Value) {
+							p.addSourceMapping(property.Key.Loc)
+							p.printSpaceBeforeIdentifier()
+							p.printUTF16(str.Value)
+
+							// Use a shorthand property if the names are the same
+							if id, ok := property.Value.Data.(*ast.BIdentifier); ok && lexer.UTF16EqualsString(str.Value, p.symbolName(id.Ref)) {
+								if property.DefaultValue != nil {
+									p.printSpace()
+									p.print("=")
+									p.printSpace()
+									p.printExpr(*property.DefaultValue, ast.LComma, 0)
+								}
+								continue
 							}
-							continue
+						} else {
+							p.printExpr(property.Key, ast.LLowest, 0)
 						}
 					} else {
-						p.printExpr(item.Key, ast.LLowest, 0)
+						p.printExpr(property.Key, ast.LLowest, 0)
 					}
-				} else {
-					p.printExpr(item.Key, ast.LLowest, 0)
+
+					p.print(":")
+					p.printSpace()
 				}
+				p.printBinding(property.Value)
 
-				p.print(":")
-				p.printSpace()
+				if property.DefaultValue != nil {
+					p.printSpace()
+					p.print("=")
+					p.printSpace()
+					p.printExpr(*property.DefaultValue, ast.LComma, 0)
+				}
 			}
-			p.printBinding(item.Value)
 
-			if item.DefaultValue != nil {
-				p.printSpace()
-				p.print("=")
-				p.printSpace()
-				p.printExpr(*item.DefaultValue, ast.LComma, 0)
+			if !b.IsSingleLine {
+				p.options.Indent--
+				p.printNewline()
+				p.printIndent()
 			}
 		}
-
 		p.print("}")
 
 	default:
@@ -629,13 +730,13 @@ func (p *printer) printBinding(binding ast.Binding) {
 }
 
 func (p *printer) printSpace() {
-	if !p.minify {
+	if !p.options.RemoveWhitespace {
 		p.print(" ")
 	}
 }
 
 func (p *printer) printNewline() {
-	if !p.minify {
+	if !p.options.RemoveWhitespace {
 		p.print("\n")
 	}
 }
@@ -661,7 +762,7 @@ func (p *printer) printSpaceBeforeOperator(next ast.OpCode) {
 }
 
 func (p *printer) printSemicolonAfterStatement() {
-	if !p.minify {
+	if !p.options.RemoveWhitespace {
 		p.print(";\n")
 	} else {
 		p.needsSemicolon = true
@@ -687,7 +788,7 @@ func (p *printer) printFnArgs(args []ast.Arg, hasRestArg bool, isArrow bool) {
 	wrap := true
 
 	// Minify "(a) => {}" as "a=>{}"
-	if p.minify && !hasRestArg && isArrow && len(args) == 1 {
+	if p.options.RemoveWhitespace && !hasRestArg && isArrow && len(args) == 1 {
 		if _, ok := args[0].Binding.Data.(*ast.BIdentifier); ok && args[0].Default == nil {
 			wrap = false
 		}
@@ -736,7 +837,7 @@ func (p *printer) printClass(class ast.Class) {
 
 	p.print("{")
 	p.printNewline()
-	p.indent++
+	p.options.Indent++
 
 	for _, item := range class.Properties {
 		p.printSemicolonIfNeeded()
@@ -752,7 +853,7 @@ func (p *printer) printClass(class ast.Class) {
 	}
 
 	p.needsSemicolon = false
-	p.indent--
+	p.options.Indent--
 	p.printIndent()
 	p.print("}")
 }
@@ -819,16 +920,21 @@ func (p *printer) printProperty(item ast.Property) {
 		return
 	}
 
-	if str, ok := item.Key.Data.(*ast.EString); ok {
-		if lexer.IsIdentifierUTF16(str.Value) {
+	switch key := item.Key.Data.(type) {
+	case *ast.EPrivateIdentifier:
+		p.printSymbol(key.Ref)
+
+	case *ast.EString:
+		p.addSourceMapping(item.Key.Loc)
+		if lexer.IsIdentifierUTF16(key.Value) {
 			p.printSpaceBeforeIdentifier()
-			p.printUTF16(str.Value)
+			p.printUTF16(key.Value)
 
 			// Use a shorthand property if the names are the same
-			if item.Value != nil {
+			if !p.options.UnsupportedFeatures.Has(compat.ObjectExtensions) && item.Value != nil {
 				switch e := item.Value.Data.(type) {
 				case *ast.EIdentifier:
-					if lexer.UTF16EqualsString(str.Value, p.symbolName(e.Ref)) {
+					if lexer.UTF16EqualsString(key.Value, p.symbolName(e.Ref)) {
 						if item.Initializer != nil {
 							p.printSpace()
 							p.print("=")
@@ -842,7 +948,7 @@ func (p *printer) printProperty(item ast.Property) {
 					// Make sure we're not using a property access instead of an identifier
 					ref := ast.FollowSymbols(p.symbols, e.Ref)
 					symbol := p.symbols.Get(ref)
-					if symbol.NamespaceAlias == nil && lexer.UTF16EqualsString(str.Value, symbol.Name) {
+					if symbol.NamespaceAlias == nil && lexer.UTF16EqualsString(key.Value, symbol.Name) {
 						if item.Initializer != nil {
 							p.printSpace()
 							p.print("=")
@@ -854,12 +960,13 @@ func (p *printer) printProperty(item ast.Property) {
 				}
 			}
 		} else {
-			c := p.bestQuoteCharForString(str.Value, false /* allowBacktick */)
+			c := p.bestQuoteCharForString(key.Value, false /* allowBacktick */)
 			p.print(c)
-			p.printQuotedUTF16(str.Value, rune(c[0]))
+			p.printQuotedUTF16(key.Value, rune(c[0]))
 			p.print(c)
 		}
-	} else {
+
+	default:
 		p.printExpr(item.Key, ast.LLowest, 0)
 	}
 
@@ -891,6 +998,10 @@ func (p *printer) printProperty(item ast.Property) {
 }
 
 func (p *printer) bestQuoteCharForString(data []uint16, allowBacktick bool) string {
+	if p.options.UnsupportedFeatures.Has(compat.TemplateLiteral) {
+		allowBacktick = false
+	}
+
 	singleCost := 0
 	doubleCost := 0
 	backtickCost := 0
@@ -898,7 +1009,7 @@ func (p *printer) bestQuoteCharForString(data []uint16, allowBacktick bool) stri
 	for i, c := range data {
 		switch c {
 		case '\n':
-			if p.minify {
+			if p.options.RemoveWhitespace {
 				// The backslash for the newline costs an extra character for old-style
 				// string literals when compared to a template literal
 				backtickCost--
@@ -929,45 +1040,76 @@ func (p *printer) bestQuoteCharForString(data []uint16, allowBacktick bool) stri
 	return c
 }
 
-func (p *printer) printRequireCall(path string, isES6Import bool) {
-	sym := runtime.RequireSym
-	if isES6Import {
-		sym = runtime.ImportSym
+type requireCallArgs struct {
+	isES6Import       bool
+	mustReturnPromise bool
+}
+
+func (p *printer) printRequireOrImportExpr(importRecordIndex uint32) {
+	space := " "
+	if p.options.RemoveWhitespace {
+		space = ""
 	}
 
-	if p.resolvedImports != nil {
-		// If we're bundling require calls, convert the string to a source index
-		if sourceIndex, ok := p.resolvedImports[path]; ok {
-			p.printRuntimeSym(sym)
-			p.print(fmt.Sprintf("(%d", sourceIndex))
-			if !p.minify {
-				p.print(fmt.Sprintf(" /* %s */", path))
-			}
-		} else {
-			// If we get here, the module was marked as an external module
-			if isES6Import {
-				p.printRuntimeSym(runtime.ToModuleSym)
-				p.print("(")
-			}
-			p.print("require(")
-			p.print(Quote(path))
-			if isES6Import {
-				p.print(")")
-			}
-		}
-	} else {
-		p.printRuntimeSym(sym)
+	record := &p.importRecords[importRecordIndex]
+	p.printSpaceBeforeIdentifier()
+
+	// Preserve "import()" expressions that don't point inside the bundle
+	if record.SourceIndex == nil && record.Kind == ast.ImportDynamic && p.options.OutputFormat.KeepES6ImportExportSyntax() {
+		p.print("import(")
+		p.print(Quote(record.Path.Text))
+		p.print(")")
+		return
+	}
+
+	// Make sure "import()" expressions return promises
+	if record.Kind == ast.ImportDynamic {
+		p.print("Promise.resolve().then(()" + space + "=>" + space)
+	}
+
+	// Make sure CommonJS imports are converted to ES6 if necessary
+	if record.WrapWithToModule {
+		p.printSymbol(p.options.ToModuleRef)
 		p.print("(")
-		p.print(Quote(path))
 	}
 
-	p.print(")")
+	// If this import points inside the bundle, then call the "require()"
+	// function for that module directly. The linker must ensure that the
+	// module's require function exists by this point. Otherwise, fall back to a
+	// bare "require()" call. Then it's up to the user to provide it.
+	if record.SourceIndex != nil {
+		p.printSymbol(record.WrapperRef)
+		p.print("()")
+	} else {
+		p.print("require(")
+		p.print(Quote(record.Path.Text))
+		p.print(")")
+	}
+
+	if record.WrapWithToModule {
+		p.print(")")
+	}
+
+	if record.Kind == ast.ImportDynamic {
+		p.print(")")
+	}
 }
 
 const (
 	forbidCall = 1 << iota
 	forbidIn
+	hasNonOptionalChainParent
 )
+
+func (p *printer) printUndefined(level ast.L) {
+	if level >= ast.LPrefix {
+		p.print("(void 0)")
+	} else {
+		p.printSpaceBeforeIdentifier()
+		p.print("void 0")
+		p.prevNumEnd = len(p.js)
+	}
+}
 
 func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 	p.addSourceMapping(expr.Loc)
@@ -976,13 +1118,7 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 	case *ast.EMissing:
 
 	case *ast.EUndefined:
-		if level >= ast.LPrefix {
-			p.print("(void 0)")
-		} else {
-			p.printSpaceBeforeIdentifier()
-			p.print("void 0")
-			p.prevNumEnd = len(p.js)
-		}
+		p.printUndefined(level)
 
 	case *ast.ESuper:
 		p.printSpaceBeforeIdentifier()
@@ -1010,9 +1146,20 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 
 	case *ast.ENew:
 		wrap := level >= ast.LCall
+
+		hasPureComment := !p.options.RemoveWhitespace && e.CanBeUnwrappedIfUnused
+		if hasPureComment && level >= ast.LPostfix {
+			wrap = true
+		}
+
 		if wrap {
 			p.print("(")
 		}
+
+		if hasPureComment {
+			p.print("/* @__PURE__ */ ")
+		}
+
 		p.printSpaceBeforeIdentifier()
 		p.print("new")
 		p.printSpace()
@@ -1035,13 +1182,33 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 
 	case *ast.ECall:
 		wrap := level >= ast.LNew || (flags&forbidCall) != 0
+		targetFlags := 0
+		if e.OptionalChain == ast.OptionalChainNone {
+			targetFlags = hasNonOptionalChainParent
+		} else if (flags & hasNonOptionalChainParent) != 0 {
+			wrap = true
+		}
+
+		hasPureComment := !p.options.RemoveWhitespace && e.CanBeUnwrappedIfUnused
+		if hasPureComment && level >= ast.LPostfix {
+			wrap = true
+		}
+
 		if wrap {
 			p.print("(")
 		}
 
+		if hasPureComment {
+			wasStmtStart := p.stmtStart == len(p.js)
+			p.print("/* @__PURE__ */ ")
+			if wasStmtStart {
+				p.stmtStart = len(p.js)
+			}
+		}
+
 		// We don't ever want to accidentally generate a direct eval expression here
 		if !e.IsDirectEval && p.isUnboundEvalIdentifier(e.Target) {
-			if p.minify {
+			if p.options.RemoveWhitespace {
 				p.print("(0,")
 			} else {
 				p.print("(0, ")
@@ -1049,31 +1216,12 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 			p.printExpr(e.Target, ast.LPostfix, 0)
 			p.print(")")
 		} else {
-			p.printExpr(e.Target, ast.LPostfix, 0)
+			p.printExpr(e.Target, ast.LPostfix, targetFlags)
 		}
 
-		if e.IsOptionalChain {
+		if e.OptionalChain == ast.OptionalChainStart {
 			p.print("?.")
 		}
-		p.print("(")
-		for i, arg := range e.Args {
-			if i != 0 {
-				p.print(",")
-				p.printSpace()
-			}
-			p.printExpr(arg, ast.LComma, 0)
-		}
-		p.print(")")
-		if wrap {
-			p.print(")")
-		}
-
-	case *ast.ERuntimeCall:
-		wrap := level >= ast.LNew || (flags&forbidCall) != 0
-		if wrap {
-			p.print("(")
-		}
-		p.printRuntimeSym(e.Sym)
 		p.print("(")
 		for i, arg := range e.Args {
 			if i != 0 {
@@ -1092,7 +1240,7 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 		if wrap {
 			p.print("(")
 		}
-		p.printRequireCall(e.Path.Text, e.IsES6Import)
+		p.printRequireOrImportExpr(e.ImportRecordIndex)
 		if wrap {
 			p.print(")")
 		}
@@ -1102,27 +1250,32 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 		if wrap {
 			p.print("(")
 		}
-		p.printSpaceBeforeIdentifier()
-		if s, ok := e.Expr.Data.(*ast.EString); ok && p.resolvedImports != nil {
-			path := lexer.UTF16ToString(s.Value)
-			if p.minify {
-				p.print("Promise.resolve().then(()=>")
-			} else {
-				p.print("Promise.resolve().then(() => ")
-			}
-			p.printRequireCall(path, true)
+		if e.ImportRecordIndex != nil {
+			p.printRequireOrImportExpr(*e.ImportRecordIndex)
 		} else {
+			// Handle non-string expressions
+			p.printSpaceBeforeIdentifier()
 			p.print("import(")
 			p.printExpr(e.Expr, ast.LComma, 0)
+			p.print(")")
 		}
-		p.print(")")
 		if wrap {
 			p.print(")")
 		}
 
 	case *ast.EDot:
+		wrap := false
+		if e.OptionalChain == ast.OptionalChainNone {
+			flags |= hasNonOptionalChainParent
+		} else {
+			if (flags & hasNonOptionalChainParent) != 0 {
+				wrap = true
+				p.print("(")
+			}
+			flags &= ^hasNonOptionalChainParent
+		}
 		p.printExpr(e.Target, ast.LPostfix, flags)
-		if e.IsOptionalChain {
+		if e.OptionalChain == ast.OptionalChainStart {
 			p.print("?")
 		} else if p.prevNumEnd == len(p.js) {
 			// "1.toString" is a syntax error, so print "1 .toString" instead
@@ -1131,15 +1284,38 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 		p.print(".")
 		p.addSourceMapping(e.NameLoc)
 		p.print(e.Name)
+		if wrap {
+			p.print(")")
+		}
 
 	case *ast.EIndex:
+		wrap := false
+		if e.OptionalChain == ast.OptionalChainNone {
+			flags |= hasNonOptionalChainParent
+		} else {
+			if (flags & hasNonOptionalChainParent) != 0 {
+				wrap = true
+				p.print("(")
+			}
+			flags &= ^hasNonOptionalChainParent
+		}
 		p.printExpr(e.Target, ast.LPostfix, flags)
-		if e.IsOptionalChain {
+		if e.OptionalChain == ast.OptionalChainStart {
 			p.print("?.")
 		}
-		p.print("[")
-		p.printExpr(e.Index, ast.LLowest, 0)
-		p.print("]")
+		if private, ok := e.Index.Data.(*ast.EPrivateIdentifier); ok {
+			if e.OptionalChain != ast.OptionalChainStart {
+				p.print(".")
+			}
+			p.printSymbol(private.Ref)
+		} else {
+			p.print("[")
+			p.printExpr(e.Index, ast.LLowest, 0)
+			p.print("]")
+		}
+		if wrap {
+			p.print(")")
+		}
 
 	case *ast.EIf:
 		wrap := level >= ast.LConditional
@@ -1161,7 +1337,10 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 		}
 
 	case *ast.EArrow:
-		wrap := level >= ast.LAssign
+		n := len(p.js)
+		useFunction := p.options.UnsupportedFeatures.Has(compat.Arrow)
+		wrap := level >= ast.LAssign || (useFunction && (p.stmtStart == n || p.exportDefaultStart == n))
+
 		if wrap {
 			p.print("(")
 		}
@@ -1170,12 +1349,22 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 			p.print("async")
 			p.printSpace()
 		}
+
+		if useFunction {
+			p.printSpaceBeforeIdentifier()
+			p.print("function")
+		}
+
 		p.printFnArgs(e.Args, e.HasRestArg, true)
 		p.printSpace()
-		p.print("=>")
-		p.printSpace()
+
+		if !useFunction {
+			p.print("=>")
+			p.printSpace()
+		}
+
 		wasPrinted := false
-		if len(e.Body.Stmts) == 1 && e.PreferExpr {
+		if len(e.Body.Stmts) == 1 && e.PreferExpr && !useFunction {
 			if s, ok := e.Body.Stmts[0].Data.(*ast.SReturn); ok && s.Value != nil {
 				p.arrowExprStart = len(p.js)
 				p.printExpr(*s.Value, ast.LComma, 0)
@@ -1230,17 +1419,35 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 
 	case *ast.EArray:
 		p.print("[")
-		for i, item := range e.Items {
-			if i != 0 {
-				p.print(",")
-				p.printSpace()
+		if len(e.Items) > 0 {
+			if !e.IsSingleLine {
+				p.options.Indent++
 			}
-			p.printExpr(item, ast.LComma, 0)
 
-			// Make sure there's a comma after trailing missing items
-			_, ok := item.Data.(*ast.EMissing)
-			if ok && i == len(e.Items)-1 {
-				p.print(",")
+			for i, item := range e.Items {
+				if i != 0 {
+					p.print(",")
+					if e.IsSingleLine {
+						p.printSpace()
+					}
+				}
+				if !e.IsSingleLine {
+					p.printNewline()
+					p.printIndent()
+				}
+				p.printExpr(item, ast.LComma, 0)
+
+				// Make sure there's a comma after trailing missing items
+				_, ok := item.Data.(*ast.EMissing)
+				if ok && i == len(e.Items)-1 {
+					p.print(",")
+				}
+			}
+
+			if !e.IsSingleLine {
+				p.options.Indent--
+				p.printNewline()
+				p.printIndent()
 			}
 		}
 		p.print("]")
@@ -1253,30 +1460,37 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 		}
 		p.print("{")
 		if len(e.Properties) != 0 {
-			p.indent++
+			if !e.IsSingleLine {
+				p.options.Indent++
+			}
 
 			for i, item := range e.Properties {
 				if i != 0 {
 					p.print(",")
+					if e.IsSingleLine {
+						p.printSpace()
+					}
 				}
-
-				p.printNewline()
-				p.printIndent()
+				if !e.IsSingleLine {
+					p.printNewline()
+					p.printIndent()
+				}
 				p.printProperty(item)
 			}
 
-			p.indent--
-			p.printNewline()
-			p.printIndent()
+			if !e.IsSingleLine {
+				p.options.Indent--
+				p.printNewline()
+				p.printIndent()
+			}
 		}
-
 		p.print("}")
 		if wrap {
 			p.print(")")
 		}
 
 	case *ast.EBoolean:
-		if p.minify {
+		if p.options.RemoveWhitespace {
 			if level >= ast.LPrefix {
 				if e.Value {
 					p.print("(!0)")
@@ -1307,7 +1521,7 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 
 	case *ast.ETemplate:
 		// Convert no-substitution template literals into strings if it's smaller
-		if p.minify && e.Tag == nil && len(e.Parts) == 0 {
+		if p.options.RemoveWhitespace && e.Tag == nil && len(e.Parts) == 0 {
 			c := p.bestQuoteCharForString(e.Head, true /* allowBacktick */)
 			p.print(c)
 			p.printQuotedUTF16(e.Head, rune(c[0]))
@@ -1372,37 +1586,9 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 				p.print("-Infinity")
 			}
 		} else {
-			var text string
-
-			if absValue < 1000 {
-				// We can avoid calling the call to slowFloatToString() because
-				// we know that exponential notation will always be longer than the
-				// integer representation for integers less than 1000.
-				if asInt := int64(absValue); absValue == float64(asInt) {
-					text = strconv.FormatInt(asInt, 10)
-				} else {
-					text = p.slowFloatToString(absValue)
-				}
-			} else {
-				text = p.slowFloatToString(absValue)
-
-				// Also try printing this number as an integer in case that's smaller.
-				// We must test that the value is within the range of 64-bit numbers to
-				// avoid crashing due to a bug in the Go WebAssembly runtime:
-				// https://github.com/golang/go/issues/38839.
-				if absValue < 9223372036854776000.0 {
-					if asInt := int64(absValue); absValue == float64(asInt) {
-						intText := strconv.FormatInt(asInt, 10)
-						if len(intText) <= len(text) {
-							text = intText
-						}
-					}
-				}
-			}
-
 			if !math.Signbit(value) {
 				p.printSpaceBeforeIdentifier()
-				p.print(text)
+				p.printNonNegativeFloat(absValue)
 
 				// Remember the end of the latest number
 				p.prevNumEnd = len(p.js)
@@ -1412,12 +1598,12 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 				// "!isNaN(value)" because we need this to be true for "-0" and "-0 < 0"
 				// is false.
 				p.print("(-")
-				p.print(text)
+				p.printNonNegativeFloat(absValue)
 				p.print(")")
 			} else {
 				p.printSpaceBeforeOperator(ast.UnOpNeg)
 				p.print("-")
-				p.print(text)
+				p.printNonNegativeFloat(absValue)
 
 				// Remember the end of the latest number
 				p.prevNumEnd = len(p.js)
@@ -1432,7 +1618,10 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 		// Potentially use a property access instead of an identifier
 		ref := ast.FollowSymbols(p.symbols, e.Ref)
 		symbol := p.symbols.Get(ref)
-		if symbol.NamespaceAlias != nil {
+
+		if symbol.ImportItemStatus == ast.ImportItemMissing {
+			p.printUndefined(level)
+		} else if symbol.NamespaceAlias != nil {
 			p.printSymbol(symbol.NamespaceAlias.NamespaceRef)
 			p.print(".")
 			p.print(symbol.NamespaceAlias.Alias)
@@ -1548,12 +1737,12 @@ func (p *printer) printExpr(expr ast.Expr, level ast.L, flags int) {
 
 		case ast.BinOpPow:
 			// "**" can't contain certain unary expressions
-			if left, ok := e.Left.Data.(*ast.EUnary); ok && !left.Op.IsUnaryUpdate() {
+			if left, ok := e.Left.Data.(*ast.EUnary); ok && left.Op.UnaryAssignTarget() == ast.AssignTargetNone {
 				leftLevel = ast.LCall
 			} else if _, ok := e.Left.Data.(*ast.EUndefined); ok {
 				// Undefined is printed as "void 0"
 				leftLevel = ast.LCall
-			} else if p.minify {
+			} else if p.options.RemoveWhitespace {
 				// When minifying, booleans are printed as "!0 and "!1"
 				if _, ok := e.Left.Data.(*ast.EBoolean); ok {
 					leftLevel = ast.LCall
@@ -1598,22 +1787,169 @@ func (p *printer) isUnboundEvalIdentifier(value ast.Expr) bool {
 	return false
 }
 
-func (p *printer) slowFloatToString(value float64) string {
-	text := strconv.FormatFloat(value, 'g', -1, 64)
+// Convert an integer to a byte slice without any allocations
+func (p *printer) smallIntToBytes(n int) []byte {
+	wasNegative := n < 0
+	if wasNegative {
+		// This assumes that -math.MinInt isn't a problem. This is fine because
+		// these integers are floating-point exponents which never go up that high.
+		n = -n
+	}
 
-	if p.minify {
-		// Replace "e+" with "e"
-		if e := strings.LastIndexByte(text, 'e'); e != -1 && text[e+1] == '+' {
-			text = text[:e+1] + text[e+2:]
-		}
+	bytes := p.intToBytesBuffer[:]
+	start := len(bytes)
 
-		// Strip off the leading zero when minifying
-		if strings.HasPrefix(text, "0.") {
-			text = text[1:]
+	// Write out the number from the end to the front
+	for {
+		start--
+		bytes[start] = '0' + byte(n%10)
+		n /= 10
+		if n == 0 {
+			break
 		}
 	}
 
-	return text
+	// Stick a negative sign on the front if needed
+	if wasNegative {
+		start--
+		bytes[start] = '-'
+	}
+
+	return bytes[start:]
+}
+
+func parseSmallInt(bytes []byte) int {
+	wasNegative := bytes[0] == '-'
+	if wasNegative {
+		bytes = bytes[1:]
+	}
+
+	// Parse the integer without any error checking. This doesn't need to handle
+	// integer overflow because these integers are floating-point exponents which
+	// never go up that high.
+	n := 0
+	for _, c := range bytes {
+		n = n*10 + int(c-'0')
+	}
+
+	if wasNegative {
+		return -n
+	}
+	return n
+}
+
+func (p *printer) printNonNegativeFloat(absValue float64) {
+	// We can avoid the slow call to strconv.FormatFloat() for integers less than
+	// 1000 because we know that exponential notation will always be longer than
+	// the integer representation. This is not the case for 1000 which is "1e3".
+	if absValue < 1000 {
+		if asInt := int64(absValue); absValue == float64(asInt) {
+			p.printBytes(p.smallIntToBytes(int(asInt)))
+			return
+		}
+	}
+
+	// Format this number into a byte slice so we can mutate it in place without
+	// further reallocation
+	result := []byte(strconv.FormatFloat(absValue, 'g', -1, 64))
+
+	// Simplify the exponent
+	// "e+05" => "e5"
+	// "e-05" => "e-5"
+	if e := bytes.LastIndexByte(result, 'e'); e != -1 {
+		from := e + 1
+		to := from
+
+		switch result[from] {
+		case '+':
+			// Strip off the leading "+"
+			from++
+
+		case '-':
+			// Skip past the leading "-"
+			to++
+			from++
+		}
+
+		// Strip off leading zeros
+		for from < len(result) && result[from] == '0' {
+			from++
+		}
+
+		result = append(result[:to], result[from:]...)
+	}
+
+	dot := bytes.IndexByte(result, '.')
+
+	if dot == 1 && result[0] == '0' {
+		// Simplify numbers starting with "0."
+		afterDot := 2
+
+		// Strip off the leading zero when minifying
+		// "0.5" => ".5"
+		if p.options.RemoveWhitespace {
+			result = result[1:]
+			afterDot--
+		}
+
+		// Try using an exponent
+		// "0.001" => "1e-3"
+		if result[afterDot] == '0' {
+			i := afterDot + 1
+			for result[i] == '0' {
+				i++
+			}
+			remaining := result[i:]
+			exponent := p.smallIntToBytes(afterDot - i - len(remaining))
+
+			// Only switch if it's actually shorter
+			if len(result) > len(remaining)+1+len(exponent) {
+				result = append(append(remaining, 'e'), exponent...)
+			}
+		}
+	} else if dot != -1 {
+		// Try to get rid of a "." and maybe also an "e"
+		if e := bytes.LastIndexByte(result, 'e'); e != -1 {
+			integer := result[:dot]
+			fraction := result[dot+1 : e]
+			exponent := parseSmallInt(result[e+1:]) - len(fraction)
+
+			// Handle small exponents by appending zeros instead
+			if exponent >= 0 && exponent <= 2 {
+				// "1.2e1" => "12"
+				// "1.2e2" => "120"
+				// "1.2e3" => "1200"
+				if len(result) >= len(integer)+len(fraction)+exponent {
+					result = append(integer, fraction...)
+					for i := 0; i < exponent; i++ {
+						result = append(result, '0')
+					}
+				}
+			} else {
+				// "1.2e4" => "12e3"
+				exponent := p.smallIntToBytes(exponent)
+				if len(result) >= len(integer)+len(fraction)+1+len(exponent) {
+					result = append(append(append(integer, fraction...), 'e'), exponent...)
+				}
+			}
+		}
+	} else if result[len(result)-1] == '0' {
+		// Simplify numbers ending with "0" by trying to use an exponent
+		// "1000" => "1e3"
+		i := len(result) - 1
+		for i > 0 && result[i-1] == '0' {
+			i--
+		}
+		remaining := result[:i]
+		exponent := p.smallIntToBytes(len(result) - i)
+
+		// Only switch if it's actually shorter
+		if len(result) > len(remaining)+1+len(exponent) {
+			result = append(append(remaining, 'e'), exponent...)
+		}
+	}
+
+	p.printBytes(result)
 }
 
 func (p *printer) printDeclStmt(isExport bool, keyword string, decls []ast.Decl) {
@@ -1671,9 +2007,9 @@ func (p *printer) printBody(body ast.Stmt) {
 		p.printNewline()
 	} else {
 		p.printNewline()
-		p.indent++
+		p.options.Indent++
 		p.printStmt(body)
-		p.indent--
+		p.options.Indent--
 	}
 }
 
@@ -1681,12 +2017,12 @@ func (p *printer) printBlock(stmts []ast.Stmt) {
 	p.print("{")
 	p.printNewline()
 
-	p.indent++
+	p.options.Indent++
 	for _, stmt := range stmts {
 		p.printSemicolonIfNeeded()
 		p.printStmt(stmt)
 	}
-	p.indent--
+	p.options.Indent--
 	p.needsSemicolon = false
 
 	p.printIndent()
@@ -1745,9 +2081,9 @@ func (p *printer) printIf(s *ast.SIf) {
 		p.print("{")
 		p.printNewline()
 
-		p.indent++
+		p.options.Indent++
 		p.printStmt(s.Yes)
-		p.indent--
+		p.options.Indent--
 		p.needsSemicolon = false
 
 		p.printIndent()
@@ -1760,9 +2096,9 @@ func (p *printer) printIf(s *ast.SIf) {
 		}
 	} else {
 		p.printNewline()
-		p.indent++
+		p.options.Indent++
 		p.printStmt(s.Yes)
-		p.indent--
+		p.options.Indent--
 
 		if s.No != nil {
 			p.printIndent()
@@ -1782,9 +2118,9 @@ func (p *printer) printIf(s *ast.SIf) {
 			p.printIf(no)
 		} else {
 			p.printNewline()
-			p.indent++
+			p.options.Indent++
 			p.printStmt(*s.No)
-			p.indent--
+			p.options.Indent--
 		}
 	}
 }
@@ -1793,6 +2129,36 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 	p.addSourceMapping(stmt.Loc)
 
 	switch s := stmt.Data.(type) {
+	case *ast.SComment:
+		text := s.Text
+		if p.options.ExtractComments {
+			if p.extractedComments == nil {
+				p.extractedComments = make(map[string]bool)
+			}
+			p.extractedComments[text] = true
+			break
+		}
+		if strings.HasPrefix(text, "/*") {
+			// Re-indent multi-line comments
+			for {
+				newline := strings.IndexByte(text, '\n')
+				if newline == -1 {
+					break
+				}
+				p.printIndent()
+				p.print(text[:newline+1])
+				text = text[newline+1:]
+			}
+			p.printIndent()
+			p.print(text)
+			p.printNewline()
+		} else {
+			// Print a mandatory newline after single-line comments
+			p.printIndent()
+			p.print(text)
+			p.print("\n")
+		}
+
 	case *ast.SFunction:
 		p.printIndent()
 		p.printSpaceBeforeIdentifier()
@@ -1879,17 +2245,17 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 		p.printSpace()
 		p.print("*")
 		p.printSpace()
-		if s.Item != nil {
+		if s.Alias != nil {
 			p.print("as")
 			p.printSpace()
 			p.printSpaceBeforeIdentifier()
-			p.print(s.Item.Alias)
+			p.print(s.Alias.Name)
 			p.printSpace()
 			p.printSpaceBeforeIdentifier()
 		}
 		p.print("from")
 		p.printSpace()
-		p.print(Quote(s.Path.Text))
+		p.print(Quote(p.importRecords[s.ImportRecordIndex].Path.Text))
 		p.printSemicolonAfterStatement()
 
 	case *ast.SExportClause:
@@ -1897,12 +2263,23 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 		p.printSpaceBeforeIdentifier()
 		p.print("export")
 		p.printSpace()
-
 		p.print("{")
+
+		if !s.IsSingleLine {
+			p.options.Indent++
+		}
+
 		for i, item := range s.Items {
 			if i != 0 {
 				p.print(",")
-				p.printSpace()
+				if s.IsSingleLine {
+					p.printSpace()
+				}
+			}
+
+			if !s.IsSingleLine {
+				p.printNewline()
+				p.printIndent()
 			}
 			name := p.symbolName(item.Name.Ref)
 			p.print(name)
@@ -1911,8 +2288,14 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 				p.print(item.Alias)
 			}
 		}
-		p.print("}")
 
+		if !s.IsSingleLine {
+			p.options.Indent--
+			p.printNewline()
+			p.printIndent()
+		}
+
+		p.print("}")
 		p.printSemicolonAfterStatement()
 
 	case *ast.SExportFrom:
@@ -1920,27 +2303,42 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 		p.printSpaceBeforeIdentifier()
 		p.print("export")
 		p.printSpace()
-
 		p.print("{")
+
+		if !s.IsSingleLine {
+			p.options.Indent++
+		}
+
 		for i, item := range s.Items {
 			if i != 0 {
 				p.print(",")
-				p.printSpace()
+				if s.IsSingleLine {
+					p.printSpace()
+				}
 			}
-			name := p.symbolName(item.Name.Ref)
-			p.print(name)
-			if name != item.Alias {
+
+			if !s.IsSingleLine {
+				p.printNewline()
+				p.printIndent()
+			}
+			p.print(item.OriginalName)
+			if item.OriginalName != item.Alias {
 				p.print(" as ")
 				p.print(item.Alias)
 			}
 		}
-		p.print("}")
 
+		if !s.IsSingleLine {
+			p.options.Indent--
+			p.printNewline()
+			p.printIndent()
+		}
+
+		p.print("}")
 		p.printSpace()
 		p.print("from")
 		p.printSpace()
-		p.print(Quote(s.Path.Text))
-
+		p.print(Quote(p.importRecords[s.ImportRecordIndex].Path.Text))
 		p.printSemicolonAfterStatement()
 
 	case *ast.SLocal:
@@ -1967,10 +2365,10 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 			p.printSpace()
 		} else {
 			p.printNewline()
-			p.indent++
+			p.options.Indent++
 			p.printStmt(s.Body)
 			p.printSemicolonIfNeeded()
-			p.indent--
+			p.options.Indent--
 			p.printIndent()
 		}
 		p.print("while")
@@ -2101,7 +2499,7 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 		p.printSpace()
 		p.print("{")
 		p.printNewline()
-		p.indent++
+		p.options.Indent++
 
 		for _, c := range s.Cases {
 			p.printSemicolonIfNeeded()
@@ -2126,15 +2524,15 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 			}
 
 			p.printNewline()
-			p.indent++
+			p.options.Indent++
 			for _, stmt := range c.Body {
 				p.printSemicolonIfNeeded()
 				p.printStmt(stmt)
 			}
-			p.indent--
+			p.options.Indent--
 		}
 
-		p.indent--
+		p.options.Indent--
 		p.printIndent()
 		p.print("}")
 		p.printNewline()
@@ -2160,12 +2558,22 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 			}
 
 			p.print("{")
+			if !s.IsSingleLine {
+				p.options.Indent++
+			}
+
 			for i, item := range *s.Items {
 				if i != 0 {
 					p.print(",")
-					p.printSpace()
+					if s.IsSingleLine {
+						p.printSpace()
+					}
 				}
 
+				if !s.IsSingleLine {
+					p.printNewline()
+					p.printIndent()
+				}
 				p.print(item.Alias)
 				name := p.symbolName(item.Name.Ref)
 				if name != item.Alias {
@@ -2173,11 +2581,17 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 					p.print(name)
 				}
 			}
+
+			if !s.IsSingleLine {
+				p.options.Indent--
+				p.printNewline()
+				p.printIndent()
+			}
 			p.print("}")
 			itemCount++
 		}
 
-		if s.StarLoc != nil {
+		if s.StarNameLoc != nil {
 			if itemCount > 0 {
 				p.print(",")
 				p.printSpace()
@@ -2197,7 +2611,7 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 			p.printSpace()
 		}
 
-		p.print(Quote(s.Path.Text))
+		p.print(Quote(p.importRecords[s.ImportRecordIndex].Path.Text))
 		p.printSemicolonAfterStatement()
 
 	case *ast.SBlock:
@@ -2269,16 +2683,49 @@ func (p *printer) printStmt(stmt ast.Stmt) {
 	}
 }
 
+func (p *printer) shouldIgnoreSourceMap() bool {
+	for _, c := range p.sourceMap {
+		if c != ';' {
+			return false
+		}
+	}
+	return true
+}
+
 type PrintOptions struct {
-	RemoveWhitespace  bool
-	SourceMapContents *string
-	Indent            int
-	ResolvedImports   map[string]uint32
-	RuntimeSymRefs    map[runtime.Sym]ast.Ref
+	OutputFormat        config.Format
+	RemoveWhitespace    bool
+	ExtractComments     bool
+	Indent              int
+	ToModuleRef         ast.Ref
+	UnsupportedFeatures compat.Feature
+
+	// This contains the contents of the input file to map back to in the source
+	// map. If it's nil that means we're not generating source maps.
+	SourceForSourceMap *logging.Source
+
+	// This will be present if the input file had a source map. In that case we
+	// want to map all the way back to the original input file(s).
+	InputSourceMap *sourcemap.SourceMap
+}
+
+type QuotedSource struct {
+	// These are quoted ahead of time instead of during source map generation so
+	// the quoting happens in parallel instead of in serial
+	QuotedPath     string
+	QuotedContents string
 }
 
 type SourceMapChunk struct {
 	Buffer []byte
+
+	// There may be more than one source for this chunk if the file being printed
+	// has an associated source map. In that case the "source index" values in
+	// the buffer are 0-based indices into this array. The source index of the
+	// first mapping will be adjusted when the chunks are joined together. Since
+	// the source indices are encoded using a delta from the previous source
+	// index, none of the other source indices need to be modified while joining.
+	QuotedSources []QuotedSource
 
 	// This end state will be used to rewrite the start of the following source
 	// map chunk so that the delta-encoded VLQ numbers are preserved.
@@ -2288,34 +2735,34 @@ type SourceMapChunk struct {
 	// there be) but if we're appending another source map chunk after this one,
 	// we'll need to know how many characters were in the last line we generated.
 	FinalGeneratedColumn int
+
+	ShouldIgnore bool
 }
 
 func createPrinter(
-	symbols *ast.SymbolMap,
+	symbols ast.SymbolMap,
+	importRecords []ast.ImportRecord,
 	options PrintOptions,
 ) *printer {
 	p := &printer{
 		symbols:            symbols,
-		writeSourceMap:     options.SourceMapContents != nil,
-		minify:             options.RemoveWhitespace,
-		resolvedImports:    options.ResolvedImports,
-		indent:             options.Indent,
+		importRecords:      importRecords,
+		options:            options,
 		stmtStart:          -1,
 		exportDefaultStart: -1,
 		arrowExprStart:     -1,
 		prevOpEnd:          -1,
 		prevNumEnd:         -1,
 		prevRegExpEnd:      -1,
-		prevLoc:            ast.Loc{-1},
-		runtimeSymRefs:     options.RuntimeSymRefs,
+		prevLoc:            ast.Loc{Start: -1},
 	}
 
 	// If we're writing out a source map, prepare a table of line start indices
 	// to do binary search on to figure out what line a given AST node came from
-	if options.SourceMapContents != nil {
+	if options.SourceForSourceMap != nil {
 		lineStarts := []int32{}
 		var prevCodePoint rune
-		for i, codePoint := range *options.SourceMapContents {
+		for i, codePoint := range options.SourceForSourceMap.Contents {
 			switch codePoint {
 			case '\n':
 				if prevCodePoint == '\r' {
@@ -2337,54 +2784,79 @@ func createPrinter(
 type PrintResult struct {
 	JS []byte
 
-	// For minification, it's desirable to strip off unnecessary trailing
-	// semicolons from modules inside closures before the ending "}". However,
-	// there are some syntax constructs where you can't just remove the trailing
-	// semicolon (e.g. "while(foo());"). So we also return the source without the
-	// unnecessary trailing semicolon added in case the caller needs it.
-	JSWithoutTrailingSemicolon []byte
-
 	// This source map chunk just contains the VLQ-encoded offsets for the "JS"
 	// field above. It's not a full source map. The bundler will be joining many
 	// source map chunks together to form the final source map.
 	SourceMapChunk SourceMapChunk
+
+	ExtractedComments map[string]bool
 }
 
 func Print(tree ast.AST, options PrintOptions) PrintResult {
-	p := createPrinter(tree.Symbols, options)
+	p := createPrinter(tree.Symbols, tree.ImportRecords, options)
 
-	// Always add a mapping at the beginning of the file
-	p.addSourceMapping(ast.Loc{0})
-
-	for _, stmt := range tree.Stmts {
-		p.printSemicolonIfNeeded()
-		p.printStmt(stmt)
-	}
-
-	// Make sure each module ends in a semicolon so we don't have weird issues
-	// with automatic semicolon insertion when concatenating modules together
-	jsWithoutTrailingSemicolon := p.js
-	if options.RemoveWhitespace && len(p.js) > 0 && p.js[len(p.js)-1] != '\n' {
-		p.printSemicolonIfNeeded()
+	for _, part := range tree.Parts {
+		for _, stmt := range part.Stmts {
+			p.printStmt(stmt)
+			p.printSemicolonIfNeeded()
+		}
 	}
 
 	return PrintResult{
-		JS:                         p.js,
-		JSWithoutTrailingSemicolon: jsWithoutTrailingSemicolon,
-		SourceMapChunk:             SourceMapChunk{p.sourceMap, p.prevState, len(p.js) - p.prevLineStart},
+		JS:                p.js,
+		ExtractedComments: p.extractedComments,
+		SourceMapChunk: SourceMapChunk{
+			Buffer:               p.sourceMap,
+			QuotedSources:        quotedSources(&tree, &options),
+			EndState:             p.prevState,
+			FinalGeneratedColumn: len(p.js) - p.prevLineStart,
+			ShouldIgnore:         p.shouldIgnoreSourceMap(),
+		},
 	}
 }
 
-func PrintExpr(expr ast.Expr, symbols *ast.SymbolMap, options PrintOptions) PrintResult {
-	p := createPrinter(symbols, options)
-
-	// Always add a mapping at the beginning of the file
-	p.addSourceMapping(ast.Loc{0})
+func PrintExpr(expr ast.Expr, symbols ast.SymbolMap, options PrintOptions) PrintResult {
+	p := createPrinter(symbols, nil, options)
 
 	p.printExpr(expr, ast.LLowest, 0)
+
 	return PrintResult{
-		JS:                         p.js,
-		JSWithoutTrailingSemicolon: p.js,
-		SourceMapChunk:             SourceMapChunk{p.sourceMap, p.prevState, len(p.js) - p.prevLineStart},
+		JS:                p.js,
+		ExtractedComments: p.extractedComments,
+		SourceMapChunk: SourceMapChunk{
+			Buffer:               p.sourceMap,
+			QuotedSources:        quotedSources(nil, &options),
+			EndState:             p.prevState,
+			FinalGeneratedColumn: len(p.js) - p.prevLineStart,
+			ShouldIgnore:         p.shouldIgnoreSourceMap(),
+		},
 	}
+}
+
+func quotedSources(tree *ast.AST, options *PrintOptions) []QuotedSource {
+	if options.SourceForSourceMap == nil {
+		return nil
+	}
+
+	if sm := options.InputSourceMap; sm != nil {
+		results := make([]QuotedSource, len(sm.Sources))
+		for i, source := range sm.Sources {
+			contents := "null"
+			if i < len(sm.SourcesContent) {
+				if value := sm.SourcesContent[i]; value != nil {
+					contents = QuoteForJSON(*value)
+				}
+			}
+			results[i] = QuotedSource{
+				QuotedPath:     QuoteForJSON(source),
+				QuotedContents: contents,
+			}
+		}
+		return results
+	}
+
+	return []QuotedSource{{
+		QuotedPath:     QuoteForJSON(options.SourceForSourceMap.PrettyPath),
+		QuotedContents: QuoteForJSON(options.SourceForSourceMap.Contents),
+	}}
 }

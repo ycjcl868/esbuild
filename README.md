@@ -1,6 +1,15 @@
 # esbuild
 
+[![Godoc](https://godoc.org/github.com/evanw/esbuild?status.svg)](https://godoc.org/github.com/evanw/esbuild/pkg/api)
+
 This is a JavaScript bundler and minifier. It packages up JavaScript and TypeScript code for distribution on the web.
+
+## Documentation
+
+* [JavaScript API documentation](docs/js-api.md)
+* [Go API documentation](https://godoc.org/github.com/evanw/esbuild/pkg/api)
+* [Architecture documentation](docs/architecture.md)
+* [中文文档](http://docs.breword.com/evanw-esbuild/)
 
 ## Why?
 
@@ -10,7 +19,7 @@ Why build another JavaScript build tool? The current build tools for the web are
 
 The use case I have in mind is packaging a large codebase for production. This includes minifying the code, which reduces network transfer time, and producing source maps, which are important for debugging errors in production. Ideally the build tool should also build quickly without having to warm up a cache first.
 
-I currently have two benchmarks that I'm using to measure esbuild performance. For these benchmarks, esbuild is **10-100x faster** than the other JavaScript bundlers I tested:
+I currently have two benchmarks that I'm using to measure esbuild performance. For these benchmarks, esbuild is at least **100x faster** than the other JavaScript bundlers I tested:
 
 ![](images/benchmark.png)
 
@@ -20,27 +29,34 @@ Here are the details about each benchmark:
 
   This benchmark approximates a large JavaScript codebase by duplicating the [three.js](https://github.com/mrdoob/three.js) library 10 times and building a single bundle from scratch, without any caches. The benchmark can be run with `make bench-three`.
 
-    | Bundler         |    Time | Relative slowdown | Absolute speed | Output size |
-    | :-------------- | ------: | ----------------: | -------------: | ----------: |
-    | esbuild         |   0.54s |                1x |  1013.8 kloc/s |      5.83mb |
-    | rollup + terser |  40.48s |               75x |    13.5 kloc/s |      5.80mb |
-    | webpack         |  46.46s |               86x |    11.8 kloc/s |      5.97mb |
-    | parcel          | 124.65s |              231x |     4.4 kloc/s |      5.90mb |
-    | fuse-box@next   | 172.56s |              320x |     3.2 kloc/s |      6.55mb |
+    | Bundler            |    Time | Relative slowdown | Absolute speed | Output size |
+    | :----------------- | ------: | ----------------: | -------------: | ----------: |
+    | esbuild            |   0.36s |                1x |  1520.7 kloc/s |      5.82mb |
+    | esbuild (1 thread) |   1.25s |                4x |   438.0 kloc/s |      5.82mb |
+    | rollup + terser    |  36.06s |              100x |    15.2 kloc/s |      5.80mb |
+    | webpack            |  44.74s |              124x |    12.2 kloc/s |      5.97mb |
+    | fuse-box@next      |  59.52s |              165x |     9.2 kloc/s |      6.34mb |
+    | parcel             | 121.18s |              337x |     4.5 kloc/s |      5.89mb |
 
-    Each time reported is the best of three runs. I'm running esbuild with `--bundle --minify --sourcemap`. I used the `rollup-plugin-terser` plugin because Rollup itself doesn't support minification. Webpack uses `--mode=production --devtool=sourcemap`. Parcel uses the default options. FuseBox is configured with `useSingleBundle: true`. Absolute speed is based on the total line count including comments and blank lines, which is currently 547,441. The tests were done on a 6-core 2019 MacBook Pro with 16gb of RAM.
+    Each time reported is the best of three runs. I'm running esbuild with `--bundle --minify --sourcemap` (the single-threaded version uses `GOMAXPROCS=1`). I used the `rollup-plugin-terser` plugin because Rollup itself doesn't support minification. Webpack uses `--mode=production --devtool=sourcemap`. Parcel uses the default options. FuseBox is configured with `useSingleBundle: true`. Absolute speed is based on the total line count including comments and blank lines, which is currently 547,441. The tests were done on a 6-core 2019 MacBook Pro with 16gb of RAM.
+
+    Caveats:
+
+    * Parcel: The bundle crashes at run time with `TypeError: Cannot redefine property: dynamic`
+    * FuseBox: The line numbers in source maps appear to be off by one
 
 * #### TypeScript benchmark
 
   This benchmark uses the [Rome](https://github.com/facebookexperimental/rome) build tool to approximate a large TypeScript codebase. All code must be combined into a single minified bundle with source maps and the resulting bundle must work correctly. The benchmark can be run with `make bench-rome`.
 
-    | Bundler         |    Time | Relative slowdown | Absolute speed | Output size |
-    | :-------------- | ------: | ----------------: | -------------: | ----------: |
-    | esbuild         |   0.13s |                1x |  1014.1 kloc/s |      0.99mb |
-    | parcel          |  15.89s |              122x |     8.3 kloc/s |      1.50mb |
-    | webpack         |  18.37s |              141x |     7.2 kloc/s |      1.22mb |
+    | Bundler            |    Time | Relative slowdown | Absolute speed | Output size |
+    | :----------------- | ------: | ----------------: | -------------: | ----------: |
+    | esbuild            |   0.10s |                1x |  1287.5 kloc/s |      0.98mb |
+    | esbuild (1 thread) |   0.32s |                3x |   412.0 kloc/s |      0.98mb |
+    | parcel             |  16.77s |              168x |     7.9 kloc/s |      1.55mb |
+    | webpack            |  18.67s |              187x |     7.1 kloc/s |      1.26mb |
 
-    Each time reported is the best of three runs. I'm running esbuild with `--bundle --minify --sourcemap --platform=node`. Webpack uses `ts-loader` with `transpileOnly: true` and `--mode=production --devtool=sourcemap`. Parcel uses `--target node --bundle-node-modules`. Absolute speed is based on the total line count including comments and blank lines, which is currently 131,836. The tests were done on a 6-core 2019 MacBook Pro with 16gb of RAM.
+    Each time reported is the best of three runs. I'm running esbuild with `--bundle --minify --sourcemap --platform=node` (the single-threaded version uses `GOMAXPROCS=1`). Webpack uses `ts-loader` with `transpileOnly: true` and `--mode=production --devtool=sourcemap`. Parcel uses `--target node --bundle-node-modules`. Absolute speed is based on the total line count including comments and blank lines, which is currently 131,836. The tests were done on a 6-core 2019 MacBook Pro with 16gb of RAM.
 
     The results don't include Rollup because I couldn't get it to work. I tried `rollup-plugin-typescript`, `@rollup/plugin-typescript`, and `@rollup/plugin-sucrase` and they all didn't work for different reasons relating to TypeScript compilation. And I'm not familiar with FuseBox so I'm not sure how work around build failures due to the use of builtin node modules.
 
@@ -55,21 +71,49 @@ Several reasons:
 
 ## Status
 
+#### Similar tools:
+
+* [Webpack](https://github.com/webpack/webpack), [Rollup](https://github.com/rollup/rollup), or [Parcel](https://github.com/parcel-bundler/parcel) for bundling
+* [Babel](https://github.com/babel/babel) or [TypeScript](https://github.com/microsoft/TypeScript) for transpiling
+* [Terser](https://github.com/terser/terser) or [UglifyJS](https://github.com/mishoo/UglifyJS) for minifying
+
+#### Used by:
+
+* [Vite](https://github.com/vuejs/vite)
+* [Snowpack](https://github.com/pikapkg/snowpack)
+* [HUGO](https://github.com/gohugoio/hugo)
+
 #### Currently supported:
 
-* JavaScript and TypeScript syntax
-* CommonJS and ES6 modules
-* JSX-to-JavaScript conversion
-* Bundling with static binding of ES6 modules using `--bundle`
-* Full minification with `--minify` (whitespace, identifiers, and mangling)
-* Full source map support when `--sourcemap` is enabled
-* Compile-time identifier substitutions via `--define`
-* Path substitution using the `browser` field in `package.json`
-* Automatic detection of `baseUrl` in `tsconfig.json`
+Here are some of the main features that esbuild offers (a non-exhaustive list):
 
-#### Syntax support:
+* Loaders:
+    * JavaScript/JSX ([more details](#javascript-syntax-support))
+    * TypeScript/TSX ([more details](#typescript-syntax-support))
+    * JSON
+    * Data (text, base64, binary, data URL, file)
+* Minification
+    * Remove whitespace
+    * Shorten identifiers
+    * Compress syntax
+* Bundling
+    * Scope hoisting for ES6 modules
+    * Respects `browser` overrides in `package.json`
+* Tree shaking
+    * Respects `sideEffects` in `package.json`
+    * Respects `/* @__PURE__ */` annotations
+* Output formats
+    * CommonJS
+    * IIFE
+    * ES6 module (supports code splitting)
+* Source map generation
+* Transpilation of JSX and newer JS syntax down to ES6
+* Compile-time name substitution with `--define`
+* Bundle metadata in JSON format for analysis
 
-Syntax transforms convert newer JavaScript syntax to older JavaScript syntax for use with older browsers. You can set the language target with the `--target` flag, which goes back as far as ES6. Note that if you use a syntax feature that esbuild doesn't yet have support for transforming to your current language target, esbuild will still build successfully but will generate a warning where the unsupported syntax is used and will pass the syntax through un-transformed.
+#### JavaScript syntax support:
+
+Syntax transforms convert newer JavaScript syntax to older JavaScript syntax for use with older browsers. You can set the language target with the `--target` flag, which goes back as far as ES6. You can also set `--target` to a comma-separated list of browsers and versions (e.g. `--target=chrome58,firefox57,safari11,edge16`). Note that if you use a syntax feature that esbuild doesn't yet have support for transforming to your current language target, esbuild will generate an error where the unsupported syntax is used.
 
 These syntax features are always transformed for older browsers:
 
@@ -80,36 +124,122 @@ These syntax features are always transformed for older browsers:
 
 These syntax features are conditionally transformed for older browsers depending on the configured language target:
 
-| Syntax transform                                                                    | Transformed when `--target` is below | Example              |
-|-------------------------------------------------------------------------------------|--------------------------------------|----------------------|
-| [Exponentiation operator](https://github.com/tc39/proposal-exponentiation-operator) | `es2016`                             | `a ** b`             |
-| [Spread properties](https://github.com/tc39/proposal-object-rest-spread)            | `es2018`                             | `let x = {...y}`     |
-| [Optional catch binding](https://github.com/tc39/proposal-optional-catch-binding)   | `es2019`                             | `try {} catch {}`    |
-| [Optional chaining](https://github.com/tc39/proposal-optional-chaining)             | `es2020`                             | `a?.b`               |
-| [Nullish coalescing](https://github.com/tc39/proposal-nullish-coalescing)           | `es2020`                             | `a ?? b`             |
-| [Class instance fields](https://github.com/tc39/proposal-class-fields)              | `esnext`                             | `class { x }`        |
-| [Static class fields](https://github.com/tc39/proposal-static-class-features/)      | `esnext`                             | `class { static x }` |
+| Syntax transform                                                                    | Transformed when `--target` is below | Example                    |
+|-------------------------------------------------------------------------------------|--------------------------------------|----------------------------|
+| [Exponentiation operator](https://github.com/tc39/proposal-exponentiation-operator) | `es2016`                             | `a ** b`                   |
+| [Async functions](https://github.com/tc39/ecmascript-asyncawait)                    | `es2017`                             | `async () => {}`           |
+| [Spread properties](https://github.com/tc39/proposal-object-rest-spread)            | `es2018`                             | `let x = {...y}`           |
+| [Rest properties](https://github.com/tc39/proposal-object-rest-spread)              | `es2018`                             | `let {...x} = y`           |
+| [Optional catch binding](https://github.com/tc39/proposal-optional-catch-binding)   | `es2019`                             | `try {} catch {}`          |
+| [Optional chaining](https://github.com/tc39/proposal-optional-chaining)             | `es2020`                             | `a?.b`                     |
+| [Nullish coalescing](https://github.com/tc39/proposal-nullish-coalescing)           | `es2020`                             | `a ?? b`                   |
+| [`import.meta`](https://github.com/tc39/proposal-import-meta)                       | `es2020`                             | `import.meta`              |
+| [Class instance fields](https://github.com/tc39/proposal-class-fields)              | `esnext`                             | `class { x }`              |
+| [Static class fields](https://github.com/tc39/proposal-static-class-features)       | `esnext`                             | `class { static x }`       |
+| [Private instance methods](https://github.com/tc39/proposal-private-methods)        | `esnext`                             | `class { #x() {} }`        |
+| [Private instance fields](https://github.com/tc39/proposal-class-fields)            | `esnext`                             | `class { #x }`             |
+| [Private static methods](https://github.com/tc39/proposal-static-class-features)    | `esnext`                             | `class { static #x() {} }` |
+| [Private static fields](https://github.com/tc39/proposal-static-class-features)     | `esnext`                             | `class { static #x }`      |
+| [Logical assignment operators](https://github.com/tc39/proposal-logical-assignment) | `esnext`                             | `a ??= b`                  |
+
+<details>
+<summary>Syntax transform caveats (click to expand)</summary>
+
+* **Nullish coalescing correctness**
+
+    By default `a ?? b` is transformed into `a != null ? a : b`, which works because `a != null` is only false if `a` is `null` or `undefined`. However, there's exactly one obscure edge case where this doesn't work. For legacy reasons, the value of `document.all` is special-cased such that `document.all != null` is false. If you need to use this value with the nullish coalescing operator, you should enable `--strict:nullish-coalescing` transforms so `a ?? b` becomes `a !== null && a !== void 0 ? a : b` instead, which works correctly with `document.all`. The strict transform isn't done by default because it causes code bloat for an obscure edge case that shouldn't matter in modern code.
+
+* **Class field correctness**
+
+    Class fields look like this:
+
+    ```js
+    class Foo {
+      foo = 123
+    }
+    ```
+
+    By default, the transform for class fields uses a normal assignment for initialization. That looks like this:
+
+    ```js
+    class Foo {
+      constructor() {
+        this.foo = 123;
+      }
+    }
+    ```
+
+    This doesn't increase code size by much and stays on the heavily-optimized path for modern JavaScript JITs. It also matches the default behavior of the TypeScript compiler. However, this doesn't exactly follow the initialization behavior in the JavaScript specification. For example, it can cause a setter to be called if one exists with that property name, which isn't supposed to happen. A more accurate transformation would be to use `Object.defineProperty()` instead like this:
+
+    ```js
+    class Foo {
+      constructor() {
+        Object.defineProperty(this, "foo", {
+          enumerable: true,
+          configurable: true,
+          writable: true,
+          value: 123
+        });
+      }
+    }
+    ```
+
+    This increases code size and decreases performance, but follows the JavaScript specification more accurately. If you need this accuracy, you should either enable the `--strict:class-fields` option or add the `useDefineForClassFields` flag to your `tsconfig.json` file.
+
+* **Private member performance**
+
+    This transform uses `WeakMap` and `WeakSet` to preserve the privacy properties of this feature, similar to the corresponding transforms in the Babel and TypeScript compilers. Most modern JavaScript engines (V8, JavaScriptCore, and SpiderMonkey but not ChakraCore) may not have good performance characteristics for large `WeakMap` and `WeakSet` objects. Creating many instances of classes with private fields or private methods with this syntax transform active may cause a lot of overhead for the garbage collector. This is because modern engines (other than ChakraCore) store weak values in an actual map object instead of as hidden properties on the keys themselves, and large map objects can cause performance issues with garbage collection. See [this reference](https://github.com/tc39/ecma262/issues/1657#issuecomment-518916579) for more information.
+
+Note that if you want to enable strictness for all transforms, you can just pass `--strict` instead of using `--strict:...` for each transform.
+</details>
 
 These syntax features are currently always passed through un-transformed:
 
-| Syntax transform                                                           | Unsupported when `--target` is below | Example                     |
-|----------------------------------------------------------------------------|--------------------------------------|-----------------------------|
-| [Async functions](https://github.com/tc39/ecmascript-asyncawait)           | `es2017`                             | `async () => {}`            |
-| [Rest properties](https://github.com/tc39/proposal-object-rest-spread)     | `es2018`                             | `let {...x} = y`            |
-| [Asynchronous Iteration](https://github.com/tc39/proposal-async-iteration) | `es2018`                             | `for await (let x of y) {}` |
-| [BigInt](https://github.com/tc39/proposal-bigint)                          | `es2020`                             | `123n`                      |
-| [Hashbang grammar](https://github.com/tc39/proposal-hashbang)              | `esnext`                             | `#!/usr/bin/env node`       |
+| Syntax transform                                                                    | Unsupported when `--target` is below | Example                     |
+|-------------------------------------------------------------------------------------|--------------------------------------|-----------------------------|
+| [Asynchronous iteration](https://github.com/tc39/proposal-async-iteration)          | `es2018`                             | `for await (let x of y) {}` |
+| [Async generators](https://github.com/tc39/proposal-async-iteration)                | `es2018`                             | `async function* foo() {}`  |
+| [BigInt](https://github.com/tc39/proposal-bigint)                                   | `es2020`                             | `123n`                      |
+| [Hashbang grammar](https://github.com/tc39/proposal-hashbang)                       | `esnext`                             | `#!/usr/bin/env node`       |
 
 These syntax features are not yet supported, and currently cannot be parsed:
 
-| Syntax transform                                                                             | Language version | Example               |
-|----------------------------------------------------------------------------------------------|------------------|-----------------------|
-| [Private instance methods](https://github.com/tc39/proposal-private-methods)                 | `esnext`         | `class { #x() {} }`   |
-| [Private instance fields](https://github.com/tc39/proposal-class-fields)                     | `esnext`         | `class { #x }`        |
-| [Private static fields and methods](https://github.com/tc39/proposal-static-class-features/) | `esnext`         | `class { static #x }` |
-| [Logical assignment operators](https://github.com/tc39/proposal-logical-assignment)          | `esnext`         | `a ??= b`             |
+| Syntax transform                                                    | Language version | Example           |
+|---------------------------------------------------------------------|------------------|-------------------|
+| [Top-level await](https://github.com/tc39/proposal-top-level-await) | `esnext`         | `await import(x)` |
 
 See also [the list of finished ECMAScript proposals](https://github.com/tc39/proposals/blob/master/finished-proposals.md) and [the list of active ECMAScript proposals](https://github.com/tc39/proposals/blob/master/README.md).
+
+#### TypeScript syntax support:
+
+TypeScript files are transformed by removing type annotations and converting TypeScript-only syntax features to JavaScript code. This section documents the support of TypeScript-only syntax features. Please refer to the [previous section](#javascript-syntax-support) for support of JavaScript syntax features, which also applies in TypeScript files.
+
+*Note that esbuild does not do any type checking. You will still want to run type checking using something like `tsc -noEmit`.*
+
+These TypeScript-only syntax features are supported, and are always converted to JavaScript (a non-exhaustive list):
+
+| Syntax feature          | Example                    | Notes |
+|-------------------------|----------------------------|-------|
+| Namespaces              | `namespace Foo {}`         | |
+| Enums                   | `enum Foo { A, B }`        | |
+| Const enums             | `const enum Foo { A, B }`  | Behaves the same as regular enums |
+| Generic type parameters | `<T>(a: T): T => a`        | |
+| JSX with types          | `<Element<T>/>`            | |
+| Type casts              | `a as B` and `<B>a`        | |
+| Type imports            | `import {Type} from 'foo'` | Handled by removing all unused imports |
+| Type exports            | `export {Type} from 'foo'` | Handled by ignoring missing exports in TypeScript files |
+| Experimental decorators | `@sealed class Foo {}`     | The `emitDecoratorMetadata` flag is not supported |
+
+These TypeScript-only syntax features are parsed and ignored (a non-exhaustive list):
+
+| Syntax feature         | Example                         |
+|------------------------|---------------------------------|
+| Interface declarations | `interface Foo {}`              |
+| Type declarations      | `type Foo = number`             |
+| Function declarations  | `function foo(): void;`         |
+| Ambient declarations   | `declare module 'foo' {}`       |
+| Type-only imports      | `import type {Type} from 'foo'` |
+| Type-only exports      | `export type {Type} from 'foo'` |
 
 #### Disclaimers:
 
@@ -119,13 +249,9 @@ See also [the list of finished ECMAScript proposals](https://github.com/tc39/pro
 
 * This project is still pretty early and I'd like to keep the scope relatively focused, at least for now. I'm trying to create a build tool that a) works well for a given sweet spot of use cases and b) resets the expectations of the community for what it means for a JavaScript build tool to be fast. I'm not trying to create an extremely flexible build system that can build anything.
 
-    That said, esbuild now has a [JavaScript API](#transforming-a-file) that exposes some of its transform code. This means it can be used as a library to minify JavaScript, convert TypeScript/JSX to JavaScript, or convert newer JavaScript to older JavaScript. So even if esbuild doesn't support a particular technology, it's possible that esbuild can still be integrated as a library to help speed it up. For example, [Vite](https://github.com/vuejs/vite) recently started using esbuild's transform library to add support for TypeScript (the official TypeScript compiler was too slow).
+    That said, esbuild now has a [JavaScript API](docs/js-api.md) and a [Go API](https://godoc.org/github.com/evanw/esbuild/pkg/api). This can be used as a library to minify JavaScript, convert TypeScript/JSX to JavaScript, or convert newer JavaScript to older JavaScript. So even if esbuild doesn't support a particular technology, it's possible that esbuild can still be integrated as a library to help speed it up. For example, [Vite](https://github.com/vuejs/vite) and [Snowpack](https://github.com/pikapkg/snowpack) recently started using esbuild's transform library to add support for TypeScript (the official TypeScript compiler was too slow).
 
-* I'm mainly looking for feedback at the moment, not contributions. The project is early and I'm still working toward an MVP bundler that can reasonably replace real-world toolchains. There are still major fundamental pieces that haven't been put in place yet (e.g. CSS support, watch mode, tree shaking, code splitting) and they all need to work well together to have best-in-class performance.
-
-* The Go code in this repo isn't intended to be built upon. Go is just an implementation detail of how I built this tool. The stable interfaces for this project are the command-line API and the JavaScript API, not the internal Go code. I'm may change the internals in a backwards-incompatible way at any time to improve performance or introduce new features.
-
-There is now some documentation about the architecture and about certain subtleties in the code here: [docs/architecture.md](docs/architecture.md). I hope it will be helpful for those interested in learning more about how the code works.
+* I'm mainly looking for feedback at the moment, not contributions. The project is early and I'm still working toward an MVP bundler that can reasonably replace real-world toolchains. There are still major fundamental pieces that haven't been put in place yet (e.g. CSS support, watch mode, code splitting) and they all need to work well together to have best-in-class performance.
 
 ## Install
 
@@ -157,7 +283,60 @@ A prebuilt binary can be installed using npm:
 
 The `esbuild` package should work on 64-bit macOS, Linux, and Windows systems. It contains an install script that downloads the appropriate package for the current platform. If the install script isn't working or you need to run esbuild on an unsupported platform, there is a fallback WebAssembly package called [esbuild-wasm](https://npmjs.com/package/esbuild-wasm) that should work on all platforms.
 
-For development, the executable can be built by running `make` (assuming you have the Go language toolchain installed).
+<details>
+<summary>Other installation methods (click to expand)</summary><br>
+
+The binary is only hosted on npm for convenience. Since esbuild is a native binary, it's not necessary to install npm to use esbuild.
+
+### Download using HTTP
+
+The binary can be downloaded from the npm registry directly over HTTP without needing to install npm first.
+
+* For Linux (the binary will be `./package/bin/esbuild`):
+
+    ```
+    curl -O https://registry.npmjs.org/esbuild-linux-64/-/esbuild-linux-64-0.0.0.tgz
+    tar xf ./esbuild-linux-64-0.0.0.tgz
+    ```
+
+* For macOS (the binary will be `./package/bin/esbuild`):
+
+    ```
+    curl -O https://registry.npmjs.org/esbuild-darwin-64/-/esbuild-darwin-64-0.0.0.tgz
+    tar xf ./esbuild-darwin-64-0.0.0.tgz
+    ```
+
+* For Windows (the binary will be `./package/esbuild.exe`):
+
+    ```
+    curl -O https://registry.npmjs.org/esbuild-windows-64/-/esbuild-windows-64-0.0.0.tgz
+    tar xf ./esbuild-windows-64-0.0.0.tgz
+    ```
+
+Substitute `0.0.0` for the version of esbuild that you want to download.
+
+### Install using Go
+
+If you have the Go compiler toolchain installed, you can use it to install the `esbuild` command globally:
+
+```
+GO111MODULE=on go get github.com/evanw/esbuild/cmd/esbuild@v0.0.0
+```
+
+The binary will be placed in Go's global binary directory (the directory called `bin` located inside the directory returned by `go env GOPATH`). You may need to add that `bin` directory to your `PATH`. Substitute `v0.0.0` for the version of esbuild that you want to build.
+
+### Build from source
+
+You can also build esbuild from source:
+
+```
+git clone --depth 1 --branch v0.0.0 https://github.com/evanw/esbuild.git
+cd esbuild
+go build ./cmd/esbuild
+```
+
+This will create a binary called `esbuild` (`esbuild.exe` on Windows) in the current directory. Substitute `v0.0.0` for the version of esbuild that you want to build.
+</details>
 
 ## Command-line usage
 
@@ -168,17 +347,17 @@ Usage:
   esbuild [options] [entry points]
 
 Options:
-  --name=...            The name of the module
   --bundle              Bundle all dependencies into the output files
   --outfile=...         The output file (for one entry point)
   --outdir=...          The output directory (for multiple entry points)
   --sourcemap           Emit a source map
-  --error-limit=...     Maximum error count or 0 to disable (default 10)
-  --target=...          Language target (default esnext)
+  --target=...          Environment target (e.g. es2017, chrome80)
   --platform=...        Platform target (browser or node, default browser)
   --external:M          Exclude module M from the bundle
-  --format=...          Output format (iife or cjs)
+  --format=...          Output format (iife, cjs, esm)
+  --splitting           Enable code splitting (currently only for esm)
   --color=...           Force use of color terminal escapes (true or false)
+  --global-name=...     The name of the global for the IIFE format
 
   --minify              Sets all --minify-* flags
   --minify-whitespace   Remove whitespace
@@ -189,11 +368,22 @@ Options:
   --jsx-factory=...     What to use instead of React.createElement
   --jsx-fragment=...    What to use instead of React.Fragment
   --loader:X=L          Use loader L to load file extension X, where L is
-                        one of: js, jsx, ts, tsx, json, text, base64
+                        one of: js, jsx, ts, tsx, json, text, base64, file,
+                        dataurl, binary
 
-  --trace=...           Write a CPU trace to this file
-  --cpuprofile=...      Write a CPU profile to this file
-  --version             Print the current version and exit
+Advanced options:
+  --version                 Print the current version and exit
+  --sourcemap=inline        Emit the source map with an inline data URL
+  --sourcemap=external      Do not link to the source map with a comment
+  --sourcefile=...          Set the source file for the source map (for stdin)
+  --error-limit=...         Maximum error count or 0 to disable (default 10)
+  --log-level=...           Disable logging (info, warning, error, silent)
+  --resolve-extensions=...  A comma-separated list of implicit extensions
+  --metafile=...            Write metadata about the build to a JSON file
+  --strict                  Transforms handle edge cases but have more overhead
+  --pure=N                  Mark the name N as a pure function for tree shaking
+  --tsconfig=...            Use this tsconfig.json file instead of other ones
+  --out-extension:.js=.mjs  Use a custom output extension instead of ".js"
 
 Examples:
   # Produces dist/entry_point.js and dist/entry_point.js.map
@@ -206,69 +396,8 @@ Examples:
   esbuild example.js --outfile=out.js --define:RELEASE=true
 
   # Provide input via stdin, get output via stdout
-  esbuild --minify < input.js > output.js
+  esbuild --minify --loader=ts < input.ts > output.js
 ```
-
-## JavaScript API usage
-
-The `esbuild` npm package also exposes a JavaScript API that can be used to invoke the command-line tool from JavaScript.
-
-### Running a build
-
-The `build()` API is the same as invoking the command-line tool. It reads from files on disk and writes back to files on disk. Using this API can be more convenient than managing a lot of command-line flags and also works on all platforms, unlike shell scripts. This is similar to "config files" from other bundlers.
-
-Example build script:
-
-```js
-const { build } = require('esbuild')
-
-const options = {
-  stdio: 'inherit',
-  entryPoints: ['./src/main.ts'],
-  outfile: './dist/main.js',
-  minify: true,
-  bundle: true,
-}
-
-build(options).catch(() => process.exit(1))
-```
-
-See [the TypeScript type definitions](./npm/esbuild/lib/main.d.ts) for the complete set of options.
-
-### Transforming a file
-
-The `transform()` API transforms a single file in memory. It can be used to minify JavaScript, convert TypeScript/JSX to JavaScript, or convert newer JavaScript to older JavaScript. It's roughly equivalent to running `build()` on a single file with `bundle: false`.
-
-To access this API you need to start a service, which is a long-lived `esbuild` child process that is then reused. You can use the service to transform many files without the overhead of starting up a new child process each time.
-
-Example usage:
-
-```js
-(async () => {
-  const jsx = `
-    import * as React from 'react'
-    import * as ReactDOM from 'react-dom'
-
-    ReactDOM.render(
-      <h1>Hello, world!</h1>,
-      document.getElementById('root')
-    );
-  `
-
-  // Start the esbuild child process once
-  const esbuild = require('esbuild')
-  const service = await esbuild.startService()
-
-  // This can be called many times without the overhead of starting a service
-  const { js } = await service.transform(jsx, { loader: 'jsx' })
-  console.log(js)
-
-  // The child process can be explicitly killed when it's no longer needed
-  service.stop()
-})()
-```
-
-See [the TypeScript type definitions](./npm/esbuild/lib/main.d.ts) for the complete set of options.
 
 ## Using with React
 
@@ -276,7 +405,7 @@ To use esbuild with [React](https://reactjs.org/):
 
 * Either put all JSX syntax in `.jsx` files instead of `.js` files, or use `--loader:.js=jsx` to use the JSX loader for `.js` files.
 
-* If you're using TypeScript, pass esbuild your `.tsx` file as the entry point. There should be no need to convert TypeScript files to JavaScript first because because esbuild parses TypeScript syntax itself.
+* If you're using TypeScript, pass esbuild your `.tsx` file as the entry point. There should be no need to convert TypeScript files to JavaScript first because esbuild parses TypeScript syntax itself.
 
     *Note that esbuild does not do any type checking, so you'll want to run `tsc -noEmit` in parallel to check types.*
 
@@ -284,7 +413,7 @@ To use esbuild with [React](https://reactjs.org/):
 
     *Note that the double quotes around `"production"` are important because the replacement should be a string, not an identifier. The outer single quotes are for escaping the double quotes in Bash but may not be necessary in other shells.*
 
-* If you're using [Preact](https://preactjs.com/) instead of React, you'll also need to pass `--jsx-factory=preact.h --jsx-fragment=preact.Fragment` to esbuild on the command line.
+* If you're using [Preact](https://preactjs.com/) instead of React, you'll need to configure the JSX factory. You can either pass `--jsx-factory=preact.h --jsx-fragment=preact.Fragment` to esbuild on the command line, or add `"jsxFactory": "preact.h", "jsxFragmentFactory": "preact.Fragment"` to your `tsconfig.json` file.
 
 For example, if you have a file called `example.tsx` with the following contents:
 

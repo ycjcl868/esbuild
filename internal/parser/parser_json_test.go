@@ -4,25 +4,22 @@ import (
 	"fmt"
 	"testing"
 
+	"github.com/evanw/esbuild/internal/ast"
 	"github.com/evanw/esbuild/internal/logging"
 	"github.com/evanw/esbuild/internal/printer"
+	"github.com/evanw/esbuild/internal/test"
 )
 
 func expectParseErrorJSON(t *testing.T, contents string, expected string) {
 	t.Run(contents, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
-		ParseJSON(log, logging.Source{
-			Index:        0,
-			AbsolutePath: "<stdin>",
-			PrettyPath:   "<stdin>",
-			Contents:     contents,
-		}, ParseJSONOptions{})
-		msgs := join()
+		log := logging.NewDeferLog()
+		ParseJSON(log, test.SourceForTest(contents), ParseJSONOptions{})
+		msgs := log.Done()
 		text := ""
 		for _, msg := range msgs {
 			text += msg.String(logging.StderrOptions{}, logging.TerminalInfo{})
 		}
-		assertEqual(t, text, expected)
+		test.AssertEqual(t, text, expected)
 	})
 }
 
@@ -31,51 +28,41 @@ func expectParseErrorJSON(t *testing.T, contents string, expected string) {
 // bundles, not JSON bundles.
 func expectPrintedJSON(t *testing.T, contents string, expected string) {
 	t.Run(contents, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
-		expr, ok := ParseJSON(log, logging.Source{
-			Index:        0,
-			AbsolutePath: "<stdin>",
-			PrettyPath:   "<stdin>",
-			Contents:     contents,
-		}, ParseJSONOptions{})
-		msgs := join()
+		log := logging.NewDeferLog()
+		expr, ok := ParseJSON(log, test.SourceForTest(contents), ParseJSONOptions{})
+		msgs := log.Done()
 		text := ""
 		for _, msg := range msgs {
 			text += msg.String(logging.StderrOptions{}, logging.TerminalInfo{})
 		}
-		assertEqual(t, text, "")
+		test.AssertEqual(t, text, "")
 		if !ok {
 			t.Fatal("Parse error")
 		}
-		js := printer.PrintExpr(expr, nil, printer.PrintOptions{
+		js := printer.PrintExpr(expr, ast.SymbolMap{}, printer.PrintOptions{
 			RemoveWhitespace: true,
 		}).JS
-		assertEqual(t, string(js), expected)
+		test.AssertEqual(t, string(js), expected)
 	})
 }
 
 func expectPrintedJSONWithWarning(t *testing.T, contents string, warning string, expected string) {
 	t.Run(contents, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
-		expr, ok := ParseJSON(log, logging.Source{
-			Index:        0,
-			AbsolutePath: "<stdin>",
-			PrettyPath:   "<stdin>",
-			Contents:     contents,
-		}, ParseJSONOptions{})
-		msgs := join()
+		log := logging.NewDeferLog()
+		expr, ok := ParseJSON(log, test.SourceForTest(contents), ParseJSONOptions{})
+		msgs := log.Done()
 		text := ""
 		for _, msg := range msgs {
 			text += msg.String(logging.StderrOptions{}, logging.TerminalInfo{})
 		}
-		assertEqual(t, text, warning)
+		test.AssertEqual(t, text, warning)
 		if !ok {
 			t.Fatal("Parse error")
 		}
-		js := printer.PrintExpr(expr, nil, printer.PrintOptions{
+		js := printer.PrintExpr(expr, ast.SymbolMap{}, printer.PrintOptions{
 			RemoveWhitespace: true,
 		}).JS
-		assertEqual(t, string(js), expected)
+		test.AssertEqual(t, string(js), expected)
 	})
 }
 
@@ -147,8 +134,8 @@ func TestJSONNumber(t *testing.T) {
 	expectPrintedJSON(t, "123.456", "123.456")
 	expectPrintedJSON(t, ".123", ".123")
 	expectPrintedJSON(t, "-.123", "-.123")
-	expectPrintedJSON(t, "123e20", "1.23e22")
-	expectPrintedJSON(t, "123e-20", "1.23e-18")
+	expectPrintedJSON(t, "123e20", "123e20")
+	expectPrintedJSON(t, "123e-20", "123e-20")
 	expectParseErrorJSON(t, "NaN", "<stdin>: error: Unexpected \"NaN\"\n")
 	expectParseErrorJSON(t, "Infinity", "<stdin>: error: Unexpected \"Infinity\"\n")
 	expectParseErrorJSON(t, "-Infinity", "<stdin>: error: Expected number but found \"Infinity\"\n")

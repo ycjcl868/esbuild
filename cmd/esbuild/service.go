@@ -6,44 +6,56 @@
 package main
 
 import (
-	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
+	"io/ioutil"
 	"os"
 	"runtime/debug"
+	"sync"
 
-	"github.com/evanw/esbuild/internal/bundler"
-	"github.com/evanw/esbuild/internal/fs"
-	"github.com/evanw/esbuild/internal/logging"
-	"github.com/evanw/esbuild/internal/printer"
-	"github.com/evanw/esbuild/internal/resolver"
+	"github.com/evanw/esbuild/pkg/api"
+	"github.com/evanw/esbuild/pkg/cli"
 )
 
-type responseType = map[string][]byte
+type responseCallback = func(interface{})
 
-func readUint32(bytes []byte) (value uint32, leftOver []byte, ok bool) {
-	if len(bytes) >= 4 {
-		return binary.LittleEndian.Uint32(bytes), bytes[4:], true
-	}
-
-	return 0, bytes, false
+type serviceType struct {
+	mutex           sync.Mutex
+	callbacks       map[uint32]responseCallback
+	nextID          uint32
+	outgoingPackets chan outgoingPacket
 }
 
-func readLengthPrefixedSlice(bytes []byte) (slice []byte, leftOver []byte, ok bool) {
-	if length, afterLength, ok := readUint32(bytes); ok && uint(len(afterLength)) >= uint(length) {
-		return afterLength[:length], afterLength[length:], true
-	}
-
-	return []byte{}, bytes, false
+type outgoingPacket struct {
+	bytes   []byte
+	isFinal bool
 }
 
 func runService() {
-	buffer := make([]byte, 4096)
+	service := serviceType{
+		callbacks:       make(map[uint32]responseCallback),
+		outgoingPackets: make(chan outgoingPacket),
+	}
+	buffer := make([]byte, 16*1024)
 	stream := []byte{}
 
-	// Write responses on a single goroutine so they aren't interleaved
-	responses := make(chan responseType)
-	go writeResponses(responses)
+	// Write messages on a single goroutine so they aren't interleaved
+	waitGroup := &sync.WaitGroup{}
+	go func() {
+		for {
+			message, ok := <-service.outgoingPackets
+			if !ok {
+				break // No more messages
+			}
+			os.Stdout.Write(message.bytes)
+
+			// Only signal that this request is done when it has actually been written
+			if message.isFinal {
+				waitGroup.Done()
+			}
+		}
+	}()
 
 	for {
 		// Read more data from stdin
@@ -56,233 +68,258 @@ func runService() {
 		}
 		stream = append(stream, buffer[:n]...)
 
-		// Process all complete (i.e. not partial) requests
+		// Process all complete (i.e. not partial) messages
 		bytes := stream
 		for {
-			request, afterRequest, ok := readLengthPrefixedSlice(bytes)
+			message, afterMessage, ok := readLengthPrefixedSlice(bytes)
 			if !ok {
 				break
 			}
-			bytes = afterRequest
+			bytes = afterMessage
 
 			// Clone the input and run it on another goroutine
-			clone := append([]byte{}, request...)
-			go handleRequest(clone, responses)
+			clone := append([]byte{}, message...)
+			waitGroup.Add(1)
+			go func() {
+				if result := service.handleIncomingMessage(clone); result != nil {
+					service.outgoingPackets <- outgoingPacket{bytes: result, isFinal: true}
+				} else {
+					waitGroup.Done()
+				}
+			}()
 		}
 
-		// Move the remaining partial request to the end to avoid reallocating
+		// Move the remaining partial message to the end to avoid reallocating
 		stream = append(stream[:0], bytes...)
 	}
+
+	// Wait for the last response to be written to stdout
+	waitGroup.Wait()
 }
 
-func writeUint32(value uint32) {
-	bytes := []byte{0, 0, 0, 0}
-	binary.LittleEndian.PutUint32(bytes, value)
-	os.Stdout.Write(bytes)
-}
-
-func writeResponses(responses chan responseType) {
-	for {
-		response := <-responses
-
-		// Each response is length-prefixed
-		length := 4
-		for k, v := range response {
-			length += 4 + len(k) + 4 + len(v)
-		}
-		writeUint32(uint32(length))
-
-		// Each response is formatted as a series of key/value pairs
-		writeUint32(uint32(len(response)))
-		for k, v := range response {
-			writeUint32(uint32(len(k)))
-			os.Stdout.Write([]byte(k))
-			writeUint32(uint32(len(v)))
-			os.Stdout.Write(v)
-		}
+func (service *serviceType) sendRequest(request interface{}) interface{} {
+	result := make(chan interface{})
+	var id uint32
+	callback := func(response interface{}) {
+		result <- response
+		close(result)
 	}
+	id = func() uint32 {
+		service.mutex.Lock()
+		defer service.mutex.Unlock()
+		id := service.nextID
+		service.nextID++
+		service.callbacks[id] = callback
+		return id
+	}()
+	service.outgoingPackets <- outgoingPacket{
+		bytes: encodePacket(packet{
+			id:        id,
+			isRequest: true,
+			value:     request,
+		}),
+	}
+	return <-result
 }
 
-func handleRequest(bytes []byte, responses chan responseType) {
-	// Read the argument count
-	argCount, bytes, ok := readUint32(bytes)
+func (service *serviceType) handleIncomingMessage(bytes []byte) (result []byte) {
+	p, ok := decodePacket(bytes)
 	if !ok {
-		return // Invalid request
+		return nil
 	}
 
-	// Read the arguments
-	rawArgs := []string{}
-	for i := uint32(0); i < argCount; i++ {
-		slice, afterSlice, ok := readLengthPrefixedSlice(bytes)
-		if !ok {
-			return // Invalid request
-		}
-		rawArgs = append(rawArgs, string(slice))
-		bytes = afterSlice
-	}
-	if len(rawArgs) < 2 {
-		return // Invalid request
-	}
-
-	// Requests have the format "id command [args...]"
-	id, command, rawArgs := rawArgs[0], rawArgs[1], rawArgs[2:]
-
-	// Catch panics in the code below so they get passed to the caller
-	defer func() {
-		if r := recover(); r != nil {
-			responses <- responseType{
-				"id":    []byte(id),
-				"error": []byte(fmt.Sprintf("%v\n\n%s", r, debug.Stack())),
+	if p.isRequest {
+		// Catch panics in the code below so they get passed to the caller
+		defer func() {
+			if r := recover(); r != nil {
+				result = encodePacket(packet{
+					id: p.id,
+					value: map[string]interface{}{
+						"error": fmt.Sprintf("Panic: %v\n\n%s", r, debug.Stack()),
+					},
+				})
 			}
+		}()
+
+		// Handle the request
+		data := p.value.([]interface{})
+		switch data[0] {
+		case "build":
+			return service.handleBuildRequest(p.id, data[1].(map[string]interface{}))
+
+		case "transform":
+			return service.handleTransformRequest(p.id, data[1].(map[string]interface{}))
+
+		default:
+			return encodePacket(packet{
+				id: p.id,
+				value: map[string]interface{}{
+					"error": fmt.Sprintf("Invalid command: %s", p.value),
+				},
+			})
 		}
+	}
+
+	callback := func() responseCallback {
+		service.mutex.Lock()
+		defer service.mutex.Unlock()
+		callback := service.callbacks[p.id]
+		delete(service.callbacks, p.id)
+		return callback
 	}()
 
-	// Dispatch the command
-	switch command {
-	case "ping":
-		handlePingRequest(responses, id, rawArgs)
-
-	case "build":
-		handleBuildRequest(responses, id, rawArgs)
-
-	default:
-		responses <- responseType{
-			"id":    []byte(id),
-			"error": []byte(fmt.Sprintf("Invalid command: %s", command)),
-		}
-	}
+	callback(p.value)
+	return nil
 }
 
-func handlePingRequest(responses chan responseType, id string, rawArgs []string) {
-	responses <- responseType{
-		"id": []byte(id),
-	}
+func encodeErrorPacket(id uint32, err error) []byte {
+	return encodePacket(packet{
+		id: id,
+		value: map[string]interface{}{
+			"error": err.Error(),
+		},
+	})
 }
 
-func handleBuildRequest(responses chan responseType, id string, rawArgs []string) {
-	files, rawArgs := stripFilesFromBuildArgs(rawArgs)
-	if files == nil {
-		responses <- responseType{
-			"id":    []byte(id),
-			"error": []byte("Invalid build request"),
-		}
-		return
-	}
+func (service *serviceType) handleBuildRequest(id uint32, request map[string]interface{}) []byte {
+	write := request["write"].(bool)
+	flags := decodeStringArray(request["flags"].([]interface{}))
+	stdin, hasStdin := request["stdin"].(string)
+	resolveDir, hasResolveDir := request["resolveDir"].(string)
 
-	mockFS := fs.MockFS(nil)
-	args, err := parseArgs(mockFS, rawArgs)
+	options, err := cli.ParseBuildOptions(flags)
+	if err == nil && write && options.Outfile == "" && options.Outdir == "" {
+		err = errors.New("Either provide \"outfile\" or set \"write\" to false")
+	}
 	if err != nil {
-		responses <- responseType{
-			"id":    []byte(id),
-			"error": []byte(err.Error()),
+		return encodeErrorPacket(id, err)
+	}
+
+	// Optionally allow input from the stdin channel
+	if hasStdin {
+		if options.Stdin == nil {
+			options.Stdin = &api.StdinOptions{}
 		}
-		return
-	}
-
-	// Make sure we don't accidentally try to read from stdin here
-	if args.bundleOptions.LoaderForStdin != bundler.LoaderNone {
-		responses <- responseType{
-			"id":    []byte(id),
-			"error": []byte("Cannot read from stdin in service mode"),
-		}
-		return
-	}
-
-	// Make sure we don't accidentally try to write to stdout here
-	if args.bundleOptions.WriteToStdout {
-		responses <- responseType{
-			"id":    []byte(id),
-			"error": []byte("Cannot write to stdout in service mode"),
-		}
-		return
-	}
-
-	mockFS = fs.MockFS(files)
-	log, join := logging.NewDeferLog()
-	resolver := resolver.NewResolver(mockFS, log, args.resolveOptions)
-	bundle := bundler.ScanBundle(log, mockFS, resolver, args.entryPaths, args.parseOptions, args.bundleOptions)
-
-	// Stop now if there were errors
-	msgs := join()
-	errors := messagesOfKind(logging.Error, msgs)
-	if len(errors) != 0 {
-		responses <- responseType{
-			"id":       []byte(id),
-			"errors":   messagesToJSON(errors),
-			"warnings": messagesToJSON(messagesOfKind(logging.Warning, msgs)),
-		}
-		return
-	}
-
-	// Generate the results
-	log, join = logging.NewDeferLog()
-	results := bundle.Compile(log, args.bundleOptions)
-
-	// Return the results
-	msgs2 := join()
-	errors = messagesOfKind(logging.Error, msgs2)
-	response := responseType{
-		"id":     []byte(id),
-		"errors": messagesToJSON(errors),
-		"warnings": messagesToJSON(append(
-			messagesOfKind(logging.Warning, msgs),
-			messagesOfKind(logging.Warning, msgs2)...)),
-	}
-	for _, result := range results {
-		response[result.JsAbsPath] = result.JsContents
-		if args.bundleOptions.SourceMap {
-			response[result.SourceMapAbsPath] = result.SourceMapContents
+		options.Stdin.Contents = stdin
+		if hasResolveDir {
+			options.Stdin.ResolveDir = resolveDir
 		}
 	}
-	responses <- response
+
+	options.Write = write
+	result := api.Build(options)
+	response := map[string]interface{}{
+		"errors":   encodeMessages(result.Errors),
+		"warnings": encodeMessages(result.Warnings),
+	}
+
+	if !write {
+		// Pass the output files back to the caller
+		response["outputFiles"] = encodeOutputFiles(result.OutputFiles)
+	}
+
+	return encodePacket(packet{
+		id:    id,
+		value: response,
+	})
 }
 
-func stripFilesFromBuildArgs(args []string) (map[string]string, []string) {
-	for i, arg := range args {
-		if arg == "--" && i%2 == 0 {
-			files := make(map[string]string)
-			for j := 0; j < i; j += 2 {
-				files[args[j]] = args[j+1]
+func (service *serviceType) handleTransformRequest(id uint32, request map[string]interface{}) []byte {
+	inputFS := request["inputFS"].(bool)
+	input := request["input"].(string)
+	flags := decodeStringArray(request["flags"].([]interface{}))
+
+	options, err := cli.ParseTransformOptions(flags)
+	if err != nil {
+		return encodeErrorPacket(id, err)
+	}
+
+	transformInput := input
+	if inputFS {
+		bytes, err := ioutil.ReadFile(input)
+		if err == nil {
+			err = os.Remove(input)
+		}
+		if err != nil {
+			return encodeErrorPacket(id, err)
+		}
+		transformInput = string(bytes)
+	}
+
+	result := api.Transform(transformInput, options)
+	jsFS := false
+	jsSourceMapFS := false
+
+	if inputFS && len(result.JS) > 0 {
+		file := input + ".js"
+		if err := ioutil.WriteFile(file, result.JS, 0644); err == nil {
+			result.JS = []byte(file)
+			jsFS = true
+		}
+	}
+
+	if inputFS && len(result.JSSourceMap) > 0 {
+		file := input + ".map"
+		if err := ioutil.WriteFile(file, result.JSSourceMap, 0644); err == nil {
+			result.JSSourceMap = []byte(file)
+			jsSourceMapFS = true
+		}
+	}
+
+	return encodePacket(packet{
+		id: id,
+		value: map[string]interface{}{
+			"errors":   encodeMessages(result.Errors),
+			"warnings": encodeMessages(result.Warnings),
+
+			"jsFS": jsFS,
+			"js":   string(result.JS),
+
+			"jsSourceMapFS": jsSourceMapFS,
+			"jsSourceMap":   string(result.JSSourceMap),
+		},
+	})
+}
+
+func decodeStringArray(values []interface{}) []string {
+	strings := make([]string, len(values))
+	for i, value := range values {
+		strings[i] = value.(string)
+	}
+	return strings
+}
+
+func encodeOutputFiles(outputFiles []api.OutputFile) []interface{} {
+	values := make([]interface{}, len(outputFiles))
+	for i, outputFile := range outputFiles {
+		value := make(map[string]interface{})
+		values[i] = value
+		value["path"] = outputFile.Path
+		value["contents"] = outputFile.Contents
+	}
+	return values
+}
+
+func encodeMessages(msgs []api.Message) []interface{} {
+	values := make([]interface{}, len(msgs))
+	for i, msg := range msgs {
+		value := make(map[string]interface{})
+		values[i] = value
+		value["text"] = msg.Text
+
+		// Some messages won't have a location
+		loc := msg.Location
+		if loc == nil {
+			value["location"] = nil
+		} else {
+			value["location"] = map[string]interface{}{
+				"file":     loc.File,
+				"line":     loc.Line,
+				"column":   loc.Column,
+				"length":   loc.Length,
+				"lineText": loc.LineText,
 			}
-			return files, args[i+1:]
 		}
 	}
-	return nil, []string{}
-}
-
-func messagesOfKind(kind logging.MsgKind, msgs []logging.Msg) []logging.Msg {
-	filtered := []logging.Msg{}
-	for _, msg := range msgs {
-		if msg.Kind == kind {
-			filtered = append(filtered, msg)
-		}
-	}
-	return filtered
-}
-
-func messagesToJSON(msgs []logging.Msg) []byte {
-	bytes := []byte{'['}
-
-	for _, msg := range msgs {
-		if len(bytes) > 1 {
-			bytes = append(bytes, ',')
-		}
-		lineCount := 0
-		columnCount := 0
-
-		// Some errors won't have a location
-		if msg.Source.PrettyPath != "" {
-			lineCount, columnCount, _ = logging.ComputeLineAndColumn(msg.Source.Contents[0:msg.Start])
-			lineCount++
-		}
-
-		bytes = append(bytes, fmt.Sprintf("%s,%s,%d,%d",
-			printer.QuoteForJSON(msg.Text),
-			printer.QuoteForJSON(msg.Source.PrettyPath),
-			lineCount,
-			columnCount)...)
-	}
-
-	bytes = append(bytes, ']')
-	return bytes
+	return values
 }

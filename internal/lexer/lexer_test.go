@@ -8,13 +8,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/evanw/esbuild/internal/logging"
+	"github.com/evanw/esbuild/internal/test"
 )
-
-func assertEqual(t *testing.T, a interface{}, b interface{}) {
-	if a != b {
-		t.Fatalf("%s != %s", a, b)
-	}
-}
 
 func assertEqualStrings(t *testing.T, a string, b string) {
 	pretty := func(text string) string {
@@ -35,20 +30,14 @@ func assertEqualStrings(t *testing.T, a string, b string) {
 }
 
 func lexToken(t *testing.T, contents string) T {
-	log, join := logging.NewDeferLog()
-	lexer := NewLexer(log, logging.Source{
-		Index:        0,
-		AbsolutePath: "<stdin>",
-		PrettyPath:   "<stdin>",
-		Contents:     contents,
-	})
-	join()
+	log := logging.NewDeferLog()
+	lexer := NewLexer(log, test.SourceForTest(contents))
 	return lexer.Token
 }
 
 func expectLexerError(t *testing.T, contents string, expected string) {
 	t.Run(contents, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
+		log := logging.NewDeferLog()
 		func() {
 			defer func() {
 				r := recover()
@@ -56,25 +45,20 @@ func expectLexerError(t *testing.T, contents string, expected string) {
 					panic(r)
 				}
 			}()
-			NewLexer(log, logging.Source{
-				Index:        0,
-				AbsolutePath: "<stdin>",
-				PrettyPath:   "<stdin>",
-				Contents:     contents,
-			})
+			NewLexer(log, test.SourceForTest(contents))
 		}()
-		msgs := join()
+		msgs := log.Done()
 		text := ""
 		for _, msg := range msgs {
 			text += msg.String(logging.StderrOptions{}, logging.TerminalInfo{})
 		}
-		assertEqual(t, text, expected)
+		test.AssertEqual(t, text, expected)
 	})
 }
 
 func expectHashbang(t *testing.T, contents string, expected string) {
 	t.Run(contents, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
+		log := logging.NewDeferLog()
 		lexer := func() Lexer {
 			defer func() {
 				r := recover()
@@ -82,17 +66,12 @@ func expectHashbang(t *testing.T, contents string, expected string) {
 					panic(r)
 				}
 			}()
-			return NewLexer(log, logging.Source{
-				Index:        0,
-				AbsolutePath: "<stdin>",
-				PrettyPath:   "<stdin>",
-				Contents:     contents,
-			})
+			return NewLexer(log, test.SourceForTest(contents))
 		}()
-		msgs := join()
-		assertEqual(t, len(msgs), 0)
-		assertEqual(t, lexer.Token, THashbang)
-		assertEqual(t, lexer.Identifier, expected)
+		msgs := log.Done()
+		test.AssertEqual(t, len(msgs), 0)
+		test.AssertEqual(t, lexer.Token, THashbang)
+		test.AssertEqual(t, lexer.Identifier, expected)
 	})
 }
 
@@ -100,12 +79,12 @@ func TestHashbang(t *testing.T) {
 	expectHashbang(t, "#!/usr/bin/env node", "#!/usr/bin/env node")
 	expectHashbang(t, "#!/usr/bin/env node\n", "#!/usr/bin/env node")
 	expectHashbang(t, "#!/usr/bin/env node\nlet x", "#!/usr/bin/env node")
-	expectLexerError(t, " #!/usr/bin/env node", "<stdin>: error: Syntax error \"#\"\n")
+	expectLexerError(t, " #!/usr/bin/env node", "<stdin>: error: Syntax error \"!\"\n")
 }
 
 func expectIdentifier(t *testing.T, contents string, expected string) {
 	t.Run(contents, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
+		log := logging.NewDeferLog()
 		lexer := func() Lexer {
 			defer func() {
 				r := recover()
@@ -113,17 +92,12 @@ func expectIdentifier(t *testing.T, contents string, expected string) {
 					panic(r)
 				}
 			}()
-			return NewLexer(log, logging.Source{
-				Index:        0,
-				AbsolutePath: "<stdin>",
-				PrettyPath:   "<stdin>",
-				Contents:     contents,
-			})
+			return NewLexer(log, test.SourceForTest(contents))
 		}()
-		msgs := join()
-		assertEqual(t, len(msgs), 0)
-		assertEqual(t, lexer.Token, TIdentifier)
-		assertEqual(t, lexer.Identifier, expected)
+		msgs := log.Done()
+		test.AssertEqual(t, len(msgs), 0)
+		test.AssertEqual(t, lexer.Token, TIdentifier)
+		test.AssertEqual(t, lexer.Identifier, expected)
 	})
 }
 
@@ -147,7 +121,7 @@ func TestIdentifier(t *testing.T) {
 
 func expectNumber(t *testing.T, contents string, expected float64) {
 	t.Run(contents, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
+		log := logging.NewDeferLog()
 		lexer := func() Lexer {
 			defer func() {
 				r := recover()
@@ -155,17 +129,12 @@ func expectNumber(t *testing.T, contents string, expected float64) {
 					panic(r)
 				}
 			}()
-			return NewLexer(log, logging.Source{
-				Index:        0,
-				AbsolutePath: "<stdin>",
-				PrettyPath:   "<stdin>",
-				Contents:     contents,
-			})
+			return NewLexer(log, test.SourceForTest(contents))
 		}()
-		msgs := join()
-		assertEqual(t, len(msgs), 0)
-		assertEqual(t, lexer.Token, TNumericLiteral)
-		assertEqual(t, lexer.Number, expected)
+		msgs := log.Done()
+		test.AssertEqual(t, len(msgs), 0)
+		test.AssertEqual(t, lexer.Token, TNumericLiteral)
+		test.AssertEqual(t, lexer.Number, expected)
 	})
 }
 
@@ -339,7 +308,7 @@ func TestNumericLiteral(t *testing.T) {
 
 func expectBigInteger(t *testing.T, contents string, expected string) {
 	t.Run(contents, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
+		log := logging.NewDeferLog()
 		lexer := func() Lexer {
 			defer func() {
 				r := recover()
@@ -347,17 +316,12 @@ func expectBigInteger(t *testing.T, contents string, expected string) {
 					panic(r)
 				}
 			}()
-			return NewLexer(log, logging.Source{
-				Index:        0,
-				AbsolutePath: "<stdin>",
-				PrettyPath:   "<stdin>",
-				Contents:     contents,
-			})
+			return NewLexer(log, test.SourceForTest(contents))
 		}()
-		msgs := join()
-		assertEqual(t, len(msgs), 0)
-		assertEqual(t, lexer.Token, TBigIntegerLiteral)
-		assertEqual(t, lexer.Identifier, expected)
+		msgs := log.Done()
+		test.AssertEqual(t, len(msgs), 0)
+		test.AssertEqual(t, lexer.Token, TBigIntegerLiteral)
+		test.AssertEqual(t, lexer.Identifier, expected)
 	})
 }
 
@@ -397,7 +361,7 @@ func TestBigIntegerLiteral(t *testing.T) {
 
 func expectString(t *testing.T, contents string, expected string) {
 	t.Run(contents, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
+		log := logging.NewDeferLog()
 		lexer := func() Lexer {
 			defer func() {
 				r := recover()
@@ -405,16 +369,11 @@ func expectString(t *testing.T, contents string, expected string) {
 					panic(r)
 				}
 			}()
-			return NewLexer(log, logging.Source{
-				Index:        0,
-				AbsolutePath: "<stdin>",
-				PrettyPath:   "<stdin>",
-				Contents:     contents,
-			})
+			return NewLexer(log, test.SourceForTest(contents))
 		}()
-		msgs := join()
-		assertEqual(t, len(msgs), 0)
-		assertEqual(t, lexer.Token, TStringLiteral)
+		msgs := log.Done()
+		test.AssertEqual(t, len(msgs), 0)
+		test.AssertEqual(t, lexer.Token, TStringLiteral)
 		assertEqualStrings(t, UTF16ToString(lexer.StringLiteral), expected)
 	})
 }
@@ -590,7 +549,7 @@ func TestTokens(t *testing.T) {
 		contents := it.contents
 		token := it.token
 		t.Run(contents, func(t *testing.T) {
-			assertEqual(t, lexToken(t, contents), token)
+			test.AssertEqual(t, lexToken(t, contents), token)
 		})
 	}
 }

@@ -1,10 +1,11 @@
 package ast
 
 import (
-	"path"
 	"strings"
 
-	"github.com/evanw/esbuild/internal/runtime"
+	"github.com/evanw/esbuild/internal/sourcemap"
+
+	"github.com/evanw/esbuild/internal/compat"
 )
 
 // Every module (i.e. file) is parsed into a separate AST data structure. For
@@ -56,8 +57,11 @@ func (op OpCode) IsPrefix() bool {
 	return op < UnOpPostDec
 }
 
-func (op OpCode) IsUnaryUpdate() bool {
-	return op >= UnOpPreDec && op <= UnOpPostInc
+func (op OpCode) UnaryAssignTarget() AssignTarget {
+	if op >= UnOpPreDec && op <= UnOpPostInc {
+		return AssignTargetUpdate
+	}
+	return AssignTargetNone
 }
 
 func (op OpCode) IsLeftAssociative() bool {
@@ -68,9 +72,23 @@ func (op OpCode) IsRightAssociative() bool {
 	return op >= BinOpAssign || op == BinOpPow
 }
 
-func (op OpCode) IsBinaryAssign() bool {
-	return op >= BinOpAssign
+func (op OpCode) BinaryAssignTarget() AssignTarget {
+	if op == BinOpAssign {
+		return AssignTargetReplace
+	}
+	if op > BinOpAssign {
+		return AssignTargetUpdate
+	}
+	return AssignTargetNone
 }
+
+type AssignTarget uint8
+
+const (
+	AssignTargetNone    AssignTarget = iota
+	AssignTargetReplace              // "a = b"
+	AssignTargetUpdate               // "a += b"
+)
 
 // If you add a new token, remember to add it to "OpTable" too
 const (
@@ -135,6 +153,9 @@ const (
 	BinOpBitwiseOrAssign
 	BinOpBitwiseAndAssign
 	BinOpBitwiseXorAssign
+	BinOpNullishCoalescingAssign
+	BinOpLogicalOrAssign
+	BinOpLogicalAndAssign
 )
 
 type opTableEntry struct {
@@ -205,6 +226,9 @@ var OpTable = []opTableEntry{
 	{"|=", LAssign, false},
 	{"&=", LAssign, false},
 	{"^=", LAssign, false},
+	{"??=", LAssign, false},
+	{"||=", LAssign, false},
+	{"&&=", LAssign, false},
 }
 
 type Loc struct {
@@ -226,9 +250,28 @@ type LocRef struct {
 	Ref Ref
 }
 
+type Span struct {
+	Text  string
+	Range Range
+}
+
+// This is used to represent both file system paths (IsAbsolute == true) and
+// abstract module paths (IsAbsolute == false). Abstract module paths represent
+// "virtual modules" when used for an input file and "package paths" when used
+// to represent an external module.
 type Path struct {
-	Loc  Loc
-	Text string
+	Text       string
+	IsAbsolute bool
+}
+
+func (a Path) ComesBeforeInSortedOrder(b Path) bool {
+	if !a.IsAbsolute && b.IsAbsolute {
+		return false
+	}
+	if a.IsAbsolute && !b.IsAbsolute {
+		return true
+	}
+	return a.Text < b.Text
 }
 
 type PropertyKind int
@@ -241,11 +284,8 @@ const (
 )
 
 type Property struct {
-	Kind       PropertyKind
-	IsComputed bool
-	IsMethod   bool
-	IsStatic   bool
-	Key        Expr
+	TSDecorators []Expr
+	Key          Expr
 
 	// This is omitted for class fields
 	Value *Expr
@@ -260,6 +300,11 @@ type Property struct {
 	//   class Foo { a = 1 }
 	//
 	Initializer *Expr
+
+	Kind       PropertyKind
+	IsComputed bool
+	IsMethod   bool
+	IsStatic   bool
 }
 
 type PropertyBinding struct {
@@ -271,20 +316,23 @@ type PropertyBinding struct {
 }
 
 type Arg struct {
+	TSDecorators []Expr
+	Binding      Binding
+	Default      *Expr
+
 	// "constructor(public x: boolean) {}"
 	IsTypeScriptCtorField bool
-
-	Binding Binding
-	Default *Expr
 }
 
 type Fn struct {
-	Name        *LocRef
-	Args        []Arg
+	Name         *LocRef
+	Args         []Arg
+	Body         FnBody
+	ArgumentsRef Ref
+
 	IsAsync     bool
 	IsGenerator bool
 	HasRestArg  bool
-	Body        FnBody
 }
 
 type FnBody struct {
@@ -293,9 +341,11 @@ type FnBody struct {
 }
 
 type Class struct {
-	Name       *LocRef
-	Extends    *Expr
-	Properties []Property
+	TSDecorators []Expr
+	Name         *LocRef
+	Extends      *Expr
+	BodyLoc      Loc
+	Properties   []Property
 }
 
 type ArrayBinding struct {
@@ -317,11 +367,15 @@ type BMissing struct{}
 type BIdentifier struct{ Ref Ref }
 
 type BArray struct {
-	Items     []ArrayBinding
-	HasSpread bool
+	Items        []ArrayBinding
+	HasSpread    bool
+	IsSingleLine bool
 }
 
-type BObject struct{ Properties []PropertyBinding }
+type BObject struct {
+	Properties   []PropertyBinding
+	IsSingleLine bool
+}
 
 func (*BMissing) isBinding()    {}
 func (*BIdentifier) isBinding() {}
@@ -337,7 +391,10 @@ type Expr struct {
 // Go's type system.
 type E interface{ isExpr() }
 
-type EArray struct{ Items []Expr }
+type EArray struct {
+	Items        []Expr
+	IsSingleLine bool
+}
 
 type EUnary struct {
 	Op    OpCode
@@ -363,38 +420,67 @@ type EThis struct{}
 type ENew struct {
 	Target Expr
 	Args   []Expr
+
+	// True if there is a comment containing "@__PURE__" or "#__PURE__" preceding
+	// this call expression. See the comment inside ECall for more details.
+	CanBeUnwrappedIfUnused bool
 }
 
 type ENewTarget struct{}
 
 type EImportMeta struct{}
 
-type ECall struct {
-	Target          Expr
-	Args            []Expr
-	IsOptionalChain bool
-	IsParenthesized bool
-	IsDirectEval    bool
-}
+type OptionalChain uint8
 
-type ERuntimeCall struct {
-	Sym  runtime.Sym
-	Args []Expr
+const (
+	// "a.b"
+	OptionalChainNone OptionalChain = iota
+
+	// "a?.b"
+	OptionalChainStart
+
+	// "a?.b.c" => ".c" is OptionalChainContinue
+	// "(a?.b).c" => ".c" is OptionalChainNone
+	OptionalChainContinue
+)
+
+type ECall struct {
+	Target        Expr
+	Args          []Expr
+	OptionalChain OptionalChain
+	IsDirectEval  bool
+
+	// True if there is a comment containing "@__PURE__" or "#__PURE__" preceding
+	// this call expression. This is an annotation used for tree shaking, and
+	// means that the call can be removed if it's unused. It does not mean the
+	// call is pure (e.g. it may still return something different if called twice).
+	//
+	// Note that the arguments are not considered to be part of the call. If the
+	// call itself is removed due to this annotation, the arguments must remain
+	// if they have side effects.
+	CanBeUnwrappedIfUnused bool
 }
 
 type EDot struct {
-	Target          Expr
-	Name            string
-	NameLoc         Loc
-	IsOptionalChain bool
-	IsParenthesized bool
+	Target        Expr
+	Name          string
+	NameLoc       Loc
+	OptionalChain OptionalChain
+
+	// If true, this property access is known to be free of side-effects. That
+	// means it can be removed if the resulting value isn't used.
+	CanBeRemovedIfUnused bool
+
+	// If true, this property access is a function that, when called, can be
+	// unwrapped if the resulting value is unused. Unwrapping means discarding
+	// the call target but keeping any arguments with side effects.
+	CallCanBeUnwrappedIfUnused bool
 }
 
 type EIndex struct {
-	Target          Expr
-	Index           Expr
-	IsOptionalChain bool
-	IsParenthesized bool
+	Target        Expr
+	Index         Expr
+	OptionalChain OptionalChain
 }
 
 type EArrow struct {
@@ -410,7 +496,20 @@ type EFunction struct{ Fn Fn }
 
 type EClass struct{ Class Class }
 
-type EIdentifier struct{ Ref Ref }
+type EIdentifier struct {
+	Ref Ref
+
+	// If true, this identifier is known to not have a side effect (i.e. to not
+	// throw an exception) when referenced. If false, this identifier may or may
+	// not have side effects when referenced. This is used to allow the removal
+	// of known globals such as "Object" if they aren't used.
+	CanBeRemovedIfUnused bool
+
+	// If true, this identifier represents a function that, when called, can be
+	// unwrapped if the resulting value is unused. Unwrapping means discarding
+	// the call target but keeping any arguments with side effects.
+	CallCanBeUnwrappedIfUnused bool
+}
 
 // This is similar to an EIdentifier but it represents a reference to an ES6
 // import item.
@@ -435,6 +534,13 @@ type EImportIdentifier struct {
 	Ref Ref
 }
 
+// This is similar to EIdentifier but it represents class-private fields and
+// methods. It can be used where computed properties can be used, such as
+// EIndex and Property.
+type EPrivateIdentifier struct {
+	Ref Ref
+}
+
 type EJSXElement struct {
 	Tag        *Expr
 	Properties []Property
@@ -447,7 +553,10 @@ type ENumber struct{ Value float64 }
 
 type EBigInt struct{ Value string }
 
-type EObject struct{ Properties []Property }
+type EObject struct {
+	Properties   []Property
+	IsSingleLine bool
+}
 
 type ESpread struct{ Value Expr }
 
@@ -484,48 +593,56 @@ type EIf struct {
 }
 
 type ERequire struct {
-	Path        Path
-	IsES6Import bool
+	ImportRecordIndex uint32
 }
 
 type EImport struct {
-	Expr Expr
+	Expr              Expr
+	ImportRecordIndex *uint32
 }
 
-func (*EArray) isExpr()            {}
-func (*EUnary) isExpr()            {}
-func (*EBinary) isExpr()           {}
-func (*EBoolean) isExpr()          {}
-func (*ESuper) isExpr()            {}
-func (*ENull) isExpr()             {}
-func (*EUndefined) isExpr()        {}
-func (*EThis) isExpr()             {}
-func (*ENew) isExpr()              {}
-func (*ENewTarget) isExpr()        {}
-func (*EImportMeta) isExpr()       {}
-func (*ECall) isExpr()             {}
-func (*ERuntimeCall) isExpr()      {}
-func (*EDot) isExpr()              {}
-func (*EIndex) isExpr()            {}
-func (*EArrow) isExpr()            {}
-func (*EFunction) isExpr()         {}
-func (*EClass) isExpr()            {}
-func (*EIdentifier) isExpr()       {}
-func (*EImportIdentifier) isExpr() {}
-func (*EJSXElement) isExpr()       {}
-func (*EMissing) isExpr()          {}
-func (*ENumber) isExpr()           {}
-func (*EBigInt) isExpr()           {}
-func (*EObject) isExpr()           {}
-func (*ESpread) isExpr()           {}
-func (*EString) isExpr()           {}
-func (*ETemplate) isExpr()         {}
-func (*ERegExp) isExpr()           {}
-func (*EAwait) isExpr()            {}
-func (*EYield) isExpr()            {}
-func (*EIf) isExpr()               {}
-func (*ERequire) isExpr()          {}
-func (*EImport) isExpr()           {}
+func (*EArray) isExpr()             {}
+func (*EUnary) isExpr()             {}
+func (*EBinary) isExpr()            {}
+func (*EBoolean) isExpr()           {}
+func (*ESuper) isExpr()             {}
+func (*ENull) isExpr()              {}
+func (*EUndefined) isExpr()         {}
+func (*EThis) isExpr()              {}
+func (*ENew) isExpr()               {}
+func (*ENewTarget) isExpr()         {}
+func (*EImportMeta) isExpr()        {}
+func (*ECall) isExpr()              {}
+func (*EDot) isExpr()               {}
+func (*EIndex) isExpr()             {}
+func (*EArrow) isExpr()             {}
+func (*EFunction) isExpr()          {}
+func (*EClass) isExpr()             {}
+func (*EIdentifier) isExpr()        {}
+func (*EImportIdentifier) isExpr()  {}
+func (*EPrivateIdentifier) isExpr() {}
+func (*EJSXElement) isExpr()        {}
+func (*EMissing) isExpr()           {}
+func (*ENumber) isExpr()            {}
+func (*EBigInt) isExpr()            {}
+func (*EObject) isExpr()            {}
+func (*ESpread) isExpr()            {}
+func (*EString) isExpr()            {}
+func (*ETemplate) isExpr()          {}
+func (*ERegExp) isExpr()            {}
+func (*EAwait) isExpr()             {}
+func (*EYield) isExpr()             {}
+func (*EIf) isExpr()                {}
+func (*ERequire) isExpr()           {}
+func (*EImport) isExpr()            {}
+
+func Assign(a Expr, b Expr) Expr {
+	return Expr{a.Loc, &EBinary{BinOpAssign, a, b}}
+}
+
+func AssignStmt(a Expr, b Expr) Stmt {
+	return Stmt{a.Loc, &SExpr{Expr{a.Loc, &EBinary{BinOpAssign, a, b}}}}
+}
 
 func JoinWithComma(a Expr, b Expr) Expr {
 	return Expr{a.Loc, &EBinary{BinOpComma, a, b}}
@@ -562,6 +679,10 @@ type SEmpty struct{}
 // This is a stand-in for a TypeScript type declaration
 type STypeScript struct{}
 
+type SComment struct {
+	Text string
+}
+
 type SDebugger struct{}
 
 type SDirective struct {
@@ -569,13 +690,15 @@ type SDirective struct {
 }
 
 type SExportClause struct {
-	Items []ClauseItem
+	Items        []ClauseItem
+	IsSingleLine bool
 }
 
 type SExportFrom struct {
-	Items        []ClauseItem
-	NamespaceRef Ref
-	Path         Path
+	Items             []ClauseItem
+	NamespaceRef      Ref
+	ImportRecordIndex uint32
+	IsSingleLine      bool
 }
 
 type SExportDefault struct {
@@ -583,13 +706,25 @@ type SExportDefault struct {
 	Value       ExprOrStmt // May be a SFunction or SClass
 }
 
+type ExportStarAlias struct {
+	Loc  Loc
+	Name string
+}
+
 type SExportStar struct {
-	Item *ClauseItem
-	Path Path
+	NamespaceRef      Ref
+	Alias             *ExportStarAlias
+	ImportRecordIndex uint32
 }
 
 // This is an "export = value;" statement in TypeScript
 type SExportEquals struct {
+	Value Expr
+}
+
+// The decision of whether to export an expression using "module.exports" or
+// "export default" is deferred until linking using this statement kind
+type SLazyExport struct {
 	Value Expr
 }
 
@@ -705,11 +840,11 @@ type SSwitch struct {
 
 // This object represents all of these types of import statements:
 //
-//   import 'path'
-//   import {item1, item2} from 'path'
-//   import * as ns from 'path'
-//   import defaultItem, {item1, item2} from 'path'
-//   import defaultItem, * as ns from 'path'
+//    import 'path'
+//    import {item1, item2} from 'path'
+//    import * as ns from 'path'
+//    import defaultItem, {item1, item2} from 'path'
+//    import defaultItem, * as ns from 'path'
 //
 // Many parts are optional and can be combined in different ways. The only
 // restriction is that you cannot have both a clause and a star namespace.
@@ -722,10 +857,11 @@ type SImport struct {
 	// when converting this module to a CommonJS module.
 	NamespaceRef Ref
 
-	DefaultName *LocRef
-	Items       *[]ClauseItem
-	StarLoc     *Loc
-	Path        Path
+	DefaultName       *LocRef
+	Items             *[]ClauseItem
+	StarNameLoc       *Loc
+	ImportRecordIndex uint32
+	IsSingleLine      bool
 }
 
 type SReturn struct {
@@ -763,6 +899,7 @@ type SContinue struct {
 }
 
 func (*SBlock) isStmt()         {}
+func (*SComment) isStmt()       {}
 func (*SDebugger) isStmt()      {}
 func (*SDirective) isStmt()     {}
 func (*SEmpty) isStmt()         {}
@@ -772,6 +909,7 @@ func (*SExportFrom) isStmt()    {}
 func (*SExportDefault) isStmt() {}
 func (*SExportStar) isStmt()    {}
 func (*SExportEquals) isStmt()  {}
+func (*SLazyExport) isStmt()    {}
 func (*SExpr) isStmt()          {}
 func (*SEnum) isStmt()          {}
 func (*SNamespace) isStmt()     {}
@@ -809,6 +947,11 @@ type ClauseItem struct {
 	Alias    string
 	AliasLoc Loc
 	Name     LocRef
+
+	// This is needed for "export {foo as bar} from 'path'" statements. This case
+	// is a re-export and "foo" and "bar" are both aliases. We need to preserve
+	// both aliases in case the symbol is renamed.
+	OriginalName string
 }
 
 type Decl struct {
@@ -858,6 +1001,18 @@ const (
 	// Classes can merge with TypeScript namespaces.
 	SymbolClass
 
+	// A class-private identifier (i.e. "#foo").
+	SymbolPrivateField
+	SymbolPrivateMethod
+	SymbolPrivateGet
+	SymbolPrivateSet
+	SymbolPrivateGetSetPair
+	SymbolPrivateStaticField
+	SymbolPrivateStaticMethod
+	SymbolPrivateStaticGet
+	SymbolPrivateStaticSet
+	SymbolPrivateStaticGetSetPair
+
 	// TypeScript enums can merge with TypeScript namespaces and other TypeScript
 	// enums.
 	SymbolTSEnum
@@ -868,11 +1023,34 @@ const (
 
 	// In TypeScript, imports are allowed to silently collide with symbols within
 	// the module. Presumably this is because the imports may be type-only.
-	SymbolTSImport
+	SymbolImport
 
 	// This annotates all other symbols that don't have special behavior.
 	SymbolOther
 )
+
+func (kind SymbolKind) IsPrivate() bool {
+	return kind >= SymbolPrivateField && kind <= SymbolPrivateStaticGetSetPair
+}
+
+func (kind SymbolKind) Feature() compat.Feature {
+	switch kind {
+	case SymbolPrivateField:
+		return compat.ClassPrivateField
+	case SymbolPrivateMethod:
+		return compat.ClassPrivateMethod
+	case SymbolPrivateGet, SymbolPrivateSet, SymbolPrivateGetSetPair:
+		return compat.ClassPrivateAccessor
+	case SymbolPrivateStaticField:
+		return compat.ClassPrivateStaticField
+	case SymbolPrivateStaticMethod:
+		return compat.ClassPrivateStaticMethod
+	case SymbolPrivateStaticGet, SymbolPrivateStaticSet, SymbolPrivateStaticGetSetPair:
+		return compat.ClassPrivateStaticAccessor
+	default:
+		return 0
+	}
+}
 
 func (kind SymbolKind) IsHoisted() bool {
 	return kind == SymbolHoisted || kind == SymbolHoistedFunction
@@ -896,6 +1074,18 @@ type Ref struct {
 	InnerIndex uint32
 }
 
+type ImportItemStatus uint8
+
+const (
+	ImportItemNone ImportItemStatus = iota
+
+	// The linker doesn't report import/export mismatch errors
+	ImportItemGenerated
+
+	// The printer will replace this import with "undefined"
+	ImportItemMissing
+)
+
 type Symbol struct {
 	Kind SymbolKind
 
@@ -903,6 +1093,25 @@ type Symbol struct {
 	// "arguments" variable is declared by the runtime for every function.
 	// Renaming can also break any identifier used inside a "with" statement.
 	MustNotBeRenamed bool
+
+	// We automatically generate import items for property accesses off of
+	// namespace imports. This lets us remove the expensive namespace imports
+	// while bundling in many cases, replacing them with a cheap import item
+	// instead:
+	//
+	//   import * as ns from 'path'
+	//   ns.foo()
+	//
+	// That can often be replaced by this, which avoids needing the namespace:
+	//
+	//   import {foo} from 'path'
+	//   foo()
+	//
+	// However, if the import is actually missing then we don't want to report a
+	// compile-time error like we do for real import items. This status lets us
+	// avoid this. We also need to be able to replace such import items with
+	// undefined, which this status is also used for.
+	ImportItemStatus ImportItemStatus
 
 	// An estimate of the number of uses of this symbol. This is used for
 	// minification (to prefer shorter names for more frequently used symbols).
@@ -945,6 +1154,7 @@ const (
 	ScopeWith
 	ScopeLabel
 	ScopeClassName
+	ScopeClassBody
 
 	// The scopes below stop hoisted variables from extending into parent scopes
 	ScopeEntry // This is a module, TypeScript enum, or TypeScript namespace
@@ -983,71 +1193,178 @@ type SymbolMap struct {
 	Outer [][]Symbol
 }
 
-func NewSymbolMap(sourceCount int) *SymbolMap {
-	return &SymbolMap{make([][]Symbol, sourceCount)}
+func NewSymbolMap(sourceCount int) SymbolMap {
+	return SymbolMap{make([][]Symbol, sourceCount)}
 }
 
-func (sm *SymbolMap) Get(ref Ref) Symbol {
-	return sm.Outer[ref.OuterIndex][ref.InnerIndex]
-}
-
-func (sm *SymbolMap) IncrementUseCountEstimate(ref Ref) {
-	sm.Outer[ref.OuterIndex][ref.InnerIndex].UseCountEstimate++
-}
-
-func (sm *SymbolMap) SetNamespaceAlias(ref Ref, alias NamespaceAlias) {
-	sm.Outer[ref.OuterIndex][ref.InnerIndex].NamespaceAlias = &alias
-}
-
-// The symbol must already exist to call this
-func (sm *SymbolMap) Set(ref Ref, symbol Symbol) {
-	sm.Outer[ref.OuterIndex][ref.InnerIndex] = symbol
-}
-
-func (sm *SymbolMap) SetKind(ref Ref, kind SymbolKind) {
-	sm.Outer[ref.OuterIndex][ref.InnerIndex].Kind = kind
+func (sm SymbolMap) Get(ref Ref) *Symbol {
+	return &sm.Outer[ref.OuterIndex][ref.InnerIndex]
 }
 
 type ImportKind uint8
 
 const (
+	// An ES6 import or re-export statement
 	ImportStmt ImportKind = iota
+
+	// A call to "require()"
 	ImportRequire
+
+	// An "import()" expression with a string argument
 	ImportDynamic
 )
 
-type ImportPath struct {
+type ImportRecord struct {
+	Loc  Loc
 	Path Path
+
+	// If this is an internal CommonJS import, this is the symbol of a function
+	// that takes no arguments which, when called, implements require() for this
+	// import. This is a wrapper function returned by "__commonJS()".
+	WrapperRef Ref
+
+	// The resolved source index for an internal import (within the bundle) or
+	// nil for an external import (not included in the bundle)
+	SourceIndex *uint32
+
+	// If this is true, the import doesn't actually use any imported values. The
+	// import is only used for its side effects.
+	DoesNotUseExports bool
+
+	// If true, this "export * from 'path'" statement is evaluated at run-time by
+	// calling the "__exportStar()" helper function
+	IsExportStarRunTimeEval bool
+
+	// Tell the printer to wrap this call to "require()" in "__toModule(...)"
+	WrapWithToModule bool
+
+	// True for require calls like this: "try { require() } catch {}". In this
+	// case we shouldn't generate an error if the path could not be resolved.
+	IsInsideTryBody bool
+
 	Kind ImportKind
 }
 
 type AST struct {
-	ImportPaths   []ImportPath
 	WasTypeScript bool
+	HasLazyExport bool
 
-	// This is true if something used the "exports" or "module" variables, which
-	// means they could have exported something. It's also true if the file
-	// contains a top-level return statement. When a file uses CommonJS features,
+	// This is a list of CommonJS features. When a file uses CommonJS features,
 	// it's not a candidate for "flat bundling" and must be wrapped in its own
 	// closure.
-	UsesCommonJSFeatures bool
+	HasTopLevelReturn bool
+	UsesExportsRef    bool
+	UsesModuleRef     bool
+
+	// This is a list of ES6 features
+	HasES6Imports bool
+	HasES6Exports bool
 
 	Hashbang    string
-	Stmts       []Stmt
-	Symbols     *SymbolMap
+	Directive   string
+	Parts       []Part
+	Symbols     SymbolMap
 	ModuleScope *Scope
 	ExportsRef  Ref
 	ModuleRef   Ref
+	WrapperRef  Ref
 
-	// This is a bitwise-or of all runtime symbols used by this AST. Runtime
-	// symbols are used by ERuntimeCall expressions.
-	UsedRuntimeSyms runtime.Sym
+	// These are stored at the AST level instead of on individual AST nodes so
+	// they can be manipulated efficiently without a full AST traversal
+	ImportRecords []ImportRecord
+
+	// These are used when bundling. They are filled in during the parser pass
+	// since we already have to traverse the AST then anyway and the parser pass
+	// is conveniently fully parallelized.
+	NamedImports            map[Ref]NamedImport
+	NamedExports            map[string]Ref
+	TopLevelSymbolToParts   map[Ref][]uint32
+	ExportStarImportRecords []uint32
+
+	SourceMapComment Span
+	SourceMap        *sourcemap.SourceMap
+}
+
+func (ast *AST) HasCommonJSFeatures() bool {
+	return ast.HasTopLevelReturn || ast.UsesExportsRef || ast.UsesModuleRef
+}
+
+func (ast *AST) UsesCommonJSExports() bool {
+	return ast.UsesExportsRef || ast.UsesModuleRef
+}
+
+func (ast *AST) HasES6Syntax() bool {
+	return ast.HasES6Imports || ast.HasES6Exports
+}
+
+type NamedImport struct {
+	// Parts within this file that use this import
+	LocalPartsWithUses []uint32
+
+	Alias             string
+	AliasLoc          Loc
+	NamespaceRef      Ref
+	ImportRecordIndex uint32
+
+	// It's useful to flag exported imports because if they are in a TypeScript
+	// file, we can't tell if they are a type or a value.
+	IsExported bool
+}
+
+// Each file is made up of multiple parts, and each part consists of one or
+// more top-level statements. Parts are used for tree shaking and code
+// splitting analysis. Individual parts of a file can be discarded by tree
+// shaking and can be assigned to separate chunks (i.e. output files) by code
+// splitting.
+type Part struct {
+	Stmts []Stmt
+
+	// Each is an index into the file-level import record list
+	ImportRecordIndices []uint32
+
+	// All symbols that are declared in this part. Note that a given symbol may
+	// have multiple declarations, and so may end up being declared in multiple
+	// parts (e.g. multiple "var" declarations with the same name). Also note
+	// that this list isn't deduplicated and may contain duplicates.
+	DeclaredSymbols []DeclaredSymbol
+
+	// An estimate of the number of uses of all symbols used within this part.
+	SymbolUses map[Ref]SymbolUse
+
+	// The indices of the other parts in this file that are needed if this part
+	// is needed.
+	LocalDependencies map[uint32]bool
+
+	// If true, this part can be removed if none of the declared symbols are
+	// used. If the file containing this part is imported, then all parts that
+	// don't have this flag enabled must be included.
+	CanBeRemovedIfUnused bool
+
+	// If true, this is the automatically-generated part for this file's ES6
+	// exports. It may hold the "const exports = {};" statement and also the
+	// "__export(exports, { ... })" call to initialize the getters.
+	IsNamespaceExport bool
+
+	// This is used for generated parts that we don't want to be present if they
+	// aren't needed. This enables tree shaking for these parts even if global
+	// tree shaking isn't enabled.
+	ForceTreeShaking bool
+}
+
+type DeclaredSymbol struct {
+	Ref        Ref
+	IsTopLevel bool
+}
+
+type SymbolUse struct {
+	CountEstimate uint32
+	IsAssigned    bool
 }
 
 // Returns the canonical ref that represents the ref for the provided symbol.
 // This may not be the provided ref if the symbol has been merged with another
 // symbol.
-func FollowSymbols(symbols *SymbolMap, ref Ref) Ref {
+func FollowSymbols(symbols SymbolMap, ref Ref) Ref {
 	symbol := symbols.Get(ref)
 	if symbol.Link == InvalidRef {
 		return ref
@@ -1058,7 +1375,6 @@ func FollowSymbols(symbols *SymbolMap, ref Ref) Ref {
 	// Only write if needed to avoid concurrent map update hazards
 	if symbol.Link != link {
 		symbol.Link = link
-		symbols.Set(ref, symbol)
 	}
 
 	return link
@@ -1068,9 +1384,9 @@ func FollowSymbols(symbols *SymbolMap, ref Ref) Ref {
 // concurrent map update hazards. In Go, mutating a map is not threadsafe
 // but reading from a map is. Calling "FollowAllSymbols" first ensures that
 // all mutation is done up front.
-func FollowAllSymbols(symbols *SymbolMap) {
+func FollowAllSymbols(symbols SymbolMap) {
 	for sourceIndex, inner := range symbols.Outer {
-		for symbolIndex, _ := range inner {
+		for symbolIndex := range inner {
 			FollowSymbols(symbols, Ref{uint32(sourceIndex), uint32(symbolIndex)})
 		}
 	}
@@ -1079,7 +1395,7 @@ func FollowAllSymbols(symbols *SymbolMap) {
 // Makes "old" point to "new" by joining the linked lists for the two symbols
 // together. That way "FollowSymbols" on both "old" and "new" will result in
 // the same ref.
-func MergeSymbols(symbols *SymbolMap, old Ref, new Ref) Ref {
+func MergeSymbols(symbols SymbolMap, old Ref, new Ref) Ref {
 	if old == new {
 		return new
 	}
@@ -1087,14 +1403,12 @@ func MergeSymbols(symbols *SymbolMap, old Ref, new Ref) Ref {
 	oldSymbol := symbols.Get(old)
 	if oldSymbol.Link != InvalidRef {
 		oldSymbol.Link = MergeSymbols(symbols, oldSymbol.Link, new)
-		symbols.Set(old, oldSymbol)
 		return oldSymbol.Link
 	}
 
 	newSymbol := symbols.Get(new)
 	if newSymbol.Link != InvalidRef {
 		newSymbol.Link = MergeSymbols(symbols, old, newSymbol.Link)
-		symbols.Set(new, newSymbol)
 		return newSymbol.Link
 	}
 
@@ -1103,26 +1417,78 @@ func MergeSymbols(symbols *SymbolMap, old Ref, new Ref) Ref {
 	if oldSymbol.MustNotBeRenamed {
 		newSymbol.MustNotBeRenamed = true
 	}
-	symbols.Set(old, oldSymbol)
-	symbols.Set(new, newSymbol)
 	return new
 }
 
-func GenerateNonUniqueNameFromPath(text string) string {
+// This has a custom implementation instead of using "filepath.Dir/Base/Ext"
+// because it should work the same on Unix and Windows. These names end up in
+// the generated output and the generated output should not depend on the OS.
+func platformIndependentPathDirBaseExt(path string) (dir string, base string, ext string) {
+	for {
+		i := strings.LastIndexAny(path, "/\\")
+
+		// Stop if there are no more slashes
+		if i < 0 {
+			base = path
+			break
+		}
+
+		// Stop if we found a non-trailing slash
+		if i+1 != len(path) {
+			dir, base = path[:i], path[i+1:]
+			break
+		}
+
+		// Ignore trailing slashes
+		path = path[:i]
+	}
+
+	// Strip off the extension
+	if dot := strings.LastIndexByte(base, '.'); dot >= 0 {
+		base, ext = base[:dot], base[dot:]
+	}
+
+	return
+}
+
+// For readability, the names of certain automatically-generated symbols are
+// derived from the file name. For example, instead of the CommonJS wrapper for
+// a file being called something like "require273" it can be called something
+// like "require_react" instead. This function generates the part of these
+// identifiers that's specific to the file path. It can take both an absolute
+// path (OS-specific) and a path in the source code (OS-independent).
+//
+// Note that these generated names do not at all relate to the correctness of
+// the code as far as avoiding symbol name collisions. These names still go
+// through the renaming logic that all other symbols go through to avoid name
+// collisions.
+func GenerateNonUniqueNameFromPath(path string) string {
 	// Get the file name without the extension
-	base := path.Base(text)
-	lastDot := strings.LastIndexByte(base, '.')
-	if lastDot >= 0 {
-		base = base[:lastDot]
+	dir, base, _ := platformIndependentPathDirBaseExt(path)
+
+	// If the name is "index", use the directory name instead. This is because
+	// many packages in npm use the file name "index.js" because it triggers
+	// node's implicit module resolution rules that allows you to import it by
+	// just naming the directory.
+	if base == "index" {
+		_, dirBase, _ := platformIndependentPathDirBaseExt(dir)
+		if dirBase != "" {
+			base = dirBase
+		}
 	}
 
 	// Convert it to an ASCII identifier
 	bytes := []byte{}
+	needsGap := false
 	for _, c := range base {
 		if (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (len(bytes) > 0 && c >= '0' && c <= '9') {
+			if needsGap {
+				bytes = append(bytes, '_')
+				needsGap = false
+			}
 			bytes = append(bytes, byte(c))
-		} else if len(bytes) > 0 && bytes[len(bytes)-1] != '_' {
-			bytes = append(bytes, '_')
+		} else if len(bytes) > 0 {
+			needsGap = true
 		}
 	}
 

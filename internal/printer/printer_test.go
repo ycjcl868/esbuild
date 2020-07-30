@@ -3,8 +3,11 @@ package printer
 import (
 	"testing"
 
+	"github.com/evanw/esbuild/internal/compat"
+	"github.com/evanw/esbuild/internal/config"
 	"github.com/evanw/esbuild/internal/logging"
 	"github.com/evanw/esbuild/internal/parser"
+	"github.com/evanw/esbuild/internal/test"
 )
 
 func assertEqual(t *testing.T, a interface{}, b interface{}) {
@@ -15,14 +18,9 @@ func assertEqual(t *testing.T, a interface{}, b interface{}) {
 
 func expectPrintedCommon(t *testing.T, name string, contents string, expected string, options PrintOptions) {
 	t.Run(name, func(t *testing.T) {
-		log, join := logging.NewDeferLog()
-		ast, ok := parser.Parse(log, logging.Source{
-			Index:        0,
-			AbsolutePath: "<stdin>",
-			PrettyPath:   "<stdin>",
-			Contents:     contents,
-		}, parser.ParseOptions{})
-		msgs := join()
+		log := logging.NewDeferLog()
+		ast, ok := parser.Parse(log, test.SourceForTest(contents), config.Options{})
+		msgs := log.Done()
 		text := ""
 		for _, msg := range msgs {
 			text += msg.String(logging.StderrOptions{}, logging.TerminalInfo{})
@@ -46,15 +44,90 @@ func expectPrintedMinify(t *testing.T, contents string, expected string) {
 	})
 }
 
+func expectPrintedTarget(t *testing.T, esVersion int, contents string, expected string) {
+	expectPrintedCommon(t, contents, contents, expected, PrintOptions{
+		UnsupportedFeatures: compat.UnsupportedFeatures(map[compat.Engine][]int{
+			compat.ES: {esVersion},
+		}),
+	})
+}
+
+func expectPrintedTargetMinify(t *testing.T, esVersion int, contents string, expected string) {
+	expectPrintedCommon(t, contents+" [minified]", contents, expected, PrintOptions{
+		UnsupportedFeatures: compat.UnsupportedFeatures(map[compat.Engine][]int{
+			compat.ES: {esVersion},
+		}),
+		RemoveWhitespace: true,
+	})
+}
+
 func TestNumber(t *testing.T) {
-	expectPrinted(t, "0.5", "0.5;\n")
-	expectPrinted(t, "-0.5", "-0.5;\n")
-	expectPrinted(t, "1e100", "1e+100;\n")
+	// Check "1eN"
 	expectPrinted(t, "1e-100", "1e-100;\n")
-	expectPrintedMinify(t, "0.5", ".5;")
-	expectPrintedMinify(t, "-0.5", "-.5;")
-	expectPrintedMinify(t, "1e100", "1e100;")
+	expectPrinted(t, "1e-4", "1e-4;\n")
+	expectPrinted(t, "1e-3", "1e-3;\n")
+	expectPrinted(t, "1e-2", "0.01;\n")
+	expectPrinted(t, "1e-1", "0.1;\n")
+	expectPrinted(t, "1e0", "1;\n")
+	expectPrinted(t, "1e1", "10;\n")
+	expectPrinted(t, "1e2", "100;\n")
+	expectPrinted(t, "1e3", "1e3;\n")
+	expectPrinted(t, "1e4", "1e4;\n")
+	expectPrinted(t, "1e100", "1e100;\n")
 	expectPrintedMinify(t, "1e-100", "1e-100;")
+	expectPrintedMinify(t, "1e-5", "1e-5;")
+	expectPrintedMinify(t, "1e-4", "1e-4;")
+	expectPrintedMinify(t, "1e-3", ".001;")
+	expectPrintedMinify(t, "1e-2", ".01;")
+	expectPrintedMinify(t, "1e-1", ".1;")
+	expectPrintedMinify(t, "1e0", "1;")
+	expectPrintedMinify(t, "1e1", "10;")
+	expectPrintedMinify(t, "1e2", "100;")
+	expectPrintedMinify(t, "1e3", "1e3;")
+	expectPrintedMinify(t, "1e4", "1e4;")
+	expectPrintedMinify(t, "1e100", "1e100;")
+
+	// Check "12eN"
+	expectPrinted(t, "12e-100", "12e-100;\n")
+	expectPrinted(t, "12e-5", "12e-5;\n")
+	expectPrinted(t, "12e-4", "12e-4;\n")
+	expectPrinted(t, "12e-3", "0.012;\n")
+	expectPrinted(t, "12e-2", "0.12;\n")
+	expectPrinted(t, "12e-1", "1.2;\n")
+	expectPrinted(t, "12e0", "12;\n")
+	expectPrinted(t, "12e1", "120;\n")
+	expectPrinted(t, "12e2", "1200;\n")
+	expectPrinted(t, "12e3", "12e3;\n")
+	expectPrinted(t, "12e4", "12e4;\n")
+	expectPrinted(t, "12e100", "12e100;\n")
+	expectPrintedMinify(t, "12e-100", "12e-100;")
+	expectPrintedMinify(t, "12e-6", "12e-6;")
+	expectPrintedMinify(t, "12e-5", "12e-5;")
+	expectPrintedMinify(t, "12e-4", ".0012;")
+	expectPrintedMinify(t, "12e-3", ".012;")
+	expectPrintedMinify(t, "12e-2", ".12;")
+	expectPrintedMinify(t, "12e-1", "1.2;")
+	expectPrintedMinify(t, "12e0", "12;")
+	expectPrintedMinify(t, "12e1", "120;")
+	expectPrintedMinify(t, "12e2", "1200;")
+	expectPrintedMinify(t, "12e3", "12e3;")
+	expectPrintedMinify(t, "12e4", "12e4;")
+	expectPrintedMinify(t, "12e100", "12e100;")
+
+	// Check cases for "A.BeX" => "ABeY" simplification
+	expectPrinted(t, "123456789", "123456789;\n")
+	expectPrinted(t, "1123456789", "1123456789;\n")
+	expectPrinted(t, "10123456789", "10123456789;\n")
+	expectPrinted(t, "100123456789", "100123456789;\n")
+	expectPrinted(t, "1000123456789", "1000123456789;\n")
+	expectPrinted(t, "10000123456789", "10000123456789;\n")
+	expectPrinted(t, "100000123456789", "100000123456789;\n")
+	expectPrinted(t, "1000000123456789", "1000000123456789;\n")
+	expectPrinted(t, "10000000123456789", "10000000123456788;\n")
+	expectPrinted(t, "100000000123456789", "100000000123456780;\n")
+	expectPrinted(t, "1000000000123456789", "1000000000123456800;\n")
+	expectPrinted(t, "10000000000123456789", "10000000000123458e3;\n")
+	expectPrinted(t, "100000000000123456789", "10000000000012345e4;\n")
 
 	// Check numbers around the ends of various integer ranges. These were
 	// crashing in the WebAssembly build due to a bug in the Go runtime.
@@ -76,20 +149,20 @@ func TestNumber(t *testing.T) {
 	expectPrinted(t, "-0x1_0000_0001", "-4294967297;\n")
 
 	// int64
-	expectPrinted(t, "0x7fff_ffff_ffff_fdff", "9223372036854774784;\n")
-	expectPrinted(t, "0x8000_0000_0000_0000", "9.223372036854776e+18;\n")
-	expectPrinted(t, "0x8000_0000_0000_3000", "9.223372036854788e+18;\n")
-	expectPrinted(t, "-0x7fff_ffff_ffff_fdff", "-9223372036854774784;\n")
-	expectPrinted(t, "-0x8000_0000_0000_0000", "-9.223372036854776e+18;\n")
-	expectPrinted(t, "-0x8000_0000_0000_3000", "-9.223372036854788e+18;\n")
+	expectPrinted(t, "0x7fff_ffff_ffff_fdff", "9223372036854775e3;\n")
+	expectPrinted(t, "0x8000_0000_0000_0000", "9223372036854776e3;\n")
+	expectPrinted(t, "0x8000_0000_0000_3000", "9223372036854788e3;\n")
+	expectPrinted(t, "-0x7fff_ffff_ffff_fdff", "-9223372036854775e3;\n")
+	expectPrinted(t, "-0x8000_0000_0000_0000", "-9223372036854776e3;\n")
+	expectPrinted(t, "-0x8000_0000_0000_3000", "-9223372036854788e3;\n")
 
 	// uint64
-	expectPrinted(t, "0xffff_ffff_ffff_fbff", "1.844674407370955e+19;\n")
-	expectPrinted(t, "0x1_0000_0000_0000_0000", "1.8446744073709552e+19;\n")
-	expectPrinted(t, "0x1_0000_0000_0000_1000", "1.8446744073709556e+19;\n")
-	expectPrinted(t, "-0xffff_ffff_ffff_fbff", "-1.844674407370955e+19;\n")
-	expectPrinted(t, "-0x1_0000_0000_0000_0000", "-1.8446744073709552e+19;\n")
-	expectPrinted(t, "-0x1_0000_0000_0000_1000", "-1.8446744073709556e+19;\n")
+	expectPrinted(t, "0xffff_ffff_ffff_fbff", "1844674407370955e4;\n")
+	expectPrinted(t, "0x1_0000_0000_0000_0000", "18446744073709552e3;\n")
+	expectPrinted(t, "0x1_0000_0000_0000_1000", "18446744073709556e3;\n")
+	expectPrinted(t, "-0xffff_ffff_ffff_fbff", "-1844674407370955e4;\n")
+	expectPrinted(t, "-0x1_0000_0000_0000_0000", "-18446744073709552e3;\n")
+	expectPrinted(t, "-0x1_0000_0000_0000_1000", "-18446744073709556e3;\n")
 }
 
 func TestArray(t *testing.T) {
@@ -101,7 +174,7 @@ func TestArray(t *testing.T) {
 func TestSplat(t *testing.T) {
 	expectPrinted(t, "[...(a, b)]", "[...(a, b)];\n")
 	expectPrinted(t, "x(...(a, b))", "x(...(a, b));\n")
-	expectPrinted(t, "({...(a, b)})", "({\n  ...(a, b)\n});\n")
+	expectPrinted(t, "({...(a, b)})", "({...(a, b)});\n")
 }
 
 func TestNew(t *testing.T) {
@@ -251,7 +324,7 @@ func TestTemplate(t *testing.T) {
 }
 
 func TestObject(t *testing.T) {
-	expectPrinted(t, "let x = {'(':')'}", "let x = {\n  \"(\": \")\"\n};\n")
+	expectPrinted(t, "let x = {'(':')'}", "let x = {\"(\": \")\"};\n")
 }
 
 func TestFor(t *testing.T) {
@@ -281,7 +354,7 @@ func TestFunction(t *testing.T) {
 		"function foo(a = (b, c), ...d) {\n}\n")
 	expectPrinted(t,
 		"function foo({[1 + 2]: a = 3} = {[1 + 2]: 3}) {}",
-		"function foo({[1 + 2]: a = 3} = {\n  [1 + 2]: 3\n}) {\n}\n")
+		"function foo({[1 + 2]: a = 3} = {[1 + 2]: 3}) {\n}\n")
 	expectPrinted(t,
 		"function foo([a = (1, 2), ...[b, ...c]] = [1, [2, 3]]) {}",
 		"function foo([a = (1, 2), ...[b, ...c]] = [1, [2, 3]]) {\n}\n")
@@ -294,6 +367,28 @@ func TestFunction(t *testing.T) {
 	expectPrinted(t,
 		"function foo([,,] = [,,]) {}",
 		"function foo([, ,] = [, ,]) {\n}\n")
+}
+
+func TestPureComment(t *testing.T) {
+	expectPrinted(t,
+		"(function() {})",
+		"(function() {\n});\n")
+	expectPrinted(t,
+		"(function() {})()",
+		"(function() {\n})();\n")
+	expectPrinted(t,
+		"/*@__PURE__*/(function() {})()",
+		"/* @__PURE__ */ (function() {\n})();\n")
+
+	expectPrinted(t,
+		"new (function() {})",
+		"new function() {\n}();\n")
+	expectPrinted(t,
+		"new (function() {})()",
+		"new function() {\n}();\n")
+	expectPrinted(t,
+		"/*@__PURE__*/new (function() {})()",
+		"/* @__PURE__ */ new function() {\n}();\n")
 }
 
 func TestGenerator(t *testing.T) {
@@ -343,7 +438,7 @@ func TestArrow(t *testing.T) {
 		"(a = (b, c), ...d) => {\n};\n")
 	expectPrinted(t,
 		"({[1 + 2]: a = 3} = {[1 + 2]: 3}) => {}",
-		"({[1 + 2]: a = 3} = {\n  [1 + 2]: 3\n}) => {\n};\n")
+		"({[1 + 2]: a = 3} = {[1 + 2]: 3}) => {\n};\n")
 	expectPrinted(t,
 		"([a = (1, 2), ...[b, ...c]] = [1, [2, 3]]) => {}",
 		"([a = (1, 2), ...[b, ...c]] = [1, [2, 3]]) => {\n};\n")
@@ -376,9 +471,9 @@ func TestArrow(t *testing.T) {
 	expectPrinted(t, "(a = b, c)", "a = b, c;\n")
 	expectPrinted(t, "([...a = b])", "[...a = b];\n")
 	expectPrinted(t, "([...a, ...b])", "[...a, ...b];\n")
-	expectPrinted(t, "({a: b, c() {}})", "({\n  a: b,\n  c() {\n  }\n});\n")
-	expectPrinted(t, "({a: b, get c() {}})", "({\n  a: b,\n  get c() {\n  }\n});\n")
-	expectPrinted(t, "({a: b, set c() {}})", "({\n  a: b,\n  set c() {\n  }\n});\n")
+	expectPrinted(t, "({a: b, c() {}})", "({a: b, c() {\n}});\n")
+	expectPrinted(t, "({a: b, get c() {}})", "({a: b, get c() {\n}});\n")
+	expectPrinted(t, "({a: b, set c() {}})", "({a: b, set c() {\n}});\n")
 }
 
 func TestClass(t *testing.T) {
@@ -520,4 +615,19 @@ func TestMinify(t *testing.T) {
 	expectPrintedMinify(t, "exports", "exports;")
 	expectPrintedMinify(t, "require", "require;")
 	expectPrintedMinify(t, "module", "module;")
+
+	// Comment statements must not affect their surroundings when minified
+	expectPrintedMinify(t, "//!single\nthrow 1 + 2", "//!single\nthrow 1+2;")
+	expectPrintedMinify(t, "/*!multi-\nline*/\nthrow 1 + 2", "/*!multi-\nline*/throw 1+2;")
+}
+
+func TestES5(t *testing.T) {
+	expectPrintedTargetMinify(t, 5, "foo('a\\n\\n\\nb')", "foo(\"a\\n\\n\\nb\");")
+	expectPrintedTargetMinify(t, 2015, "foo('a\\n\\n\\nb')", "foo(`a\n\n\nb`);")
+
+	expectPrintedTarget(t, 5, "foo({a, b})", "foo({a: a, b: b});\n")
+	expectPrintedTarget(t, 2015, "foo({a, b})", "foo({a, b});\n")
+
+	expectPrintedTarget(t, 5, "x => x", "(function(x) {\n  return x;\n});\n")
+	expectPrintedTarget(t, 2015, "x => x", "(x) => x;\n")
 }
